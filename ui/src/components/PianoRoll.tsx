@@ -21,6 +21,7 @@ import {
   snapRound,
   splitNotes,
   stepSelection,
+  tileGhost,
   toggleMute,
 } from "../noteEditing";
 import { mixHex, swingWarp, TIER_COLORS, trackColor, uuid, type NoteEvent, type Tier } from "../types";
@@ -122,6 +123,13 @@ export function PianoRoll() {
   const fold = useStore((s) => s.fold);
   const ghostPatternId = useStore((s) => s.ghostPatternId);
   const ghostPattern = useStore((s) => s.snapshot?.model.patterns.find((p) => p.id === ghostPatternId) ?? null);
+  // A drum ghost has no pitches worth tiering: it's drawn as the rhythm (hit lines), in its track's color.
+  const ghostDrum = useStore((s) => !!ghostPattern && !!s.snapshot?.model.tracks.find((t) => t.id === ghostPattern.trackId)?.isDrum);
+  const ghostColor = useStore((s) => {
+    const ts = s.snapshot?.model.tracks ?? [];
+    const i = ghostPattern ? ts.findIndex((t) => t.id === ghostPattern.trackId) : -1;
+    return i >= 0 ? trackColor(ts[i], i) : C.text4;
+  });
   const commitGesture = useStore((s) => s.commitGesture);
   const editing = useStore((s) => s.settings.editing);
   const swing = useStore((s) => s.snapshot?.model.swing ?? 50);
@@ -148,11 +156,17 @@ export function PianoRoll() {
   const [viewW, setViewW] = useState(800);
 
   const notes = useMemo(() => (pattern && track ? pattern.notes : []), [pattern, track]);
-  // Another pattern's notes, drawn faint behind this one and never heard.
-  const ghostNotes = useMemo(() => (ghostPattern && ghostPattern.id !== pattern?.id ? ghostPattern.notes : []), [ghostPattern, pattern]);
+  const beats = pattern?.lengthBeats ?? 16;
+  // Another pattern's notes, drawn faint behind this one and never heard; looped under this
+  // pattern the way the song would loop it. A drum ghost is kept apart (rhythm lines, no rows).
+  const ghostAll = useMemo(
+    () => (ghostPattern && ghostPattern.id !== pattern?.id ? tileGhost(ghostPattern.notes, ghostPattern.lengthBeats, beats) : []),
+    [ghostPattern, pattern?.id, beats],
+  );
+  const ghostNotes = useMemo(() => (ghostDrum ? [] : ghostAll), [ghostDrum, ghostAll]);
+  const ghostHits = useMemo(() => (ghostDrum ? ghostAll : []), [ghostDrum, ghostAll]);
   // The project chords from where this pattern was opened (`chordOffsetBeats`), shifted to 0.
   const chords = usePatternChords();
-  const beats = pattern?.lengthBeats ?? 16;
   const beatW = BASE_BEAT_W * zoom;
   const gridW = beats * beatW;
   const shown = preview ?? notes;
@@ -350,7 +364,7 @@ export function PianoRoll() {
       ctx.fillText(label, x + c.lengthBeats * beatW - tw - 4, 19);
     }
 
-    // Ghost notes: another track, dashed, behind everything else.
+    // Ghost notes: another pattern, dashed, tiered against these chords, behind everything else.
     if (ghostNotes.length) {
       ctx.setLineDash([3, 2]);
       ctx.lineWidth = 1;
@@ -371,6 +385,20 @@ export function PianoRoll() {
       }
       ctx.globalAlpha = 1;
       ctx.setLineDash([]);
+    }
+    // A drum ghost: one faint line per hit (kick and snare/clap stronger than hats), plus a
+    // tick along the ruler's foot, so you can lock a bassline to the kick.
+    if (ghostHits.length) {
+      ctx.fillStyle = ghostColor;
+      for (const h of ghostHits) {
+        const x = Math.round(GUTTER + h.startBeat * beatW);
+        const strong = h.pitch === 36 || h.pitch === 38 || h.pitch === 39;
+        ctx.globalAlpha = (strong ? 0.26 : 0.1) * (0.5 + 0.5 * (h.velocity / 127));
+        ctx.fillRect(x, RULER_H, h.pitch === 36 ? 2 : 1, gridH);
+        ctx.globalAlpha = strong ? 0.9 : 0.45;
+        ctx.fillRect(x, RULER_H - (h.pitch === 36 ? 7 : 4), h.pitch === 36 ? 2 : 1, h.pitch === 36 ? 6 : 3);
+      }
+      ctx.globalAlpha = 1;
     }
 
     // Notes
@@ -531,7 +559,7 @@ export function PianoRoll() {
       ctx.fillStyle = "#b8b8c0";
       ctx.fillText(why, hx + 6, hy + 20);
     }
-  }, [shown, ghostNotes, chords, key, playhead, showLandscape, highlightRows, noteLength, beatW, beats, gridW, gridH, selection, hover, preview, color, rootPc, bpb, loopRegion, looping, ROW_H, appearance, swing, swingGrid, visiblePitches, rowOf, fold, pixelRatio]);
+  }, [shown, ghostNotes, ghostHits, ghostColor, chords, key, playhead, showLandscape, highlightRows, noteLength, beatW, beats, gridW, gridH, selection, hover, preview, color, rootPc, bpb, loopRegion, looping, ROW_H, appearance, swing, swingGrid, visiblePitches, rowOf, fold, pixelRatio]);
 
   // ─── Velocity lane canvas ─────────────────────────────────────────────────────────────────
   useEffect(() => {

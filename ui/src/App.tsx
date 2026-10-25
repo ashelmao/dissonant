@@ -12,7 +12,7 @@ import { Dialog } from "./components/Dialog";
 import { SettingsWindow } from "./components/Settings";
 import { ExportDialog, ExportProgressBar } from "./components/ExportDialog";
 import { NewProjectScreen } from "./components/NewProjectScreen";
-import { useStore } from "./store";
+import { selectedPattern, useStore } from "./store";
 import { useLiveKeyboard } from "./liveKeyboard";
 import { splitNotes } from "./noteEditing";
 
@@ -88,7 +88,9 @@ export default function App() {
       } else if (!mod && s.liveKeyboard === "off" && k === "l") {
         s.toggleLooping();
       } else if (!mod && s.liveKeyboard === "off" && k === "r") {
-        s.toggleRecord();
+        // Recording lands in the selected pattern, so there has to be one to arm.
+        if (!s.armed && !selectedPattern(s)) s.showToast("pick a pattern to record into first");
+        else s.toggleRecord();
       } else if (!mod && s.liveKeyboard === "off" && k === "m") {
         s.toggleMetronome();
       }
@@ -121,10 +123,12 @@ export default function App() {
             </div>
           </>
         ) : (
+          // The tree is the left panel; the inspector sits on the right and folds to a rail,
+          // so the roll keeps most of the width.
           <>
             <TrackTree />
-            <Inspector />
             <Editor />
+            <Inspector />
           </>
         )}
       </div>
