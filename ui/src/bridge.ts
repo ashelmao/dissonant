@@ -48,8 +48,9 @@ export interface Bridge {
    * What ▶ plays. In pattern mode `chordOffsetBeats` is the song beat the pattern's bar 1 sits
    * on: the chord bed and tiering use the project chords from there.
    */
-  /** `ghostPatternId`: another pattern looped along in pattern mode, heard while you write. */
-  setPlaybackContext(mode: PlayMode, patternId: string | null, chordOffsetBeats: number, ghostPatternId?: string | null): Promise<void>;
+  /** `ghostPatternId`: another pattern looped along in pattern mode, heard while you write, at
+   *  `ghostLevel` (0…1.5, 1 = its track's own level). */
+  setPlaybackContext(mode: PlayMode, patternId: string | null, chordOffsetBeats: number, ghostPatternId?: string | null, ghostLevel?: number): Promise<void>;
   /** Start playing; with `countInBars` the metronome counts first and the transport starts after. */
   play(countInBars?: number): Promise<void>;
   stop(): Promise<void>;
@@ -149,8 +150,8 @@ async function tauriBridge(): Promise<Bridge> {
     newProject: (starter) => invoke<Snapshot>("new_project", { starter: starter ?? null }),
     openProject: (path) => invoke<Snapshot>("open_project", { path }),
     saveProject: (path) => invoke<Snapshot>("save_project", { path: path ?? null }),
-    setPlaybackContext: (mode, patternId, chordOffsetBeats, ghostPatternId = null) =>
-      invoke("set_playback_context", { mode, patternId, chordOffsetBeats, ghostPatternId }),
+    setPlaybackContext: (mode, patternId, chordOffsetBeats, ghostPatternId = null, ghostLevel = 1) =>
+      invoke("set_playback_context", { mode, patternId, chordOffsetBeats, ghostPatternId, ghostLevel }),
     play: (countInBars) => invoke("transport_play", { countInBars: countInBars ?? null }),
     stop: () => invoke("transport_stop"),
     setMetronome: (on, volume) => invoke("set_metronome", { on, volume: volume ?? null }),

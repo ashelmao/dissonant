@@ -176,6 +176,8 @@ function GhostPicker({ pattern }: { pattern: SongPattern }) {
   const setGhostPattern = useStore((s) => s.setGhostPattern);
   const hearGhost = useStore((s) => s.hearGhost);
   const toggleHearGhost = useStore((s) => s.toggleHearGhost);
+  const ghostLevel = useStore((s) => s.ghostLevel);
+  const setGhostLevel = useStore((s) => s.setGhostLevel);
   const value = ghostPatternId && ghostPatternId !== pattern.id ? ghostPatternId : "";
   const ghost = model.patterns.find((p) => p.id === value);
   const gi = ghost ? model.tracks.findIndex((t) => t.id === ghost.trackId) : -1;
@@ -211,6 +213,23 @@ function GhostPicker({ pattern }: { pattern: SongPattern }) {
         >
           <span className="box" aria-hidden="true">{hearGhost ? "■" : "□"}</span> hear
         </button>
+      )}
+      {ghost && (
+        <span className={`ghostlevel${hearGhost ? "" : " off"}`} title={`ghost volume ${Math.round(ghostLevel * 100)}% · 100% is its track's own level · double-click resets`}>
+          <input
+            type="range"
+            min={0}
+            max={150}
+            step={5}
+            value={Math.round(ghostLevel * 100)}
+            disabled={!hearGhost}
+            onChange={(e) => setGhostLevel(Number(e.target.value) / 100)}
+            onDoubleClick={() => setGhostLevel(1)}
+            aria-label="ghost volume"
+            aria-valuetext={`${Math.round(ghostLevel * 100)}%`}
+          />
+          <span className="pct">{Math.round(ghostLevel * 100)}%</span>
+        </span>
       )}
       {ghost && (
         <button className="ico" onClick={() => setGhostPattern(null)} aria-label="ghost off" title="ghost off">

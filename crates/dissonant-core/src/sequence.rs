@@ -89,12 +89,26 @@ impl Sequence {
     /// sequence's length and cut at its end, so the pattern being edited can be heard against
     /// it (a melody over the drums). Repeats get stable, distinct ids derived from the note id
     /// and the repetition. An unknown ghost id leaves the sequence as it was.
-    pub fn with_ghost(mut self, model: &ProjectModel, ghost_id: &Uuid) -> Self {
+    ///
+    /// `level` (0…1.5, 1 = as the track is) sets how loud the ghost plays. On a track of its own
+    /// it scales that track's volume, which the engine changes without cutting notes; on the
+    /// track being edited (which already has the edited pattern's notes) it scales the ghost
+    /// notes' velocities instead, so the notes being written keep their level.
+    pub fn with_ghost(mut self, model: &ProjectModel, ghost_id: &Uuid, level: f64) -> Self {
         let Some(ghost) = model.pattern(ghost_id) else { return self };
         let Some(track) = self.tracks.iter_mut().find(|t| t.id == ghost.track_id) else { return self };
         if !(ghost.length_beats > 0.0) {
             return self;
         }
+        let level = if level.is_finite() { level.clamp(0.0, 1.5) } else { 1.0 };
+        let shared = !track.notes.is_empty();
+        if shared && level <= 0.0 {
+            return self;
+        }
+        if !shared {
+            track.volume *= level;
+        }
+        let velocity = |v: i32| if shared { ((v as f64) * level).round().clamp(1.0, 127.0) as i32 } else { v };
         let end = self.length_beats;
         let mut base = 0.0;
         let mut rep = 0u64;
@@ -110,6 +124,7 @@ impl Sequence {
                     id: Uuid::new_v5(&note.id, &salt),
                     start_beat: start,
                     length_beats: (note.length_beats.min(end - start)).max(1.0 / 64.0),
+                    velocity: velocity(note.velocity),
                     ..note.clone()
                 });
             }
@@ -192,7 +207,7 @@ mod tests {
         let (melody, drums) = (model.patterns[0].id, model.patterns[1].id);
         model.patterns[1].length_beats = 4.0;
         model.patterns[1].notes = vec![NoteEvent::new(0.0, 0.25, 36), NoteEvent::new(3.0, 2.0, 38)];
-        let p = Sequence::from_pattern(&model, &melody, 0.0).unwrap().with_ghost(&model, &drums);
+        let p = Sequence::from_pattern(&model, &melody, 0.0).unwrap().with_ghost(&model, &drums, 1.0);
         let starts: Vec<f64> = p.tracks[1].notes.iter().map(|n| n.start_beat).collect();
         assert_eq!(starts, vec![0.0, 3.0, 4.0, 7.0, 8.0, 11.0, 12.0, 15.0], "a 4-beat ghost loops four times under 16 beats");
         assert_eq!(p.tracks[1].notes.last().unwrap().length_beats, 1.0, "cut at the loop end");
@@ -200,7 +215,32 @@ mod tests {
         assert_eq!(ids.len(), 8, "every repeat has its own id");
         assert_eq!(p.tracks[0].notes.len(), model.patterns[0].notes.len(), "the edited pattern is untouched");
         let same = Sequence::from_pattern(&model, &melody, 0.0).unwrap();
-        assert_eq!(same.clone().with_ghost(&model, &Uuid::new_v4()), same, "an unknown ghost changes nothing");
+        assert_eq!(same.clone().with_ghost(&model, &Uuid::new_v4(), 1.0), same, "an unknown ghost changes nothing");
+    }
+
+    #[test]
+    fn the_ghost_level_scales_its_own_track_or_only_its_notes_on_a_shared_one() {
+        let mut model = ProjectModel::starter();
+        let (melody, drums) = (model.patterns[0].id, model.patterns[1].id);
+        let base = Sequence::from_pattern(&model, &melody, 0.0).unwrap();
+        let quiet = base.clone().with_ghost(&model, &drums, 0.5);
+        assert_eq!(quiet.tracks[1].volume, base.tracks[1].volume * 0.5, "its own track: the track volume");
+        assert_eq!(quiet.tracks[1].notes.iter().map(|n| n.velocity).collect::<Vec<_>>(), model.patterns[1].notes.iter().map(|n| n.velocity).collect::<Vec<_>>());
+        assert_eq!(quiet.tracks[0], base.tracks[0], "the edited track is untouched");
+
+        // A second melody pattern ghosted under the first: same track, so only its notes soften.
+        let mut other = model.patterns[0].clone();
+        other.id = Uuid::new_v4();
+        other.notes = vec![NoteEvent::new(0.0, 1.0, 121)];
+        other.notes[0].velocity = 100;
+        let other_id = other.id;
+        model.patterns.push(other);
+        let base = Sequence::from_pattern(&model, &melody, 0.0).unwrap();
+        let shared = base.clone().with_ghost(&model, &other_id, 0.5);
+        assert_eq!(shared.tracks[0].volume, base.tracks[0].volume, "the track level stays");
+        let ghost_notes: Vec<_> = shared.tracks[0].notes.iter().filter(|n| n.pitch == 121).map(|n| n.velocity).collect();
+        assert!(!ghost_notes.is_empty() && ghost_notes.iter().all(|&v| v == 50), "{ghost_notes:?}");
+        assert_eq!(base.clone().with_ghost(&model, &other_id, 0.0), base, "silent on a shared track: no ghost notes");
     }
 
     #[test]

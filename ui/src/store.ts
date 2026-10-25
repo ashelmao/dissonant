@@ -101,6 +101,8 @@ interface State {
   ghostPatternId: string | null;
   /** Play the ghost pattern along in pattern mode (it is always drawn). */
   hearGhost: boolean;
+  /** How loud the ghost plays: 0…1.5, 1 = its track's own level. */
+  ghostLevel: number;
   /** A pattern being dragged from the tree; the song view previews the drop from it. */
   patternDrag: PatternDrag | null;
   /** Registered by the song view while mounted; the tree calls it on release. */
@@ -159,6 +161,7 @@ interface State {
   toggleFold(): void;
   setGhostPattern(id: string | null): void;
   toggleHearGhost(): void;
+  setGhostLevel(level: number): void;
   setPatternDrag(drag: PatternDrag | null): void;
   setPatternDropHandler(fn: PatternDropHandler | null): void;
   requestSelection(ids: string[]): void;
@@ -255,9 +258,9 @@ export function reconcileSelection(m: ProjectModel, trackId: string | null, patt
 export const useStore = create<State>((set, get) => {
   const syncPlayback = async () => {
     const b = await getBridge();
-    const { mode, selectedPatternId, chordOffsetBeats, ghostPatternId, hearGhost } = get();
+    const { mode, selectedPatternId, chordOffsetBeats, ghostPatternId, hearGhost, ghostLevel } = get();
     const ghost = hearGhost && ghostPatternId !== selectedPatternId ? ghostPatternId : null;
-    await b.setPlaybackContext(playModeOf(mode), selectedPatternId, chordOffsetBeats, ghost);
+    await b.setPlaybackContext(playModeOf(mode), selectedPatternId, chordOffsetBeats, ghost, ghostLevel);
   };
 
   /**
@@ -394,6 +397,7 @@ export const useStore = create<State>((set, get) => {
     fold: false,
     ghostPatternId: null,
     hearGhost: true,
+    ghostLevel: 1,
     patternDrag: null,
     patternDropHandler: null,
     selectionRequest: null,
@@ -667,6 +671,11 @@ export const useStore = create<State>((set, get) => {
     },
     toggleHearGhost() {
       set((s) => ({ hearGhost: !s.hearGhost }));
+      void syncPlayback();
+    },
+    setGhostLevel(level) {
+      if (!Number.isFinite(level)) return;
+      set({ ghostLevel: Math.min(1.5, Math.max(0, level)) });
       void syncPlayback();
     },
     setPatternDrag(drag) {

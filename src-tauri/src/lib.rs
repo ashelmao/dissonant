@@ -32,8 +32,10 @@ struct PlaybackContext {
     /// The song beat the edited pattern's beat 0 sits on, for the chords it hears and tiers
     /// against (0 = from song bar 1).
     chord_offset_beats: f64,
-    /// Another pattern played along in pattern mode (the ghost the user chose to hear).
+    /// Another pattern played along in pattern mode (the ghost the user chose to hear), and
+    /// how loud (1 = the track's own level).
     ghost_pattern_id: Option<Uuid>,
+    ghost_level: f64,
     hear_chords: bool,
     /// The track live input (MIDI / typing keyboard) plays and records into.
     live_track: Option<Uuid>,
@@ -51,6 +53,7 @@ impl Default for PlaybackContext {
             pattern_id: None,
             chord_offset_beats: 0.0,
             ghost_pattern_id: None,
+            ghost_level: 1.0,
             hear_chords: false,
             live_track: None,
             looping: true,
@@ -443,7 +446,7 @@ impl AppState {
         let seq = {
             let doc = self.doc.lock().unwrap();
             let ctx = self.playback.lock().unwrap();
-            build_sequence(doc.model(), ctx.mode, ctx.pattern_id, ctx.chord_offset_beats, ctx.ghost_pattern_id)
+            build_sequence(doc.model(), ctx.mode, ctx.pattern_id, ctx.chord_offset_beats, ctx.ghost_pattern_id.map(|g| (g, ctx.ghost_level)))
         };
         let master = self.doc.lock().unwrap().model().master.clone();
         self.send(EngineCommand::SetSequence(Arc::new(seq)));
@@ -481,14 +484,14 @@ fn build_sequence(
     mode: PlayMode,
     pattern_id: Option<Uuid>,
     chord_offset_beats: f64,
-    ghost_pattern_id: Option<Uuid>,
+    ghost: Option<(Uuid, f64)>,
 ) -> Sequence {
     match mode {
         PlayMode::Song => Sequence::from_song(model),
         PlayMode::Pattern => pattern_id
             .and_then(|id| Sequence::from_pattern(model, &id, chord_offset_beats))
-            .map(|seq| match ghost_pattern_id.filter(|g| Some(*g) != pattern_id) {
-                Some(ghost) => seq.with_ghost(model, &ghost),
+            .map(|seq| match ghost.filter(|(g, _)| Some(*g) != pattern_id) {
+                Some((id, level)) => seq.with_ghost(model, &id, level),
                 None => seq,
             })
             .unwrap_or_else(|| Sequence::silent(model, model.bar_beats() * 4.0)),
@@ -647,8 +650,8 @@ fn autosave_now(state: State<'_, AppState>) -> Option<String> {
 
 /// What ▶ plays: the song, or one pattern heard against the project chords from song beat
 /// `chord_offset_beats` (default 0, song bar 1), with `ghost_pattern_id` looping along when the
-/// user wants to hear it. Switching mode or pattern rewinds; moving only the chord offset or
-/// changing the ghost does not.
+/// user wants to hear it, at `ghost_level` (default 1). Switching mode or pattern rewinds;
+/// moving only the chord offset or changing the ghost does not.
 #[tauri::command]
 fn set_playback_context(
     state: State<'_, AppState>,
@@ -656,6 +659,7 @@ fn set_playback_context(
     pattern_id: Option<Uuid>,
     chord_offset_beats: Option<f64>,
     ghost_pattern_id: Option<Uuid>,
+    ghost_level: Option<f64>,
 ) {
     let offset = chord_offset_beats.filter(|b| b.is_finite()).unwrap_or(0.0).max(0.0);
     {
@@ -665,6 +669,7 @@ fn set_playback_context(
         ctx.pattern_id = pattern_id;
         ctx.chord_offset_beats = offset;
         ctx.ghost_pattern_id = ghost_pattern_id;
+        ctx.ghost_level = ghost_level.filter(|l| l.is_finite()).unwrap_or(1.0).clamp(0.0, 1.5);
         if changed {
             state.send(EngineCommand::Seek { beat: 0.0 });
         }

@@ -2730,9 +2730,40 @@ select {
 .ctxbar .ghostpick select {
   max-width: 120px;
 }
+/* Ghost volume: a small slider and its percent, dimmed while the ghost isn't heard. */
+.ctxbar .ghostlevel {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.ctxbar .ghostlevel input[type="range"] {
+  width: 64px;
+  height: 4px;
+  margin: 0;
+  accent-color: var(--accent);
+}
+.ctxbar .ghostlevel .pct {
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  color: var(--text-3);
+  min-width: 30px;
+  text-align: right;
+}
+.ctxbar .ghostlevel.off {
+  opacity: 0.4;
+}
 @media (max-width: 1100px) {
   /* The pattern's view and length are in the left panel too; drop them before the toggles. */
   .ctxbar .crumbs .meta {
+    display: none;
+  }
+  .ctxbar .chordsfrom select {
+    max-width: 96px;
+  }
+  .ctxbar .ghostlevel input[type="range"] {
+    width: 48px;
+  }
+  .ctxbar .ghostlevel .pct {
     display: none;
   }
 }
