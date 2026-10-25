@@ -26,6 +26,22 @@ impl ChordTrack {
         &self.chords
     }
 
+    /// The part of a song-beat progression inside `[from, from + length)`, shifted so `from`
+    /// lands on beat 0 and cut to the window. A chord that started before the window counts
+    /// from the window's start. This is what pattern mode hears and tiers against.
+    pub fn window(chords: &[ChordEvent], from: f64, length: f64) -> ChordTrack {
+        let end = from + length;
+        let inside = chords
+            .iter()
+            .filter_map(|c| {
+                let start = c.start_beat.max(from);
+                let stop = c.end_beat().min(end);
+                (stop > start).then(|| ChordEvent { start_beat: start - from, length_beats: stop - start, ..c.clone() })
+            })
+            .collect();
+        ChordTrack::new(inside)
+    }
+
     pub fn is_empty(&self) -> bool {
         self.chords.is_empty()
     }
@@ -100,6 +116,16 @@ mod tests {
         t.add(ChordEvent::new(2.0, 4.0, vec![7, 11, 2], Some("G".into())));
         assert_eq!(t.chord_at(3.0).unwrap().name.as_deref(), Some("G"));
         assert_eq!(t.chord_at(1.0).unwrap().name.as_deref(), Some("C"));
+    }
+
+    #[test]
+    fn window_shifts_to_zero_and_clips_at_both_edges() {
+        let song = [c(), f(), ChordEvent::new(8.0, 4.0, vec![7, 11, 2], Some("G".into()))];
+        let w = ChordTrack::window(&song, 2.0, 8.0);
+        let spans: Vec<(f64, f64, &str)> =
+            w.chords().iter().map(|c| (c.start_beat, c.length_beats, c.name.as_deref().unwrap())).collect();
+        assert_eq!(spans, vec![(0.0, 2.0, "C"), (2.0, 4.0, "F"), (6.0, 2.0, "G")]);
+        assert!(ChordTrack::window(&song, 20.0, 4.0).is_empty());
     }
 
     #[test]

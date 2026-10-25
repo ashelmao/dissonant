@@ -8,7 +8,7 @@
 use std::f64::consts::PI;
 use std::sync::Arc;
 
-use dissonant_core::{MasterSettings, NoteEvent, ProjectModel, Sequence};
+use dissonant_core::{MasterSettings, NoteEvent, ProjectModel, Sequence, SongPattern};
 use dissonant_engine::engine::{Engine, EngineCommand, Shared};
 use dissonant_engine::render::{render_to_buffer, RenderOptions};
 
@@ -24,13 +24,31 @@ fn model(voice: &str, length_beats: f64) -> ProjectModel {
     m
 }
 
+/// Put `notes` in the track's own pattern, making one (as long as the first) on first use.
 fn set_notes(m: &mut ProjectModel, track: usize, notes: Vec<NoteEvent>) {
     let id = m.tracks[track].id;
-    m.patterns[0].notes_by_track.insert(id, notes);
+    let length = m.patterns[0].length_beats;
+    match m.patterns.iter_mut().find(|p| p.track_id == id) {
+        Some(p) => p.notes = notes,
+        None => {
+            let mut p = SongPattern::new(id, "p");
+            p.length_beats = length;
+            p.notes = notes;
+            m.patterns.push(p);
+        }
+    }
 }
 
+/// The first pattern's loop with every track's own pattern playing along at pattern-local
+/// beats, as if each were placed at beat 0 (so multi-track mixes can be measured).
 fn sequence(m: &ProjectModel) -> Arc<Sequence> {
-    Arc::new(Sequence::from_pattern(m, &m.patterns[0].id).expect("pattern exists"))
+    let mut seq = Sequence::from_pattern(m, &m.patterns[0].id, 0.0).expect("pattern exists");
+    for t in &mut seq.tracks {
+        if let Some(p) = m.patterns.iter().find(|p| p.track_id == t.id) {
+            t.notes = p.notes.clone();
+        }
+    }
+    Arc::new(seq)
 }
 
 /// Offline render of the model's first pattern. Returns de-interleaved (left, right).
@@ -38,7 +56,6 @@ fn render(m: &ProjectModel, tail_seconds: f64) -> (Vec<f32>, Vec<f32>) {
     let opts = RenderOptions {
         sample_rate: SR as u32,
         tail_seconds,
-        hear_chords: false,
         master: m.master.clone(),
         // Measurements below compare raw sample values, so no normalising, dither or extra loops.
         ..RenderOptions::default()

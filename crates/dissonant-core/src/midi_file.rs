@@ -1,7 +1,9 @@
 //! Standard MIDI files: export a pattern or the whole song (one MIDI track per Dissonant
-//! track, chord names as markers), and import a file into a pattern as new tracks.
+//! track, chord names as markers), and read a file into tracks of notes for
+//! [`crate::Command::ImportTracks`].
 
 use crate::arrangement::Arrangement;
+use crate::chord_track::ChordTrack;
 use crate::model::{NoteEvent, ProjectModel, Track};
 use midly::num::{u15, u24, u28, u4, u7};
 use midly::{Format, Header, MetaMessage, MidiMessage, Smf, Timing, TrackEvent, TrackEventKind};
@@ -24,9 +26,12 @@ pub enum MidiError {
 }
 
 /// What to export.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum MidiScope {
-    Pattern(Uuid),
+    /// One pattern on its own track. Chord markers come from the project progression from
+    /// song beat `chord_offset_beats` (what the pattern is being edited against).
+    Pattern { id: Uuid, chord_offset_beats: f64 },
+    /// Every track over the song length.
     Song,
 }
 
@@ -56,29 +61,33 @@ type TrackNotes<'a> = Vec<(&'a Track, Vec<NoteEvent>)>;
 type ChordMarkers = Vec<(f64, String)>;
 
 /// Build the SMF (format 1) for a scope. Track 0 carries tempo, time signature and chord
-/// markers; every Dissonant track becomes one MIDI track (drums on channel 10).
+/// markers; every Dissonant track in scope becomes one MIDI track (drums on channel 10): the
+/// pattern's own track for a pattern, every track for the song.
 pub fn export(model: &ProjectModel, scope: MidiScope) -> Result<Vec<u8>, MidiError> {
+    let markers = |chords: &[crate::model::ChordEvent]| -> ChordMarkers {
+        chords.iter().filter_map(|c| c.name.clone().map(|n| (c.start_beat, n))).collect()
+    };
     // Gather (track, notes) and the chord list first; names must outlive the Smf.
     let (per_track, chords): (TrackNotes, ChordMarkers) = match scope {
-        MidiScope::Pattern(id) => {
+        MidiScope::Pattern { id, chord_offset_beats } => {
             let p = model.pattern(&id).ok_or(MidiError::NoSuchPattern)?;
+            let track = model.track(&p.track_id).ok_or(MidiError::NoSuchPattern)?;
+            let offset = if chord_offset_beats.is_finite() { chord_offset_beats.max(0.0) } else { 0.0 };
+            let window = ChordTrack::window(&model.chords, offset, p.length_beats.max(1.0));
+            (vec![(track, p.notes.clone())], markers(window.chords()))
+        }
+        MidiScope::Song => {
+            let end = model.song_length_beats;
+            let in_song: Vec<_> = model.chords.iter().filter(|c| c.start_beat < end).cloned().collect();
             (
-                model.tracks.iter().map(|t| (t, p.notes(&t.id).to_vec())).collect(),
-                p.chords.chords().iter().filter_map(|c| c.name.clone().map(|n| (c.start_beat, n))).collect(),
+                model
+                    .tracks
+                    .iter()
+                    .map(|t| (t, Arrangement::flattened_notes(&t.id, &model.patterns, &model.clips)))
+                    .collect(),
+                markers(&in_song),
             )
         }
-        MidiScope::Song => (
-            model
-                .tracks
-                .iter()
-                .map(|t| (t, Arrangement::flattened_notes(&t.id, &model.patterns, &model.clips)))
-                .collect(),
-            Arrangement::flattened_chords(&model.patterns, &model.clips)
-                .chords()
-                .iter()
-                .filter_map(|c| c.name.clone().map(|n| (c.start_beat, n)))
-                .collect(),
-        ),
     };
     if per_track.iter().all(|(_, n)| n.is_empty()) {
         return Err(MidiError::Empty);
@@ -226,52 +235,60 @@ mod tests {
     use super::*;
     use crate::model::Clip;
 
+    fn pattern_scope(id: Uuid) -> MidiScope {
+        MidiScope::Pattern { id, chord_offset_beats: 0.0 }
+    }
+
     #[test]
     fn export_then_import_round_trips_notes_and_names() {
         let mut model = ProjectModel::starter();
         model.tempo = 100.0;
-        let (tid, pid) = (model.tracks[0].id, model.patterns[0].id);
-        let drums = model.tracks[1].id;
+        let (melody, drums) = (model.patterns[0].id, model.patterns[1].id);
         model.tracks[0].name = "lead".into();
         let mut muted = NoteEvent::new(3.0, 1.0, 72);
         muted.muted = true;
-        model.patterns[0].notes_by_track.insert(
-            tid,
-            vec![NoteEvent::new(0.0, 0.5, 60).with_velocity(90), NoteEvent::new(1.5, 1.0, 67), muted],
-        );
-        model.patterns[0].notes_by_track.insert(drums, vec![NoteEvent::new(0.0, 0.25, 36)]);
+        model.patterns[0].notes = vec![NoteEvent::new(0.0, 0.5, 60).with_velocity(90), NoteEvent::new(1.5, 1.0, 67), muted];
+        model.patterns[1].notes = vec![NoteEvent::new(0.0, 0.25, 36)];
 
-        let bytes = export(&model, MidiScope::Pattern(pid)).unwrap();
+        let bytes = export(&model, pattern_scope(melody)).unwrap();
         let back = import(&bytes, 4.0).unwrap();
         assert_eq!(back.tempo_bpm.map(|t| t.round()), Some(100.0));
-        assert_eq!(back.tracks.len(), 2);
-        let lead = back.tracks.iter().find(|t| t.name == "lead").unwrap();
+        assert_eq!(back.tracks.len(), 1, "a pattern exports its own track only");
+        let lead = &back.tracks[0];
+        assert_eq!(lead.name, "lead");
         assert!(!lead.is_drum);
         assert_eq!(lead.notes.len(), 2, "muted notes are not exported");
         assert_eq!(lead.notes[0].pitch, 60);
         assert_eq!(lead.notes[0].velocity, 90);
         assert!((lead.notes[0].length_beats - 0.5).abs() < 1e-9);
         assert!((lead.notes[1].start_beat - 1.5).abs() < 1e-9);
-        let kit = back.tracks.iter().find(|t| t.name == "drums").unwrap();
-        assert!(kit.is_drum, "channel 10 marks drums");
         assert_eq!(back.length_beats, 4.0);
+
+        let kit = import(&export(&model, pattern_scope(drums)).unwrap(), 4.0).unwrap();
+        assert_eq!(kit.tracks.len(), 1);
+        assert_eq!(kit.tracks[0].name, "drums");
+        assert!(kit.tracks[0].is_drum, "channel 10 marks drums");
     }
 
     #[test]
     fn song_export_follows_clips_and_empty_is_an_error() {
         let mut model = ProjectModel::starter();
-        let (tid, pid) = (model.tracks[0].id, model.patterns[0].id);
-        model.patterns[0].notes_by_track.clear();
-        model.patterns[0].notes_by_track.insert(tid, vec![NoteEvent::new(0.0, 1.0, 60)]);
-        model.clips = vec![Clip::new(pid, 0.0, 16.0), Clip::new(pid, 16.0, 16.0)];
+        let (melody, drums) = (model.patterns[0].id, model.patterns[1].id);
+        model.patterns[0].notes = vec![NoteEvent::new(0.0, 1.0, 60)];
+        model.patterns[1].notes = vec![NoteEvent::new(1.0, 0.25, 36)];
+        model.clips = vec![Clip::new(melody, 0.0, 16.0), Clip::new(melody, 16.0, 16.0), Clip::new(drums, 0.0, 16.0)];
         let back = import(&export(&model, MidiScope::Song).unwrap(), 4.0).unwrap();
+        assert_eq!(back.tracks.len(), 2, "every track with notes in the song");
         let lead = &back.tracks[0];
         assert_eq!(lead.notes.len(), 2);
         assert!((lead.notes[1].start_beat - 16.0).abs() < 1e-9);
+        assert_eq!(back.tracks[1].notes.len(), 1, "the drums play their own clip only");
         assert_eq!(back.length_beats, 20.0, "last note ends at 17 → rounded up to the bar");
 
         let empty = ProjectModel::empty();
         assert!(matches!(export(&empty, MidiScope::Song), Err(MidiError::Empty)));
+        assert!(matches!(export(&empty, pattern_scope(empty.patterns[0].id)), Err(MidiError::Empty)));
+        assert!(matches!(export(&empty, pattern_scope(Uuid::new_v4())), Err(MidiError::NoSuchPattern)));
         assert!(matches!(import(b"not midi", 4.0), Err(MidiError::Parse(_))));
     }
 }

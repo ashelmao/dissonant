@@ -1,6 +1,6 @@
 //! The flattened, engine-facing view of what to play: one list of notes per track, the chord
-//! track for the bed, and a loop length. Built from either the selected pattern (pattern mode)
-//! or the whole arrangement (song mode). The engine never looks at `ProjectModel` directly.
+//! track for the bed, and a loop length. Built from either one pattern (pattern mode) or the
+//! whole song (song mode). The engine never looks at `ProjectModel` directly.
 
 use crate::arrangement::Arrangement;
 use crate::chord_track::ChordTrack;
@@ -64,25 +64,43 @@ pub struct Sequence {
 }
 
 impl Sequence {
-    pub fn from_pattern(model: &ProjectModel, pattern_id: &Uuid) -> Option<Self> {
+    /// One pattern on its own: only the pattern's track has notes (every other track is still
+    /// there, silent, so live input and auditions can reach it). The chords are the project's
+    /// progression from song beat `chord_offset_beats` for the pattern's length, shifted to 0 —
+    /// the bar the pattern is being edited against.
+    pub fn from_pattern(model: &ProjectModel, pattern_id: &Uuid, chord_offset_beats: f64) -> Option<Self> {
         let pattern = model.pattern(pattern_id)?;
+        let length = pattern.length_beats.max(1.0);
+        let offset = if chord_offset_beats.is_finite() { chord_offset_beats.max(0.0) } else { 0.0 };
         let tracks = model
             .tracks
             .iter()
-            .map(|t| SequenceTrack::from_track(t, pattern.notes(&t.id).to_vec()))
+            .map(|t| SequenceTrack::from_track(t, if t.id == pattern.track_id { pattern.notes.clone() } else { vec![] }))
             .collect();
         Some(Sequence {
             tracks,
-            chords: pattern.chords.clone(),
-            length_beats: pattern.length_beats.max(1.0),
+            chords: ChordTrack::window(&model.chords, offset, length),
+            length_beats: length,
+            ..Self::silent(model, length)
+        })
+    }
+
+    /// Every track with no notes and no chords, for pattern mode with nothing to edit.
+    pub fn silent(model: &ProjectModel, length_beats: f64) -> Self {
+        Sequence {
+            tracks: model.tracks.iter().map(|t| SequenceTrack::from_track(t, vec![])).collect(),
+            chords: ChordTrack::default(),
+            length_beats: if length_beats.is_finite() { length_beats.max(1.0) } else { 16.0 },
             tempo_bpm: model.tempo,
             swing: model.swing,
             swing_grid: model.swing_grid,
             beats_per_bar: model.time_signature.beats_per_bar(),
             tempo_map: TempoMap::constant(model.tempo),
-        })
+        }
     }
 
+    /// The whole song: per track, the clips of that track's patterns; the project chords; and
+    /// the song's explicit length as the hard end.
     pub fn from_song(model: &ProjectModel) -> Self {
         let tracks = model
             .tracks
@@ -94,15 +112,13 @@ impl Sequence {
                 )
             })
             .collect();
-        let total = Arrangement::total_length(&model.clips);
-        let fallback = model.patterns.first().map(|p| p.length_beats).unwrap_or(16.0);
+        // Same floor as `from_pattern`: a non-positive loop length stops song mode from ever
+        // wrapping and makes offline render bail out.
+        let length = if model.song_length_beats.is_finite() { model.song_length_beats.max(1.0) } else { 16.0 };
         Sequence {
             tracks,
-            chords: Arrangement::flattened_chords(&model.patterns, &model.clips),
-            // Same floor as `from_pattern`: a loaded project can carry a zero, negative or
-            // non-finite `length_beats` (nothing clamps it on decode), and a non-positive loop
-            // length stops song mode from ever wrapping and makes offline render bail out.
-            length_beats: if total > 0.0 { total } else { fallback }.max(1.0),
+            chords: ChordTrack::new(model.chords.clone()),
+            length_beats: length,
             tempo_bpm: model.tempo,
             swing: model.swing,
             swing_grid: model.swing_grid,
@@ -119,32 +135,68 @@ impl Sequence {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{ChordEvent, Clip};
 
     #[test]
-    fn pattern_and_song_sequences() {
-        let mut model = ProjectModel::starter();
-        let track_id = model.tracks[0].id;
-        let pattern_id = model.patterns[0].id;
-        model.patterns[0]
-            .notes_by_track
-            .insert(track_id, vec![NoteEvent::new(0.0, 1.0, 60)]);
-        model.clips = vec![crate::model::Clip::new(pattern_id, 0.0, 16.0), crate::model::Clip::new(pattern_id, 16.0, 16.0)];
-
-        let p = Sequence::from_pattern(&model, &pattern_id).unwrap();
+    fn pattern_mode_plays_only_its_own_track() {
+        let model = ProjectModel::starter();
+        let (melody, drums) = (&model.patterns[0], &model.patterns[1]);
+        let p = Sequence::from_pattern(&model, &melody.id, 0.0).unwrap();
         assert_eq!(p.length_beats, 16.0);
-        assert_eq!(p.tracks[0].notes.len(), 1);
-        assert!(!p.chords.is_empty());
+        assert_eq!(p.tracks.len(), 2, "every track is there");
+        assert_eq!(p.tracks[0].notes.len(), melody.notes.len());
+        assert!(p.tracks[1].notes.is_empty(), "the drums are silent while the melody is edited");
+        let d = Sequence::from_pattern(&model, &drums.id, 0.0).unwrap();
+        assert!(d.tracks[0].notes.is_empty());
+        assert_eq!(d.tracks[1].notes.len(), drums.notes.len());
+    }
 
+    #[test]
+    fn pattern_mode_chords_are_the_song_window_at_the_offset() {
+        let mut model = ProjectModel::empty();
+        model.patterns[0].length_beats = 8.0;
+        model.chords = vec![
+            ChordEvent::new(0.0, 4.0, vec![0, 4, 7], Some("C".into())),
+            ChordEvent::new(4.0, 8.0, vec![5, 9, 0], Some("F".into())),
+            ChordEvent::new(12.0, 4.0, vec![7, 11, 2], Some("G".into())),
+        ];
+        let pid = model.patterns[0].id;
+        let at = |offset: f64| -> Vec<(f64, f64, String)> {
+            Sequence::from_pattern(&model, &pid, offset)
+                .unwrap()
+                .chords
+                .chords()
+                .iter()
+                .map(|c| (c.start_beat, c.length_beats, c.name.clone().unwrap()))
+                .collect()
+        };
+        assert_eq!(at(0.0), vec![(0.0, 4.0, "C".into()), (4.0, 4.0, "F".into())], "from bar 1, cut at the pattern end");
+        assert_eq!(at(8.0), vec![(0.0, 4.0, "F".into()), (4.0, 4.0, "G".into())], "a chord already sounding starts at 0");
+        assert!(at(16.0).is_empty(), "past the progression: no chords");
+        assert_eq!(at(f64::NAN), at(0.0), "a bad offset reads as bar 1");
+    }
+
+    #[test]
+    fn song_mode_uses_the_explicit_length_and_project_chords() {
+        let mut model = ProjectModel::starter();
+        let melody = model.patterns[0].id;
+        model.patterns[0].notes = vec![NoteEvent::new(0.0, 1.0, 60)];
+        model.clips = vec![Clip::new(melody, 0.0, 16.0), Clip::new(melody, 16.0, 16.0)];
+        model.song_length_beats = 64.0;
         let s = Sequence::from_song(&model);
-        assert_eq!(s.length_beats, 32.0);
+        assert_eq!(s.length_beats, 64.0, "the song ends where it says, not at the last clip");
         assert_eq!(s.tracks[0].notes.len(), 2);
+        assert!(s.tracks[1].notes.is_empty(), "the drum pattern has no clips any more");
         assert_eq!(s.chords.chord_at(17.0).unwrap().name.as_deref(), Some("C"));
     }
 
     #[test]
-    fn empty_song_falls_back_to_first_pattern_length() {
+    fn an_empty_song_still_has_its_length() {
         let mut model = ProjectModel::empty();
-        model.patterns[0].length_beats = 8.0;
+        model.song_length_beats = 8.0;
         assert_eq!(Sequence::from_song(&model).length_beats, 8.0);
+        let silent = Sequence::silent(&model, 0.0);
+        assert_eq!(silent.length_beats, 1.0);
+        assert_eq!(silent.tracks.len(), 1);
     }
 }

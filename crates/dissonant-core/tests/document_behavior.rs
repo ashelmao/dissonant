@@ -10,26 +10,31 @@ use uuid::Uuid;
 
 // ---------------------------------------------------------------- fixtures
 
-/// Two tracks (melody + drums), two patterns (16 and 8 beats), notes on the first pattern,
-/// both patterns arranged. Rich enough that every `Command` variant has something to bite on.
+/// Two tracks (melody + drums), one pattern each (the melody's 16 beats with two notes, the
+/// drums' 8 beats and empty), both placed, in the starter's 128-beat song with its chords.
+/// Rich enough that every `Command` variant has something to bite on.
 fn fixture() -> ProjectModel {
     let mut m = ProjectModel::starter();
-    m.patterns[0].notes_by_track.clear(); // the starter's seeded melody and groove
-    let mut second = SongPattern::new("pattern 2");
-    second.length_beats = 8.0;
-    m.patterns.push(second);
-    let t0 = m.tracks[0].id;
+    m.patterns[0].notes = vec![
+        NoteEvent::new(0.0, 1.0, 60).with_velocity(90),
+        NoteEvent::new(4.0, 2.0, 64).with_velocity(70),
+    ];
+    m.patterns[1].notes.clear(); // the starter's groove
+    m.patterns[1].length_beats = 8.0;
     let p0 = m.patterns[0].id;
     let p1 = m.patterns[1].id;
-    m.patterns[0].notes_by_track.insert(
-        t0,
-        vec![
-            NoteEvent::new(0.0, 1.0, 60).with_velocity(90),
-            NoteEvent::new(4.0, 2.0, 64).with_velocity(70),
-        ],
-    );
     m.clips = vec![clip_at(p0, 0.0, 16.0), clip_at(p1, 16.0, 8.0)];
     m
+}
+
+/// A second pattern on the melody track, so the song can switch melodies over the same beat.
+fn add_melody_pattern(m: &mut ProjectModel, length: f64, notes: Vec<NoteEvent>) -> Uuid {
+    let mut p = SongPattern::new(m.tracks[0].id, "melody 2");
+    p.length_beats = length;
+    p.notes = notes;
+    let id = p.id;
+    m.patterns.push(p);
+    id
 }
 
 /// A clip placing `pattern` on the song timeline.
@@ -41,6 +46,7 @@ fn doc() -> Document {
     Document::new(fixture())
 }
 
+/// (melody track, drum track, melody pattern, drum pattern).
 fn ids(m: &ProjectModel) -> (Uuid, Uuid, Uuid, Uuid) {
     (m.tracks[0].id, m.tracks[1].id, m.patterns[0].id, m.patterns[1].id)
 }
@@ -61,7 +67,7 @@ fn every_variant_is_accounted_for(c: Command) -> &'static str {
         Command::SetTrackVoice { .. } => "SetTrackVoice",
         Command::SetTrackParam { .. } => "SetTrackParam",
         Command::SetTrackColor { .. } => "SetTrackColor",
-        Command::AddPattern => "AddPattern",
+        Command::AddPattern { .. } => "AddPattern",
         Command::DuplicatePattern { .. } => "DuplicatePattern",
         Command::DeletePattern { .. } => "DeletePattern",
         Command::RenamePattern { .. } => "RenamePattern",
@@ -70,7 +76,11 @@ fn every_variant_is_accounted_for(c: Command) -> &'static str {
         Command::SetChords { .. } => "SetChords",
         Command::AddClip { .. } => "AddClip",
         Command::UpdateClip { .. } => "UpdateClip",
+        Command::UpdateClips { .. } => "UpdateClips",
         Command::RemoveClip { .. } => "RemoveClip",
+        Command::RemoveClips { .. } => "RemoveClips",
+        Command::MakeClipUnique { .. } => "MakeClipUnique",
+        Command::SetSongLength { .. } => "SetSongLength",
         Command::AddSection { .. } => "AddSection",
         Command::UpdateSection { .. } => "UpdateSection",
         Command::RemoveSection { .. } => "RemoveSection",
@@ -87,6 +97,7 @@ fn every_variant_is_accounted_for(c: Command) -> &'static str {
 /// One mutating instance of every `Command` variant, bound to the ids of `m`.
 fn one_of_every_variant(m: &ProjectModel) -> Vec<Command> {
     let (t0, _t1, p0, p1) = ids(m);
+    let (c0, c1) = (m.clips[0].clone(), m.clips[1].clone());
     vec![
         Command::SetTempo { bpm: 90.0 },
         Command::SetKey { key: KeyState::locked(5, ScaleType::Minor) },
@@ -103,17 +114,24 @@ fn one_of_every_variant(m: &ProjectModel) -> Vec<Command> {
         Command::SetTrackParam { id: t0, param: TrackParam::Tone, value: 4_000.0 },
         Command::SetTrackParam { id: t0, param: TrackParam::Pan, value: -0.75 },
         Command::SetTrackColor { id: t0, color: Some("#010203".into()) },
-        Command::AddPattern,
+        Command::AddPattern { track_id: t0 },
         Command::DuplicatePattern { id: p0 },
         Command::DeletePattern { id: p1 },
         Command::RenamePattern { id: p0, name: "verse".into() },
         Command::SetPatternLength { id: p0, beats: 32.0 },
-        Command::SetNotes { pattern_id: p1, track_id: t0, notes: vec![NoteEvent::new(1.0, 1.0, 62)] },
-        Command::SetChords {
-            pattern_id: p1,
-            chords: vec![ChordEvent::new(0.0, 4.0, vec![2, 5, 9], Some("Dm".into()))],
-        },
+        Command::SetNotes { pattern_id: p1, notes: vec![NoteEvent::new(1.0, 1.0, 62)] },
+        Command::SetChords { chords: vec![ChordEvent::new(0.0, 4.0, vec![2, 5, 9], Some("Dm".into()))] },
         Command::AddClip { pattern_id: p1, start_beat: 16.0, length_beats: None },
+        Command::UpdateClip { clip: Clip { start_beat: 32.0, ..c1.clone() } },
+        Command::UpdateClips { clips: vec![Clip { start_beat: 4.0, ..c0.clone() }, Clip { muted: true, ..c1.clone() }] },
+        Command::RemoveClip { id: c0.id },
+        Command::RemoveClips { ids: vec![c0.id, c1.id] },
+        Command::MakeClipUnique { id: c0.id },
+        Command::SetSongLength { beats: 20.0 },
+        Command::ImportTracks {
+            tracks: vec![ImportedTrack { name: "piano".into(), is_drum: false, notes: vec![NoteEvent::new(0.0, 1.0, 60)] }],
+            length_beats: 16.0,
+        },
         Command::AddSection { name: "chorus".into(), start_beat: 32.0 },
         Command::SetMaster { master: MasterSettings { gain: 0.5, ..MasterSettings::default() } },
         Command::SetTimeSignature { numerator: 3, denominator: 4 },
@@ -214,11 +232,10 @@ fn a_command_that_changes_nothing_records_no_undo_step() {
     if let Some(clip) = before.clips.first() {
         d.apply(Command::UpdateClip { clip: clip.clone() }, false).unwrap();
     }
-    d.apply(
-        Command::SetNotes { pattern_id: p0, track_id: t0, notes: before.patterns[0].notes(&t0).to_vec() },
-        false,
-    )
-    .unwrap();
+    d.apply(Command::SetNotes { pattern_id: p0, notes: before.patterns[0].notes.clone() }, false).unwrap();
+    d.apply(Command::SetChords { chords: before.chords.clone() }, false).unwrap();
+    d.apply(Command::SetSongLength { beats: before.song_length_beats }, false).unwrap();
+    d.apply(Command::RemoveClips { ids: vec![Uuid::new_v4()] }, false).unwrap();
 
     assert_eq!(d.model(), &before);
     assert!(!d.can_undo(), "a no-op edit polluted the undo stack");
@@ -363,19 +380,25 @@ fn can_undo_only_promises_an_undo_that_will_happen() {
 // ---------------------------------------------------------------- 3. validation
 
 #[test]
-fn the_last_track_and_the_last_pattern_are_protected() {
+fn the_last_track_is_protected_but_a_project_may_have_no_patterns() {
     let mut d = Document::new(ProjectModel::empty());
     let (t0, p0) = (d.model().tracks[0].id, d.model().patterns[0].id);
     assert_eq!(d.apply(Command::DeleteTrack { id: t0 }, false), Err(EditError::LastTrack));
-    assert_eq!(d.apply(Command::DeletePattern { id: p0 }, false), Err(EditError::LastPattern));
     assert_eq!(d.model().tracks.len(), 1);
-    assert_eq!(d.model().patterns.len(), 1);
+    d.apply(Command::DeletePattern { id: p0 }, false).unwrap();
+    assert!(d.model().patterns.is_empty());
+    // Nothing to play in pattern mode, but the song still plays (silence for its length).
+    assert!(Sequence::from_pattern(d.model(), &p0, 0.0).is_none());
+    assert_eq!(Sequence::from_song(d.model()).length_beats, d.model().song_length_beats);
+    // And the track can grow a new one.
+    d.apply(Command::AddPattern { track_id: t0 }, false).unwrap();
+    assert_eq!(d.model().patterns[0].name, "melody 1");
 }
 
 #[test]
 fn unknown_ids_are_rejected() {
     let mut d = doc();
-    let (t0, _, p0, _) = ids(d.model());
+    let (_, _, p0, _) = ids(d.model());
     let ghost = Uuid::new_v4();
 
     use EditError::*;
@@ -395,15 +418,18 @@ fn unknown_ids_are_rejected() {
     assert_eq!(d.apply(Command::DuplicatePattern { id: ghost }, false), Err(NoSuchPattern));
     assert_eq!(d.apply(Command::RenamePattern { id: ghost, name: "x".into() }, false), Err(NoSuchPattern));
     assert_eq!(d.apply(Command::SetPatternLength { id: ghost, beats: 8.0 }, false), Err(NoSuchPattern));
-    assert_eq!(d.apply(Command::SetChords { pattern_id: ghost, chords: vec![] }, false), Err(NoSuchPattern));
+    assert_eq!(d.apply(Command::SetNotes { pattern_id: ghost, notes: vec![] }, false), Err(NoSuchPattern));
+    assert_eq!(d.apply(Command::AddPattern { track_id: ghost }, false), Err(NoSuchTrack));
     assert_eq!(
-        d.apply(Command::SetNotes { pattern_id: ghost, track_id: t0, notes: vec![] }, false),
+        d.apply(Command::AddClip { pattern_id: ghost, start_beat: 0.0, length_beats: None }, false),
         Err(NoSuchPattern)
     );
-    assert_eq!(
-        d.apply(Command::SetNotes { pattern_id: p0, track_id: ghost, notes: vec![] }, false),
-        Err(NoSuchTrack)
-    );
+
+    let stray = Clip::new(p0, 0.0, 4.0);
+    assert_eq!(d.apply(Command::UpdateClip { clip: stray.clone() }, false), Err(NoSuchClip));
+    assert_eq!(d.apply(Command::UpdateClips { clips: vec![stray] }, false), Err(NoSuchClip));
+    assert_eq!(d.apply(Command::RemoveClip { id: ghost }, false), Err(NoSuchClip));
+    assert_eq!(d.apply(Command::MakeClipUnique { id: ghost }, false), Err(NoSuchClip));
 }
 
 #[test]
@@ -419,6 +445,11 @@ fn non_finite_and_out_of_range_values_are_rejected() {
             Err(InvalidValue)
         );
         assert_eq!(d.apply(Command::SetPatternLength { id: p0, beats: bad }, false), Err(InvalidValue));
+        assert_eq!(d.apply(Command::SetSongLength { beats: bad }, false), Err(InvalidValue));
+        assert_eq!(
+            d.apply(Command::AddClip { pattern_id: p0, start_beat: bad, length_beats: None }, false),
+            Err(InvalidValue)
+        );
         assert_eq!(
             d.apply(
                 Command::SetMaster { master: MasterSettings { gain: bad, ..MasterSettings::default() } },
@@ -454,7 +485,7 @@ fn blank_pattern_names_are_rejected() {
             "pattern accepted the blank name {blank:?}"
         );
     }
-    assert_eq!(d.model().patterns[0].name, "pattern 1");
+    assert_eq!(d.model().patterns[0].name, "melody 1");
 }
 
 #[test]
@@ -553,8 +584,12 @@ fn a_refused_command_mutates_nothing_and_records_no_undo_step() {
         Command::SetTrackColor { id: t0, color: Some("nope".into()) },
         Command::SetTrackParam { id: t0, param: TrackParam::Tone, value: f64::NAN },
         Command::DuplicatePattern { id: ghost },
-        Command::SetNotes { pattern_id: ghost, track_id: t0, notes: vec![NoteEvent::new(0.0, 1.0, 60)] },
+        Command::SetNotes { pattern_id: ghost, notes: vec![NoteEvent::new(0.0, 1.0, 60)] },
         Command::SetMaster { master: MasterSettings { high_eq: f64::NAN, ..MasterSettings::default() } },
+        Command::AddClip { pattern_id: p0, start_beat: 500.0, length_beats: None },
+        Command::UpdateClips { clips: vec![Clip { start_beat: 4.0, ..baseline.clips[0].clone() }, Clip::new(p0, 0.0, 4.0)] },
+        Command::SetSongLength { beats: f64::INFINITY },
+        Command::ImportTracks { tracks: vec![], length_beats: 16.0 },
     ];
     for command in refusals {
         assert!(d.apply(command.clone(), false).is_err(), "{command:?} was expected to be refused");
@@ -580,32 +615,26 @@ fn a_refused_transient_command_does_not_open_a_gesture() {
 // ---------------------------------------------------------------- 4. referential integrity
 
 #[test]
-fn deleting_a_track_purges_its_notes_from_every_pattern() {
+fn deleting_a_track_purges_its_patterns_and_their_clips() {
     let mut d = doc();
-    let (t0, t1, p0, p1) = ids(d.model());
-    for pattern_id in [p0, p1] {
-        for track_id in [t0, t1] {
-            d.apply(
-                Command::SetNotes { pattern_id, track_id, notes: vec![NoteEvent::new(0.0, 1.0, 60)] },
-                false,
-            )
-            .unwrap();
-        }
-    }
-    assert_eq!(d.model().patterns[0].notes_by_track.len(), 2);
-    assert_eq!(d.model().patterns[1].notes_by_track.len(), 2);
+    let (t0, _, p0, p1) = ids(d.model());
+    d.apply(Command::AddPattern { track_id: t0 }, false).unwrap();
+    let second = d.model().patterns_of(&t0).nth(1).unwrap().id;
+    d.apply(Command::AddClip { pattern_id: second, start_beat: 32.0, length_beats: None }, false).unwrap();
+    d.apply(Command::SetNotes { pattern_id: p1, notes: vec![NoteEvent::new(0.0, 0.25, 36)] }, false).unwrap();
+    let before = d.model().clone();
 
     d.apply(Command::DeleteTrack { id: t0 }, false).unwrap();
-    for p in &d.model().patterns {
-        assert!(p.notes(&t0).is_empty(), "pattern {} kept notes for the deleted track", p.name);
-        assert!(!p.notes_by_track.contains_key(&t0), "pattern {} kept an orphan note bucket", p.name);
-        assert_eq!(p.notes(&t1).len(), 1, "pattern {} lost the surviving track's notes", p.name);
-    }
+    let m = d.model();
+    assert!(m.patterns.iter().all(|p| p.track_id != t0), "a pattern of the deleted track survived");
+    assert!(m.pattern(&p0).is_none() && m.pattern(&second).is_none());
+    assert!(m.clips.iter().all(|c| c.pattern_id == p1), "a clip of the deleted track survived");
+    assert_eq!(m.clips.len(), 1);
+    assert_eq!(m.pattern(&p1).unwrap().notes.len(), 1, "the surviving track lost its notes");
 
-    // And undo brings every note back.
+    // And undo brings every pattern and clip back.
     assert!(d.undo());
-    assert_eq!(d.model().patterns[0].notes(&t0).len(), 1);
-    assert_eq!(d.model().patterns[1].notes(&t0).len(), 1);
+    assert_eq!(d.model(), &before);
 }
 
 #[test]
@@ -629,59 +658,30 @@ fn deleting_a_pattern_purges_every_clip_of_it_from_the_song() {
 }
 
 #[test]
-fn duplicating_a_pattern_deep_copies_notes_and_chords_with_fresh_ids() {
+fn duplicating_a_pattern_deep_copies_its_notes_on_the_same_track_with_fresh_ids() {
     let mut d = doc();
-    let (t0, t1, p0, _) = ids(d.model());
-    d.apply(
-        Command::SetNotes {
-            pattern_id: p0,
-            track_id: t1,
-            notes: vec![NoteEvent::new(2.0, 1.0, 48), NoteEvent::new(3.0, 1.0, 50)],
-        },
-        false,
-    )
-    .unwrap();
+    let (t0, _, p0, _) = ids(d.model());
     d.apply(Command::DuplicatePattern { id: p0 }, false).unwrap();
 
     let original = d.model().patterns[0].clone();
     let copy = d.model().patterns[1].clone();
     assert_ne!(original.id, copy.id);
+    assert_eq!(copy.track_id, t0, "the copy belongs to the same track");
     assert_eq!(copy.name, format!("{} copy", original.name));
     assert_eq!(copy.length_beats, original.length_beats);
 
-    let note_ids = |p: &SongPattern| {
-        let mut v: Vec<Uuid> = p.notes_by_track.values().flatten().map(|n| n.id).collect();
-        v.sort();
-        v
-    };
-    let a = note_ids(&original);
-    let b = note_ids(&copy);
-    assert_eq!(a.len(), 4, "fixture should have four notes across two tracks");
-    assert_eq!(a.len(), b.len(), "the copy lost notes");
-    for id in &b {
-        assert!(!a.contains(id), "copy shares note id {id} with the original");
+    assert_eq!(original.notes.len(), 2, "fixture should have two melody notes");
+    assert_eq!(copy.notes.len(), original.notes.len(), "the copy lost notes");
+    for n in &copy.notes {
+        assert!(!original.notes.iter().any(|o| o.id == n.id), "copy shares note id {} with the original", n.id);
     }
     // Musical content is identical even though the ids are not.
-    for track_id in [t0, t1] {
-        let orig: Vec<_> = original.notes(&track_id).iter().map(|n| (n.start_beat, n.pitch, n.velocity)).collect();
-        let dup: Vec<_> = copy.notes(&track_id).iter().map(|n| (n.start_beat, n.pitch, n.velocity)).collect();
-        assert_eq!(orig, dup, "duplicated notes differ musically");
-    }
-
-    assert!(!copy.chords.is_empty());
-    assert_eq!(copy.chords.chords().len(), original.chords.chords().len());
-    for c in copy.chords.chords() {
-        assert!(
-            !original.chords.chords().iter().any(|o| o.id == c.id),
-            "copy shares chord id {} with the original",
-            c.id
-        );
-    }
+    let musical = |p: &SongPattern| p.notes.iter().map(|n| (n.start_beat, n.pitch, n.velocity)).collect::<Vec<_>>();
+    assert_eq!(musical(&original), musical(&copy), "duplicated notes differ musically");
 
     // Editing the copy must not reach back into the original.
-    let copy_id = copy.id;
-    d.apply(Command::SetNotes { pattern_id: copy_id, track_id: t1, notes: vec![] }, false).unwrap();
-    assert_eq!(d.model().patterns[0].notes(&t1).len(), 2, "editing the copy mutated the original");
+    d.apply(Command::SetNotes { pattern_id: copy.id, notes: vec![] }, false).unwrap();
+    assert_eq!(d.model().patterns[0].notes.len(), 2, "editing the copy mutated the original");
 }
 
 #[test]
@@ -709,38 +709,65 @@ fn from_pattern_uses_pattern_local_positions_and_honours_pattern_length() {
     let m = fixture();
     let (t0, t1, p0, p1) = ids(&m);
 
-    let seq = Sequence::from_pattern(&m, &p0).expect("pattern 1 exists");
+    let seq = Sequence::from_pattern(&m, &p0, 0.0).expect("pattern 1 exists");
     assert_eq!(seq.length_beats, 16.0);
     assert_eq!(seq.tempo_bpm, m.tempo);
     assert_eq!(seq.tracks.len(), m.tracks.len());
     assert_eq!(seq.tracks[0].id, t0);
     let starts: Vec<f64> = seq.tracks[0].notes.iter().map(|n| n.start_beat).collect();
     assert_eq!(starts, vec![0.0, 4.0], "pattern-mode notes must keep their pattern-local beats");
-    assert!(seq.tracks[1].notes.is_empty(), "track {t1} has no notes in pattern 1");
-    assert!(!seq.chords.is_empty());
+    assert!(seq.tracks[1].notes.is_empty(), "track {t1} is not this pattern's track");
+    assert_eq!(seq.chords.chords().len(), 4, "the progression's first 16 beats");
 
-    let short = Sequence::from_pattern(&m, &p1).unwrap();
+    let short = Sequence::from_pattern(&m, &p1, 0.0).unwrap();
     assert_eq!(short.length_beats, 8.0);
     assert!(short.tracks.iter().all(|t| t.notes.is_empty()));
+    assert_eq!(short.chords.end_beat(), 8.0, "chords are cut at the pattern end");
 
-    assert!(Sequence::from_pattern(&m, &Uuid::new_v4()).is_none(), "unknown pattern id must be None");
+    assert!(Sequence::from_pattern(&m, &Uuid::new_v4(), 0.0).is_none(), "unknown pattern id must be None");
+}
+
+/// Pattern mode tiers against the bar the pattern was opened at: a clip at song beat 8 sees
+/// the song's chords from beat 8, starting at its own beat 0.
+#[test]
+fn pattern_mode_chords_follow_the_chord_offset() {
+    let mut m = fixture();
+    let (_, _, p0, _) = ids(&m);
+    m.chords = vec![
+        ChordEvent::new(0.0, 8.0, vec![0, 4, 7], Some("C".into())),
+        ChordEvent::new(8.0, 8.0, vec![9, 0, 4], Some("Am".into())),
+        ChordEvent::new(16.0, 16.0, vec![5, 9, 0], Some("F".into())),
+    ];
+    let names = |offset: f64| -> Vec<(f64, f64, String)> {
+        let seq = Sequence::from_pattern(&m, &p0, offset).unwrap();
+        seq.chords.chords().iter().map(|c| (c.start_beat, c.length_beats, c.name.clone().unwrap())).collect()
+    };
+    assert_eq!(names(0.0), vec![(0.0, 8.0, "C".into()), (8.0, 8.0, "Am".into())]);
+    assert_eq!(names(8.0), vec![(0.0, 8.0, "Am".into()), (8.0, 8.0, "F".into())]);
+    assert_eq!(names(20.0), vec![(0.0, 12.0, "F".into())], "mid-chord offset, cut at the progression end");
+    // The notes do not move with the offset; only the harmony under them does.
+    let notes = |offset: f64| Sequence::from_pattern(&m, &p0, offset).unwrap().tracks[0].notes.clone();
+    assert_eq!(notes(0.0), notes(8.0));
 }
 
 #[test]
 fn song_flattening_produces_absolute_beat_positions() {
     let mut m = fixture();
-    let (t0, _, p0, p1) = ids(&m);
-    // p0 is 16 beats with notes at 0 and 4; p1 is 8 beats with a note at 2.
-    m.patterns[1].notes_by_track.insert(t0, vec![NoteEvent::new(2.0, 1.0, 67)]);
-    m.clips = vec![clip_at(p0, 0.0, 16.0), clip_at(p1, 16.0, 8.0), clip_at(p0, 24.0, 16.0)];
+    let (_, t1, p0, p1) = ids(&m);
+    // p0 is 16 beats with notes at 0 and 4; melody 2 is 8 beats with a note at 2; the drums
+    // play under all of it from their own pattern.
+    let p2 = add_melody_pattern(&mut m, 8.0, vec![NoteEvent::new(2.0, 1.0, 67)]);
+    m.patterns[1].notes = vec![NoteEvent::new(0.0, 0.25, 36)];
+    m.clips = vec![clip_at(p0, 0.0, 16.0), clip_at(p2, 16.0, 8.0), clip_at(p0, 24.0, 16.0), clip_at(p1, 0.0, 40.0)];
 
     let seq = Sequence::from_song(&m);
-    assert_eq!(seq.length_beats, 16.0 + 8.0 + 16.0);
+    assert_eq!(seq.length_beats, m.song_length_beats, "the song ends at its explicit length");
 
-    let mut starts: Vec<f64> = seq.tracks[0].notes.iter().map(|n| n.start_beat).collect();
-    starts.sort_by(f64::total_cmp);
-    // p0 @0 → 0,4 ; p1 @16 → 18 ; p0 @24 → 24,28
+    let starts: Vec<f64> = seq.tracks[0].notes.iter().map(|n| n.start_beat).collect();
+    // p0 @0 → 0,4 ; melody 2 @16 → 18 ; p0 @24 → 24,28
     assert_eq!(starts, vec![0.0, 4.0, 18.0, 24.0, 28.0]);
+    let drums: Vec<f64> = seq.tracks[1].notes.iter().map(|n| n.start_beat).collect();
+    assert_eq!(drums, vec![0.0, 8.0, 16.0, 24.0, 32.0], "track {t1} loops its own 8-beat pattern");
 
     // Repeated occurrences get distinct but deterministic ids.
     let ids: Vec<Uuid> = seq.tracks[0].notes.iter().map(|n| n.id).collect();
@@ -750,81 +777,72 @@ fn song_flattening_produces_absolute_beat_positions() {
     assert_eq!(unique.len(), ids.len(), "repeated pattern occurrences reused note ids");
     assert_eq!(ids, Sequence::from_song(&m).tracks[0].notes.iter().map(|n| n.id).collect::<Vec<_>>());
 
-    // Chords are offset the same way.
-    let first = seq.chords.chord_at(0.0).unwrap().name.clone();
-    assert_eq!(seq.chords.chord_at(24.0).unwrap().name, first, "the third occurrence lost its chords");
+    // The chords are the project's own, in song beats.
+    assert_eq!(seq.chords.chords(), m.chords.as_slice());
 }
 
 #[test]
 fn a_song_sequence_always_has_a_playable_loop_length() {
-    // `SetPatternLength` refuses anything below 1 beat, but nothing clamps `lengthBeats` when a
-    // project is *loaded*, so a hand-edited or third-party file can carry 0 or a negative
-    // length. `Sequence::from_pattern` already guards this with `.max(1.0)`; `from_song` must
-    // give the same guarantee, otherwise song mode never loops (engine.rs:370 requires
-    // `len > 0.0`) and "Export" fails outright with `RenderError::Empty` (render.rs:40).
+    // `SetPatternLength` refuses anything below 1 beat, but nothing clamps a pattern's
+    // `lengthBeats` when a project is *loaded*, so a hand-edited or third-party file can carry 0
+    // or a negative length. `Sequence::from_pattern` guards this with `.max(1.0)`, and the song
+    // length is held to at least one bar on load; otherwise song mode never loops
+    // (`len > 0.0` in the engine) and "Export" fails outright with `RenderError::Empty`.
     let base = r#"{
+      "schemaVersion": 6,
+      "songLengthBeats": SONG,
       "tracks": [ { "id": "11111111-1111-1111-1111-111111111111", "name": "lead" } ],
-      "patterns": [ { "id": "22222222-2222-2222-2222-222222222222", "name": "p", "lengthBeats": LEN } ],
+      "patterns": [ { "id": "22222222-2222-2222-2222-222222222222", "trackId": "11111111-1111-1111-1111-111111111111", "name": "p", "lengthBeats": LEN } ],
       "clips": [ { "patternId": "22222222-2222-2222-2222-222222222222", "startBeat": 0, "lengthBeats": 16 } ]
     }"#;
     for len in ["0", "-8", "0.25"] {
-        let m = ProjectModel::from_json(&base.replace("LEN", len)).unwrap();
+        let m = ProjectModel::from_json(&base.replace("LEN", len).replace("SONG", len)).unwrap();
         let pid = m.patterns[0].id;
         assert!(
-            Sequence::from_pattern(&m, &pid).unwrap().length_beats >= 1.0,
+            Sequence::from_pattern(&m, &pid, 0.0).unwrap().length_beats >= 1.0,
             "pattern mode produced an unplayable loop for lengthBeats {len}"
         );
         assert!(
-            Sequence::from_song(&m).length_beats >= 1.0,
-            "song mode produced an unplayable loop ({}) for lengthBeats {len}",
+            Sequence::from_song(&m).length_beats >= 4.0,
+            "song mode produced an unplayable loop ({}) for songLengthBeats {len}",
             Sequence::from_song(&m).length_beats
         );
     }
-
-    // Same guarantee when the arrangement is empty and the fallback pattern is degenerate.
-    let m = ProjectModel::from_json(&base.replace("LEN", "0").replace(r#""clips": [ { "patternId": "22222222-2222-2222-2222-222222222222", "startBeat": 0, "lengthBeats": 16 } ]"#, r#""clips": []"#)).unwrap();
-    assert!(Sequence::from_song(&m).length_beats >= 1.0, "empty-arrangement fallback is unplayable");
 }
 
 #[test]
 fn song_flattening_survives_empty_and_degenerate_input() {
-    // Empty song: no notes, length falls back to the first pattern.
+    // Empty song: no notes, but the song is still as long as it says and keeps its chords.
     let mut m = fixture();
     m.clips = vec![];
     let seq = Sequence::from_song(&m);
     assert!(seq.tracks.iter().all(|t| t.notes.is_empty()));
-    assert!(seq.chords.is_empty());
-    assert_eq!(seq.length_beats, 16.0);
+    assert_eq!(seq.chords.chords(), m.chords.as_slice());
+    assert_eq!(seq.length_beats, m.song_length_beats);
 
-    // Clips of patterns that are gone: loading drops them, so the song falls back to the first
-    // pattern's length rather than stretching over clips that can never play.
+    // Clips of patterns that are gone: loading drops them.
     m.clips = vec![clip_at(Uuid::new_v4(), 0.0, 16.0), clip_at(Uuid::new_v4(), 16.0, 16.0)];
     let m = ProjectModel::from_json(&m.to_json().unwrap()).unwrap();
     assert!(m.clips.is_empty(), "clips of deleted patterns survived loading");
     let seq = Sequence::from_song(&m);
-    assert_eq!(seq.length_beats, 16.0);
     assert!(seq.tracks.iter().all(|t| t.notes.is_empty()));
     let mut m = m;
 
     // A dead id in the middle must not shift the patterns after it.
-    let (t0, _, p0, p1) = ids(&m);
-    m.patterns[1].notes_by_track.insert(t0, vec![NoteEvent::new(0.0, 1.0, 67)]);
-    m.clips = vec![clip_at(p0, 0.0, 16.0), clip_at(p1, 16.0, 16.0)];
+    let (_, _, p0, _) = ids(&m);
+    let p2 = add_melody_pattern(&mut m, 16.0, vec![NoteEvent::new(0.0, 1.0, 67)]);
+    m.clips = vec![clip_at(p0, 0.0, 16.0), clip_at(p2, 16.0, 16.0)];
     let seq = Sequence::from_song(&m);
     let starts: Vec<f64> = seq.tracks[0].notes.iter().map(|n| n.start_beat).collect();
-    assert_eq!(
-        Arrangement::total_length(&m.clips),
-        seq.length_beats,
-        "total_length and the flattened timeline disagree"
-    );
+    assert_eq!(Arrangement::total_length(&m.clips), 32.0);
     assert!(starts.contains(&16.0), "the pattern after a dead id was misplaced: {starts:?}");
 
-    // A pattern with no notes and no chords: empty, not a panic.
+    // A pattern with no notes and a project with no chords: empty, not a panic.
     let mut bare = ProjectModel::empty();
     let bare_p = bare.patterns[0].id;
     bare.clips = vec![clip_at(bare_p, 0.0, 16.0)];
     let seq = Sequence::from_song(&bare);
-    assert_eq!(seq.length_beats, 16.0);
+    assert_eq!(seq.length_beats, bare.song_length_beats);
     assert!(seq.chords.is_empty());
     assert!(seq.tracks.iter().all(|t| t.notes.is_empty()));
     assert!(!seq.any_solo());
@@ -835,17 +853,18 @@ fn sequence_carries_mute_and_solo_so_audibility_is_decidable() {
     let mut d = doc();
     let (t0, t1, p0, _) = ids(d.model());
     d.apply(Command::SetTrackMuted { id: t0, muted: true }, false).unwrap();
-    let seq = Sequence::from_pattern(d.model(), &p0).unwrap();
+    let seq = Sequence::from_pattern(d.model(), &p0, 0.0).unwrap();
     assert!(!seq.any_solo());
     assert!(!seq.tracks[0].audible(false), "a muted track must not be audible");
     assert!(seq.tracks[1].audible(false));
 
     d.apply(Command::SetTrackSoloed { id: t1, soloed: true }, false).unwrap();
-    let seq = Sequence::from_pattern(d.model(), &p0).unwrap();
+    let seq = Sequence::from_pattern(d.model(), &p0, 0.0).unwrap();
     assert!(seq.any_solo());
     assert!(!seq.tracks[0].audible(true));
     assert!(seq.tracks[1].audible(true));
 }
+
 
 // ---------------------------------------------------------------- 6. persistence / migration
 
@@ -865,20 +884,17 @@ fn save_load_round_trip_preserves_every_edit() {
     d.apply(
         Command::SetNotes {
             pattern_id: p1,
-            track_id: t1,
             notes: vec![NoteEvent::new(1.5, 0.25, 36).with_velocity(1), NoteEvent::new(2.0, 0.5, 42)],
         },
         false,
     )
     .unwrap();
-    d.apply(
-        Command::SetChords { pattern_id: p1, chords: vec![ChordEvent::new(0.0, 4.0, vec![9, 0, 4], None)] },
-        false,
-    )
-    .unwrap();
+    d.apply(Command::SetChords { chords: vec![ChordEvent::new(0.0, 4.0, vec![9, 0, 4], None)] }, false).unwrap();
+    d.apply(Command::SetSongLength { beats: 96.0 }, false).unwrap();
     for (pattern_id, start) in [(p1, 0.0), (p0, 16.0), (p1, 32.0)] {
         d.apply(Command::AddClip { pattern_id, start_beat: start, length_beats: None }, false).unwrap();
     }
+    d.apply(Command::AddPattern { track_id: t0 }, false).unwrap();
     d.apply(
         Command::SetMaster {
             master: MasterSettings {
@@ -911,25 +927,28 @@ fn save_load_round_trip_preserves_every_edit() {
 fn a_file_missing_newer_optional_fields_opens_with_documented_defaults() {
     let track = "11111111-1111-1111-1111-111111111111";
     let pattern = "22222222-2222-2222-2222-222222222222";
-    // A minimal "v2-era" file: no velocity, no master, no voice/tone/pan, no schemaVersion.
+    // A minimal schema-6 file: no velocity, no master, no voice/tone/pan, no chords, no song
+    // length.
     let json = format!(
         r#"{{
+          "schemaVersion": 6,
           "tempo": 128,
           "tracks": [ {{ "id": "{track}", "name": "lead" }} ],
-          "patterns": [ {{ "id": "{pattern}", "name": "verse",
-            "notesByTrack": {{ "{track}": [ {{ "startBeat": 0, "lengthBeats": 1, "pitch": 60 }} ] }}
+          "patterns": [ {{ "id": "{pattern}", "trackId": "{track}", "name": "verse",
+            "notes": [ {{ "startBeat": 0, "lengthBeats": 1, "pitch": 60 }} ]
           }} ]
         }}"#
     );
-    let m = ProjectModel::from_json(&json).expect("an older file must still open");
+    let m = ProjectModel::from_json(&json).expect("a minimal file must still open");
 
-    assert_eq!(m.schema_version, SCHEMA_VERSION, "schema was not bumped on load");
+    assert_eq!(m.schema_version, SCHEMA_VERSION);
     assert_eq!(m.tempo, 128.0);
     assert_eq!(m.key, KeyState::NONE);
-    assert_eq!(m.arrangement, Vec::<Uuid>::new());
     assert_eq!(m.master, MasterSettings::default());
     assert_eq!(m.master.low_cut_hz, 20.0);
     assert_eq!(m.master.high_cut_hz, 18_000.0);
+    assert!(m.chords.is_empty());
+    assert_eq!(m.song_length_beats, DEFAULT_SONG_BARS as f64 * 4.0, "missing songLengthBeats is the default song");
 
     let t = &m.tracks[0];
     assert_eq!(t.voice, "saw");
@@ -941,29 +960,30 @@ fn a_file_missing_newer_optional_fields_opens_with_documented_defaults() {
 
     let p = &m.patterns[0];
     assert_eq!(p.length_beats, 16.0, "missing lengthBeats must default to 16");
-    assert!(p.chords.is_empty());
+    assert_eq!(p.track_id, t.id);
 
     // A note with no velocity plays at the documented default, and gets a real id.
-    let note = &p.notes(&t.id)[0];
+    let note = &p.notes[0];
     assert_eq!(note.velocity, 100, "a note without velocity must default to 100");
     assert_ne!(note.id, Uuid::nil(), "a note without an id must get a fresh one");
 }
 
 #[test]
 fn an_empty_or_stub_file_still_opens_as_a_usable_project() {
-    for json in ["{}", r#"{"tracks": []}"#, r#"{"patterns": []}"#, r#"{"tracks": [], "patterns": []}"#] {
+    for json in [
+        r#"{"schemaVersion": 6}"#,
+        r#"{"schemaVersion": 6, "tracks": []}"#,
+        r#"{"schemaVersion": 6, "patterns": []}"#,
+        r#"{"schemaVersion": 6, "tracks": [], "patterns": []}"#,
+    ] {
         let m = ProjectModel::from_json(json).unwrap_or_else(|e| panic!("{json} failed to open: {e}"));
         assert!(!m.tracks.is_empty(), "{json} produced a project with no tracks");
-        assert!(!m.patterns.is_empty(), "{json} produced a project with no patterns");
+        assert!(!m.patterns.is_empty(), "{json} produced a project with nothing to write into");
         // And a usable project is one you can immediately play and edit.
-        assert!(Sequence::from_pattern(&m, &m.patterns[0].id).is_some());
+        assert!(Sequence::from_pattern(&m, &m.patterns[0].id, 0.0).is_some());
         let mut d = Document::new(m);
-        let (t0, p0) = (d.model().tracks[0].id, d.model().patterns[0].id);
-        d.apply(
-            Command::SetNotes { pattern_id: p0, track_id: t0, notes: vec![NoteEvent::new(0.0, 1.0, 60)] },
-            false,
-        )
-        .unwrap();
+        let p0 = d.model().patterns[0].id;
+        d.apply(Command::SetNotes { pattern_id: p0, notes: vec![NoteEvent::new(0.0, 1.0, 60)] }, false).unwrap();
     }
 }
 
@@ -978,13 +998,16 @@ fn garbage_input_produces_an_error_not_a_panic() {
         "\"a string\"",
         "{",
         "{ \"tempo\": }",
-        r#"{ "tempo": "fast" }"#,
-        r#"{ "tempo": null }"#,
-        r#"{ "tracks": "nope" }"#,
-        r#"{ "tracks": [ { "voice": "saw" } ] }"#, // track with no name
-        r#"{ "patterns": [ { "name": "p", "lengthBeats": "long" } ] }"#,
-        r#"{ "tracks": [ { "id": "not-a-uuid", "name": "x" } ] }"#,
-        r#"{ "patterns": [ { "name": "p", "notesByTrack": { "nope": [] } } ] }"#,
+        r#"{ "schemaVersion": 6, "tempo": "fast" }"#,
+        r#"{ "schemaVersion": 6, "tempo": null }"#,
+        r#"{ "schemaVersion": 6, "tracks": "nope" }"#,
+        r#"{ "schemaVersion": 6, "tracks": [ { "voice": "saw" } ] }"#, // track with no name
+        r#"{ "schemaVersion": 6, "patterns": [ { "name": "p", "trackId": "11111111-1111-1111-1111-111111111111", "lengthBeats": "long" } ] }"#,
+        r#"{ "schemaVersion": 6, "tracks": [ { "id": "not-a-uuid", "name": "x" } ] }"#,
+        r#"{ "schemaVersion": 6, "patterns": [ { "name": "p", "trackId": "nope" } ] }"#,
+        r#"{ "schemaVersion": 6, "patterns": [ { "name": "p" } ] }"#, // a pattern belongs to a track
+        r#"{ "schemaVersion": 6, "chords": [ { "startBeat": 0 } ] }"#,
+        r#"{ "schemaVersion": 6, "songLengthBeats": "long" }"#,
         "\u{feff}{}",
         deep.as_str(),
     ];
@@ -1007,11 +1030,11 @@ fn a_bare_json_array_is_not_a_project() {
         );
     }
     // An object still opens, including the minimal one.
-    assert_eq!(ProjectModel::from_json("{}").unwrap().tempo, 120.0);
+    assert_eq!(ProjectModel::from_json(r#"{"schemaVersion": 6}"#).unwrap().tempo, 120.0);
 }
 
 #[test]
-fn a_file_from_a_newer_schema_is_refused_rather_than_downgraded() {
+fn files_from_another_schema_are_refused_rather_than_converted() {
     // Opening a future file here would drop every field this build doesn't know, and the next
     // Save would overwrite the user's richer project with the lossy version. Refuse instead.
     let future = SCHEMA_VERSION + 96;
@@ -1021,47 +1044,59 @@ fn a_file_from_a_newer_schema_is_refused_rather_than_downgraded() {
         err.to_string().contains("newer version"),
         "the error should tell the user why: {err}"
     );
-    // The current schema, and anything older, still opens and is normalized forward.
-    for version in [0, 1, SCHEMA_VERSION] {
+    // Anything before schema 6 held every track's notes in each pattern: no migration, a
+    // clear refusal.
+    for version in [0, 1, 2, 3, 4, 5] {
         let json = format!(r#"{{ "schemaVersion": {version}, "tempo": 100 }}"#);
-        assert_eq!(ProjectModel::from_json(&json).unwrap().schema_version, SCHEMA_VERSION);
+        let err = ProjectModel::from_json(&json).expect_err("an old file was opened");
+        assert_eq!(err.to_string(), OLD_SCHEMA_ERROR);
     }
+    let json = format!(r#"{{ "schemaVersion": {SCHEMA_VERSION}, "tempo": 100 }}"#);
+    assert_eq!(ProjectModel::from_json(&json).unwrap().schema_version, SCHEMA_VERSION);
 }
 
 #[test]
-fn loading_drops_notes_attached_to_tracks_that_do_not_exist() {
-    // Note buckets keyed by a track that is not in the project are invisible in the UI and never
-    // played, but would otherwise survive every load/save cycle and grow the file forever.
+fn loading_drops_patterns_of_tracks_that_do_not_exist() {
+    // A pattern of a track that is not in the project is invisible in the UI and never played,
+    // but would otherwise survive every load/save cycle and grow the file forever. Its clips go
+    // with it.
     let ghost = "33333333-3333-3333-3333-333333333333";
     let track = "11111111-1111-1111-1111-111111111111";
     let json = format!(
         r#"{{
+          "schemaVersion": 6,
           "tracks": [ {{ "id": "{track}", "name": "lead" }} ],
-          "patterns": [ {{ "name": "p", "notesByTrack": {{
-            "{track}": [ {{ "startBeat": 0, "lengthBeats": 1, "pitch": 60 }} ],
-            "{ghost}": [ {{ "startBeat": 0, "lengthBeats": 1, "pitch": 72 }} ]
-          }} }} ]
+          "patterns": [
+            {{ "id": "44444444-4444-4444-4444-444444444444", "trackId": "{track}", "name": "p",
+               "notes": [ {{ "startBeat": 0, "lengthBeats": 1, "pitch": 60 }} ] }},
+            {{ "id": "55555555-5555-5555-5555-555555555555", "trackId": "{ghost}", "name": "orphan",
+               "notes": [ {{ "startBeat": 0, "lengthBeats": 1, "pitch": 72 }} ] }}
+          ],
+          "clips": [
+            {{ "patternId": "44444444-4444-4444-4444-444444444444", "startBeat": 0, "lengthBeats": 16 }},
+            {{ "patternId": "55555555-5555-5555-5555-555555555555", "startBeat": 0, "lengthBeats": 16 }}
+          ]
         }}"#
     );
     let m = ProjectModel::from_json(&json).unwrap();
-    let live: Vec<Uuid> = m.tracks.iter().map(|t| t.id).collect();
-    let orphans: Vec<Uuid> = m.patterns[0].notes_by_track.keys().copied().filter(|k| !live.contains(k)).collect();
-    assert!(orphans.is_empty(), "notes survived for tracks that no longer exist: {orphans:?}");
-    // The live track's notes are untouched.
-    assert_eq!(m.patterns[0].notes_by_track[&live[0]].len(), 1);
-    assert_eq!(m.patterns[0].notes_by_track[&live[0]][0].pitch, 60);
+    assert_eq!(m.patterns.len(), 1, "the orphan pattern survived loading");
+    assert_eq!(m.patterns[0].name, "p");
+    assert_eq!(m.patterns[0].notes[0].pitch, 60, "the live track's notes are untouched");
+    assert_eq!(m.clips.len(), 1, "the orphan's clip survived loading");
 }
 
 #[test]
 fn json_is_camel_case_on_every_nested_field() {
     let json = fixture().to_json().unwrap();
-    for key in ["schemaVersion", "notesByTrack", "lengthBeats", "startBeat", "pitchClasses", "isDrum"] {
+    for key in ["schemaVersion", "trackId", "lengthBeats", "startBeat", "pitchClasses", "isDrum", "songLengthBeats"] {
         assert!(json.contains(&format!("\"{key}\"")), "missing camelCase key {key}");
     }
-    for snake in ["length_beats", "start_beat", "notes_by_track", "pitch_classes", "is_drum", "reverb_send"] {
+    for snake in ["length_beats", "start_beat", "track_id", "pitch_classes", "is_drum", "reverb_send", "song_length_beats"] {
         assert!(!json.contains(snake), "snake_case key {snake} leaked into the file");
     }
+    assert!(!json.contains("notesByTrack"), "the schema-5 layout leaked into the file");
 }
+
 
 // ---------------------------------------------------------------- dirty / path tracking
 
