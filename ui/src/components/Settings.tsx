@@ -291,6 +291,10 @@ function EditingTab() {
         <Seg value={e.defaultPatternBars} options={[[1, "1"], [2, "2"], [4, "4"], [8, "8"]]} onChange={(v) => upd({ defaultPatternBars: v })} />
         <span className="k">bars</span>
       </Row>
+      <Row label="song length" hint="where a new song ends; change it per song in SETUP">
+        <Seg value={e.defaultSongBars} options={[[8, "8"], [16, "16"], [32, "32"], [64, "64"]]} onChange={(v) => upd({ defaultSongBars: v })} />
+        <span className="k">bars</span>
+      </Row>
     </>
   );
 }

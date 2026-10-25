@@ -2134,3 +2134,573 @@ select {
     border-top: 1px solid var(--line-1);
   }
 }
+
+/* ── setup ── */
+/* SETUP: fundamentals band, the song as aligned lanes (one scroll, one zoom), tools below. */
+.setup {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-editor);
+}
+.setup .seg.sm > div {
+  padding: 2px 7px;
+  font-size: 9px;
+}
+
+/* Fundamentals band */
+.st-fund {
+  flex: none;
+  display: flex;
+  background: var(--bg-1);
+  border-bottom: 1px solid var(--line-1);
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+.st-fund::-webkit-scrollbar {
+  height: 4px;
+}
+.st-fund .cell {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 8px 14px 9px;
+  border-right: 1px solid var(--line-1);
+  min-width: 0;
+}
+.st-fund .cell.grow {
+  flex: 1;
+  border-right: 0;
+}
+.st-fund .sub {
+  font-size: 9.5px;
+  color: var(--text-5);
+  white-space: nowrap;
+}
+.st-fund .unit {
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  color: var(--text-5);
+}
+.st-fund .big {
+  font-family: var(--font-mono);
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--text-0);
+}
+.st-fund input.big,
+.st-fund select.big {
+  height: 24px;
+  background-color: var(--bg-0);
+}
+.st-fund select.big {
+  background-position: calc(100% - 9px) 10px, calc(100% - 5px) 10px;
+  min-width: 52px;
+}
+.st-fund input[type="range"] {
+  width: 84px;
+  height: 4px;
+  margin: 0;
+  accent-color: var(--accent);
+}
+.st-fund .st-play {
+  min-width: 64px;
+  height: 24px;
+  font-size: 10px;
+}
+.st-fund .st-play.on {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--on-accent);
+}
+
+/* Lane toolbar */
+.st-bar {
+  flex: none;
+  height: 30px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 10px;
+  background: var(--bg-transport);
+  border-bottom: 1px solid var(--line-1);
+  overflow-x: auto;
+  overflow-y: hidden;
+  white-space: nowrap;
+}
+.st-bar > * {
+  flex-shrink: 0;
+}
+.st-bar::-webkit-scrollbar {
+  height: 3px;
+}
+.st-bar .vdiv {
+  height: 16px;
+  margin: 0;
+}
+.setup .st-meta {
+  font-size: 9.5px;
+  color: var(--text-4);
+  white-space: nowrap;
+}
+.st-bar .st-range {
+  font-size: 9.5px;
+  color: var(--accent);
+}
+.st-bar .st-hint {
+  font-size: 9.5px;
+  color: var(--text-6);
+  flex-shrink: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Aligned lanes */
+.st-scroller {
+  flex: none;
+  overflow-x: auto;
+  overflow-y: hidden;
+  background: var(--bg-lane);
+  border-bottom: 1px solid var(--line-1);
+}
+.st-lanes {
+  position: relative;
+  min-width: 100%;
+}
+.st-row {
+  display: flex;
+  border-bottom: 1px solid var(--line-1);
+}
+.st-head {
+  width: var(--setup-head);
+  flex: none;
+  display: flex;
+  align-items: center;
+  padding: 0 10px;
+  border-right: 1px solid var(--line-1);
+  background: var(--bg-1);
+  position: sticky;
+  left: 0;
+  z-index: 3;
+}
+.st-track {
+  position: relative;
+  flex: none;
+}
+.st-ruler {
+  height: 22px;
+  background: var(--bg-1);
+}
+.st-ruler .st-track {
+  cursor: text;
+}
+.st-bar-tick {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  border-left: 1px solid var(--line-1);
+  padding: 5px 0 0 3px;
+  font-family: var(--font-mono);
+  font-size: 9px;
+  color: var(--text-5);
+  pointer-events: none;
+}
+.st-bar-tick.strong {
+  border-left-color: var(--text-6);
+  color: #c8c8d0;
+}
+.st-end {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  border-left: 2px solid var(--text-4);
+  padding: 5px 0 0 4px;
+  font-size: 8.5px;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--text-4);
+  pointer-events: none;
+}
+.st-sel {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  background: rgba(var(--accent-rgb), 0.18);
+  border-left: 1px solid var(--accent);
+  border-right: 1px solid var(--accent);
+  pointer-events: none;
+}
+.st-phtri {
+  position: absolute;
+  bottom: 0;
+  width: 0;
+  height: 0;
+  margin-left: -5px;
+  border-left: 5px solid transparent;
+  border-right: 5px solid transparent;
+  border-bottom: 6px solid var(--text-0);
+  pointer-events: none;
+}
+.st-playline {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: rgba(255, 255, 255, 0.55);
+  pointer-events: none;
+  z-index: 2;
+}
+
+/* Sections strip */
+.st-sections {
+  height: 26px;
+  position: relative;
+  z-index: 4;
+}
+.st-sections .st-track {
+  cursor: copy;
+}
+.st-empty {
+  position: absolute;
+  left: 8px;
+  top: 7px;
+  font-size: 10px;
+  color: var(--text-6);
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+  pointer-events: none;
+}
+.st-section {
+  position: absolute;
+  top: 3px;
+  height: 19px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  border-left: 2px solid;
+  padding: 0 6px;
+  font-weight: 700;
+  font-size: 9.5px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  white-space: nowrap;
+  overflow: hidden;
+  cursor: grab;
+}
+.st-section .k {
+  font-family: var(--font-mono);
+  font-weight: 500;
+  letter-spacing: 0;
+  text-transform: none;
+  opacity: 0.85;
+}
+.st-section.sel {
+  box-shadow: inset 0 0 0 1px currentColor;
+}
+
+/* The chord lane, tall, with its gutter widened to the shared head */
+.setup .chordlane {
+  border-bottom: 1px solid var(--line-1);
+  background: var(--bg-lane);
+}
+.setup .chordlane .gut {
+  width: var(--setup-head);
+  justify-content: flex-start;
+  padding: 0 10px;
+  z-index: 3;
+}
+.setup .chordlane .inner:focus {
+  outline: none;
+}
+.setup .chordlane .inner:focus-visible {
+  box-shadow: inset 0 0 0 1px var(--accent-border);
+}
+.setup .chordlane .hint {
+  left: 10px;
+  top: calc(50% - 7px);
+  font-size: 10.5px;
+  color: var(--text-5);
+  pointer-events: none;
+  z-index: 1;
+}
+.st-underlay {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+.st-underlay > div {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+}
+.st-underlay .barline {
+  border-left: 1px solid var(--line-1);
+}
+.st-underlay .barline.strong {
+  border-left-color: var(--line-strong);
+}
+.st-underlay .beat {
+  border-left: 1px dotted var(--line-0);
+}
+.st-underlay .sel {
+  background: rgba(var(--accent-rgb), 0.08);
+}
+.chordlane.tall .chordblock {
+  flex-direction: column;
+  align-items: flex-start;
+  justify-content: center;
+  gap: 3px;
+  padding: 0 8px;
+}
+.chordlane.tall .chordblock .nm {
+  font-size: 14px;
+  line-height: 1;
+}
+.chordblock .nm {
+  white-space: nowrap;
+}
+.chordblock .sub {
+  display: flex;
+  gap: 8px;
+  font-size: 9px;
+  font-weight: 500;
+  opacity: 0.75;
+  white-space: nowrap;
+}
+.chordblock .sub .len {
+  opacity: 0.8;
+}
+/* Outside the key: dashed, so it reads without color too. */
+.chordblock.outside {
+  border-style: dashed;
+}
+.chordblock.sel {
+  box-shadow: 0 0 0 1px var(--text-0);
+}
+.chordblock .handle.l {
+  right: auto;
+  left: 0;
+}
+.chordlane.editing {
+  overflow: visible;
+  z-index: 5;
+}
+.setup .tempolane .head {
+  flex-direction: column;
+  align-items: flex-start;
+  justify-content: center;
+  gap: 2px;
+}
+
+/* Tools under the lanes */
+.st-tools {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: minmax(270px, 1.15fr) minmax(220px, 0.9fr) minmax(260px, 1.1fr) minmax(220px, 0.9fr);
+  overflow: auto;
+}
+.st-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
+  border-right: 1px solid var(--line-1);
+  min-width: 0;
+  overflow-y: auto;
+}
+.st-panel:last-child {
+  border-right: 0;
+}
+.st-ph {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 18px;
+}
+.st-ph .flabel {
+  white-space: nowrap;
+}
+.st-guide {
+  margin: 0;
+  font-size: 10.5px;
+  line-height: 1.5;
+  color: var(--text-3);
+}
+.st-guide.dim {
+  font-size: 9.5px;
+  color: var(--text-5);
+}
+button.linkish {
+  background: none;
+  border: 0;
+  padding: 0;
+  font: inherit;
+  letter-spacing: 0;
+  text-transform: none;
+  color: var(--accent);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+/* Chord builder (SETUP's chord column, and the lane's own popover) */
+.chordbuilder {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.chordbuilder .big {
+  color: var(--accent);
+  font-family: var(--font-mono);
+  font-size: 18px;
+  font-weight: 700;
+}
+.chordbuilder .pcgrid {
+  margin: 0;
+}
+.cb-diatonic {
+  display: grid;
+  grid-template-columns: repeat(7, 1fr);
+  gap: 3px;
+}
+.cb-diatonic button {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 1px;
+  padding: 3px 0;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  text-transform: none;
+  letter-spacing: 0;
+}
+.cb-diatonic button .rn {
+  font-size: 8.5px;
+  color: var(--text-5);
+}
+.cb-diatonic button.on .rn {
+  color: inherit;
+}
+.cb-roots {
+  display: grid;
+  grid-template-columns: repeat(12, 1fr);
+  gap: 2px;
+}
+.cb-roots button,
+.cb-quals button {
+  padding: 3px 0;
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  text-transform: none;
+  letter-spacing: 0;
+}
+.cb-quals {
+  display: grid;
+  grid-template-columns: repeat(9, 1fr);
+  gap: 2px;
+}
+
+/* Next-chord suggestions */
+.st-next {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.st-next .nx {
+  display: flex;
+  gap: 3px;
+  opacity: 0.6;
+}
+.st-next .nx.common {
+  opacity: 1;
+}
+.st-next .nx.split {
+  margin-top: 6px;
+}
+.st-next .nx-add {
+  flex: 1;
+  display: grid;
+  grid-template-columns: 34px 48px 1fr;
+  align-items: center;
+  text-align: left;
+  padding: 4px 7px;
+  text-transform: none;
+  letter-spacing: 0;
+  font-size: 10.5px;
+  font-weight: 500;
+}
+.st-next .nx-add .rn {
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  color: var(--text-5);
+}
+.st-next .nx-add .nm {
+  font-family: var(--font-mono);
+  font-weight: 700;
+  color: var(--accent);
+}
+.st-next .nx-add .why {
+  color: var(--text-3);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.st-next .nx-swap {
+  font-size: 8.5px;
+  color: var(--text-5);
+}
+
+/* Sections list */
+.st-seclist {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.st-seclist .sr {
+  display: grid;
+  grid-template-columns: 8px 1fr auto auto auto;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 6px;
+  border-radius: 2px;
+  font-size: 10.5px;
+  cursor: pointer;
+}
+.st-seclist .sr:hover {
+  background: var(--bg-2);
+}
+.st-seclist .sr.sel {
+  background: var(--bg-2-sel);
+}
+.st-seclist .sw {
+  width: 8px;
+  height: 8px;
+  border-radius: 1px;
+}
+.st-seclist .nm {
+  font-weight: 600;
+  color: var(--text-1);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.st-seclist .mono {
+  font-size: 9.5px;
+  color: var(--text-3);
+}
+.st-seclist .mono.dim {
+  color: var(--text-5);
+}
+.st-seclist .mono.key {
+  color: var(--accent);
+}
+.sectioneditor.docked {
+  border-top: 1px solid var(--line-1);
+  padding-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
