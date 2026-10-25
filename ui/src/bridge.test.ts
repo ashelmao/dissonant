@@ -432,8 +432,14 @@ describe("setChords", () => {
     });
     const chords = (await model()).chords;
     expect(chords.map((c) => c.startBeat)).toEqual([0, 40]);
-    expect(chords[0].pitchClasses).toEqual([0, 4, 7]);
+    // Order is kept so the root stays first, as `tidy_chords` does.
+    expect(chords[0].pitchClasses).toEqual([4, 0, 7]);
     expect(chords[1].pitchClasses).toEqual([7, 11]);
+  });
+
+  it("cuts each chord at the next one's start", async () => {
+    await b.apply({ type: "setChords", chords: [chord(0, 8, [0, 4, 7]), chord(4, 4, [5, 9, 0])] });
+    expect((await model()).chords.map((c) => [c.startBeat, c.lengthBeats])).toEqual([[0, 4], [4, 4]]);
   });
 });
 

@@ -607,10 +607,14 @@ function reduce(m: ProjectModel, c: Command): void {
       break;
     case "setChords":
       // The project progression, in song beats.
+      // Mirrors `tidy_chords`: pitch classes keep their order (root first), each chord is cut
+      // at the next one's start.
       m.chords = c.chords
-        .filter((ch) => ch.lengthBeats > 0 && ch.startBeat >= 0)
-        .map((ch) => ({ ...ch, pitchClasses: [...new Set(ch.pitchClasses.map(normalize))].sort((a, b) => a - b) }))
-        .sort((a, b) => a.startBeat - b.startBeat);
+        .filter((ch) => allFinite(ch.startBeat, ch.lengthBeats) && ch.lengthBeats > 0 && ch.startBeat >= 0)
+        .map((ch) => ({ ...ch, pitchClasses: [...new Set(ch.pitchClasses.map(normalize))] }))
+        .sort((a, b) => a.startBeat - b.startBeat)
+        .map((ch, i, all) => (all[i + 1] ? { ...ch, lengthBeats: Math.min(ch.lengthBeats, all[i + 1].startBeat - ch.startBeat) } : ch))
+        .filter((ch) => ch.lengthBeats > 1e-9);
       break;
     case "addClip": {
       const p = pattern(c.patternId);
