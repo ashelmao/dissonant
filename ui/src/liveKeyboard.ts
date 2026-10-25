@@ -4,8 +4,9 @@
 //    playhead, top row = its tensions, remapped live as the chord changes. A beginner can jam
 //    in-harmony with no theory. Held keys keep their pitch until released.
 import { useEffect } from "react";
-import { effectiveKey, selectedPattern, useStore } from "./store";
+import { patternChords, selectedPattern, useStore } from "./store";
 import { tierMap } from "./theory";
+import { keyAt } from "./types";
 
 const CHROMATIC_LOW = ["z", "s", "x", "d", "c", "v", "g", "b", "h", "n", "j", "m", ",", "l", ".", ";", "/"];
 const CHROMATIC_HIGH = ["q", "2", "w", "3", "e", "r", "5", "t", "6", "y", "7", "u", "i", "9", "o", "0", "p"];
@@ -28,9 +29,15 @@ export function pitchForKey(key: string, mode: "tier" | "chromatic", octave: num
     return null;
   }
   const pattern = selectedPattern(state);
-  const projectKey = effectiveKey(state);
-  if (!pattern) return null;
-  const map = tierMap(state.playhead, pattern.chords.chords, projectKey);
+  const model = state.snapshot?.model;
+  if (!pattern || !model) return null;
+  // The pattern editor's playhead runs inside the pattern, which sits at `chordOffsetBeats` in
+  // the song; SETUP and SONG run on the song itself. The key is the section key at that song
+  // position, the chords are the ones the editor shows (pattern-relative) or the song's.
+  const inPattern = state.mode === "pattern";
+  const songBeat = inPattern ? state.chordOffsetBeats + state.playhead : state.playhead;
+  const chords = inPattern ? patternChords(state) : model.chords;
+  const map = tierMap(state.playhead, chords, keyAt(model, songBeat));
   const base = 48 + octave * 12;
   const pitches = (tier: "chordTone" | "tension") => {
     const out: number[] = [];

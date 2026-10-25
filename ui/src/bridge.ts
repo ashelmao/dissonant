@@ -6,6 +6,7 @@ import type {
   AudioStatus,
   AudioStatusEvent,
   ChordEvent,
+  Clip,
   ExportProgress,
   ExportRequest,
   ExportResult,
@@ -28,8 +29,8 @@ import type {
   ScaleType,
   VibeInfo,
 } from "./types";
-import { uuid, withDefaults } from "./types";
-import { chordAt, normalize, progression, STARTERS } from "./theory";
+import { beatsPerBar, uuid, withDefaults } from "./types";
+import { chordAt, normalize, progression } from "./theory";
 
 export interface Bridge {
   readonly isTauri: boolean;
@@ -43,7 +44,13 @@ export interface Bridge {
   newProject(starter?: boolean): Promise<Snapshot>;
   openProject(path: string): Promise<Snapshot>;
   saveProject(path?: string): Promise<Snapshot>;
-  setPlaybackContext(mode: PlayMode, patternId: string | null): Promise<void>;
+  /**
+   * What ▶ plays. In pattern mode `chordOffsetBeats` is the song beat the pattern's bar 1 sits
+   * on: the chord bed and tiering use the project chords from there.
+   */
+  /** `ghostPatternId`: another pattern looped along in pattern mode, heard while you write, at
+   *  `ghostLevel` (0…1.5, 1 = its track's own level). */
+  setPlaybackContext(mode: PlayMode, patternId: string | null, chordOffsetBeats: number, ghostPatternId?: string | null, ghostLevel?: number): Promise<void>;
   /** Start playing; with `countInBars` the metronome counts first and the transport starts after. */
   play(countInBars?: number): Promise<void>;
   stop(): Promise<void>;
@@ -58,7 +65,8 @@ export interface Bridge {
   exportWav(request: ExportRequest): Promise<ExportResult>;
   onExportProgress(cb: (p: ExportProgress) => void): () => void;
   exportMidi(path: string, scope: "song" | "pattern"): Promise<string>;
-  importMidi(path: string, patternId: string): Promise<Snapshot>;
+  /** Each MIDI track becomes a new track with one pattern and one clip at beat 0. */
+  importMidi(path: string): Promise<Snapshot>;
   listTemplates(): Promise<TemplateInfo[]>;
   saveTemplate(name: string): Promise<TemplateInfo>;
   deleteTemplate(name: string): Promise<void>;
@@ -142,7 +150,8 @@ async function tauriBridge(): Promise<Bridge> {
     newProject: (starter) => invoke<Snapshot>("new_project", { starter: starter ?? null }),
     openProject: (path) => invoke<Snapshot>("open_project", { path }),
     saveProject: (path) => invoke<Snapshot>("save_project", { path: path ?? null }),
-    setPlaybackContext: (mode, patternId) => invoke("set_playback_context", { mode, patternId }),
+    setPlaybackContext: (mode, patternId, chordOffsetBeats, ghostPatternId = null, ghostLevel = 1) =>
+      invoke("set_playback_context", { mode, patternId, chordOffsetBeats, ghostPatternId, ghostLevel }),
     play: (countInBars) => invoke("transport_play", { countInBars: countInBars ?? null }),
     stop: () => invoke("transport_stop"),
     setMetronome: (on, volume) => invoke("set_metronome", { on, volume: volume ?? null }),
@@ -155,7 +164,7 @@ async function tauriBridge(): Promise<Bridge> {
     exportWav: (request) => invoke<ExportResult>("export_wav", { request }),
     onExportProgress: (cb) => subscribe<ExportProgress>("export-progress", cb),
     exportMidi: (path, scope) => invoke<string>("export_midi", { path, scope }),
-    importMidi: (path, patternId) => invoke<Snapshot>("import_midi", { path, patternId }),
+    importMidi: (path) => invoke<Snapshot>("import_midi", { path }),
     listTemplates: () => invoke<TemplateInfo[]>("list_templates"),
     saveTemplate: (name) => invoke<TemplateInfo>("save_template", { name }),
     deleteTemplate: (name) => invoke("delete_template", { name }),
@@ -221,8 +230,10 @@ const NO_SUCH_PATTERN = "no such pattern";
 const NO_SUCH_CLIP = "no such clip";
 const NO_SUCH_SECTION = "no such section";
 const LAST_TRACK = "a project needs at least one track";
-const LAST_PATTERN = "a project needs at least one pattern";
 const INVALID_VALUE = "invalid value";
+const PAST_SONG_END = "that is past the end of the song";
+/** `ProjectModel` decoding refuses schema < 6 with this text (no migration). */
+export const OLD_SCHEMA = "This project was made with an older version of dissonant and can't be opened.";
 
 function fail(message: string): never {
   // A plain string, not an `Error`: that is what Tauri's `invoke` rejects with.
@@ -256,21 +267,63 @@ function newTrack(isDrum: boolean, name: string): Track {
   };
 }
 
-function newPattern(name: string): SongPattern {
-  return { id: uuid(), name, lengthBeats: 16, chords: { chords: [] }, notesByTrack: {} };
+function newPattern(trackId: string, name: string): SongPattern {
+  return { id: uuid(), trackId, name, lengthBeats: 16, notes: [] };
 }
 
-/** `ProjectModel::empty()`: one melody track, one empty pattern, no key, nothing arranged. */
-function emptyModel(): ProjectModel {
+/** `"<track name> <n>"`: the next free number among that track's patterns. */
+function nextPatternName(m: ProjectModel, track: Track): string {
+  const names = new Set(m.patterns.filter((p) => p.trackId === track.id).map((p) => p.name));
+  let n = names.size + 1;
+  while (names.has(`${track.name} ${n}`)) n++;
+  return `${track.name} ${n}`;
+}
+
+/** A copy of a pattern on the same track: fresh ids, `"<name> copy"`. */
+function copyPattern(p: SongPattern): SongPattern {
+  const copy = clone(p);
+  copy.id = uuid();
+  copy.name = `${p.name} copy`;
+  for (const n of copy.notes) n.id = uuid();
+  return copy;
+}
+
+/** A clip of `patternId` from beat 0 to the song end (loop-extended). */
+function songClip(patternId: string, songLengthBeats: number): Clip {
+  return { id: uuid(), patternId, startBeat: 0, lengthBeats: songLengthBeats, offsetBeats: 0, muted: false };
+}
+
+/** Beats per bar of the model's time signature. */
+const barOf = (m: ProjectModel) => beatsPerBar(m.timeSignature);
+
+/** The mock's stand-in for `settings.json`. */
+const SETTINGS_KEY = "dissonant.mock.settings";
+
+function mockSettings(): Settings {
+  try {
+    return withDefaults(JSON.parse(localStorage.getItem(SETTINGS_KEY) ?? "null"));
+  } catch {
+    return withDefaults(null);
+  }
+}
+
+/** `editing.defaultSongBars`: how long every fresh project's song is. */
+const defaultSongBars = () => Math.max(1, Math.round(mockSettings().editing.defaultSongBars) || 32);
+
+/** `ProjectModel::empty()`: one melody track with one empty pattern, no key, nothing arranged. */
+function emptyModel(songBars = defaultSongBars()): ProjectModel {
+  const melody = newTrack(false, "melody");
   return {
     schemaVersion: SCHEMA_VERSION,
     tempo: 120,
     key: { rootPitchClass: null, scale: "major", isLocked: false },
-    tracks: [newTrack(false, "melody")],
-    patterns: [newPattern("pattern 1")],
+    tracks: [melody],
+    patterns: [newPattern(melody.id, "melody 1")],
     clips: [],
     sections: [],
     master: { gain: 1, reverbWet: 0, lowCutHz: 20, highCutHz: 18000, lowEq: 1, midEq: 1, highEq: 1 },
+    chords: [],
+    songLengthBeats: songBars * 4,
   };
 }
 
@@ -356,43 +409,50 @@ const MOCK_VIBES: MockVibe[] = [
 
 const withSound = (t: Track, [voice, tone, reverb]: Sound): Track => ({ ...t, voice, tone, reverbSend: reverb });
 
-/** `ProjectModel::from_vibe`. */
-function vibeModel(id: string): ProjectModel | null {
+/**
+ * `ProjectModel::from_vibe`: one pattern per track ("keys 1", "bass 1", "drums 1"), the
+ * progression tiled across the whole song, one clip per track from 0 to the song end.
+ */
+function vibeModel(id: string, songBars = defaultSongBars()): ProjectModel | null {
   const v = MOCK_VIBES.find((x) => x.id === id);
   if (!v) return null;
-  const m = emptyModel();
+  const m = emptyModel(songBars);
   m.tempo = v.tempo;
   m.swing = v.swing;
   m.swingGrid = v.swingGrid;
   m.key = { ...v.key };
-  const chords = progression(v.degrees, v.key.rootPitchClass!, v.key.scale, 16, v.chordBeats);
+  m.chords = progression(v.degrees, v.key.rootPitchClass!, v.key.scale, m.songLengthBeats, v.chordBeats);
   const lead = withSound({ ...m.tracks[0], name: v.leadName }, v.leadSound);
   const bass = withSound(newTrack(false, "bass"), v.bassSound);
   const drums = newTrack(true, "drums");
   m.tracks = [lead, bass, drums];
-  const p = m.patterns[0];
-  p.chords = { chords };
-  p.notesByTrack = { [bass.id]: bassLine(chords, v.bass), [drums.id]: grooveHits(v.groove) };
-  m.clips = [{ id: uuid(), patternId: p.id, startBeat: 0, lengthBeats: 16, offsetBeats: 0, muted: false }];
+  m.patterns = [
+    newPattern(lead.id, `${lead.name} 1`),
+    { ...newPattern(bass.id, "bass 1"), notes: bassLine(m.chords, v.bass) },
+    { ...newPattern(drums.id, "drums 1"), notes: grooveHits(v.groove) },
+  ];
+  m.clips = m.patterns.map((p) => songClip(p.id, m.songLengthBeats));
   return m;
 }
 
-/** `ProjectModel::starter()`: I–IV–V–vi in C (key locked), a pluck melody, a drum groove, one clip. */
-function starterModel(): ProjectModel {
-  const m = emptyModel();
+/**
+ * `ProjectModel::starter()`: I–IV–V–vi in C (key locked) across the whole song, a pluck melody
+ * pattern and a drum pattern, each placed from 0 to the song end so ▶ plays music at once.
+ */
+function starterModel(songBars = defaultSongBars()): ProjectModel {
+  const m = emptyModel(songBars);
   m.key = { rootPitchClass: 0, scale: "major", isLocked: true };
-  m.patterns[0].chords = { chords: progression([0, 3, 4, 5], 0, "major", 16) };
+  m.chords = progression([0, 3, 4, 5], 0, "major", m.songLengthBeats);
   const melody = m.tracks[0];
   melody.voice = "pluck";
   melody.reverbSend = 0.2;
   const drums = newTrack(true, "drums");
   m.tracks.push(drums);
-  const p = m.patterns[0];
-  p.notesByTrack[melody.id] = STARTER_MELODY.flatMap((phrase, i) =>
+  m.patterns[0].notes = STARTER_MELODY.flatMap((phrase, i) =>
     phrase.map(([start, lengthBeats, pitch, velocity]) => ({ id: uuid(), startBeat: i * 4 + start, lengthBeats, pitch, velocity })),
   );
-  p.notesByTrack[drums.id] = grooveHits("backbeat");
-  m.clips = [{ id: uuid(), patternId: p.id, startBeat: 0, lengthBeats: p.lengthBeats, offsetBeats: 0, muted: false }];
+  m.patterns.push({ ...newPattern(drums.id, "drums 1"), notes: grooveHits("backbeat") });
+  m.clips = m.patterns.map((p) => songClip(p.id, m.songLengthBeats));
   return m;
 }
 
@@ -415,27 +475,42 @@ function sanitizeNote(n: NoteEvent): NoteEvent {
 }
 
 /** The schema this build writes; mirrors `SCHEMA_VERSION` in crates/dissonant-core/src/model.rs. */
-const SCHEMA_VERSION = 5;
+const SCHEMA_VERSION = 6;
 
-/** `ProjectModel::normalized`, run on anything read back from storage. */
+/**
+ * Decoding plus `ProjectModel::normalized`, run on anything read back from storage. A file
+ * older than schema 6 is refused: there is no migration from patterns that hold every track.
+ */
 function normalizedModel(m: ProjectModel): ProjectModel {
-  // Only ever bump forward, like `normalized()`: relabelling a newer file as ours would make the
-  // next save overwrite it with the fields this build dropped.
-  m.schemaVersion = Math.max(m.schemaVersion ?? 0, SCHEMA_VERSION);
+  if (!((m.schemaVersion ?? 0) >= SCHEMA_VERSION)) fail(OLD_SCHEMA);
   if (m.tracks.length === 0) m.tracks = [newTrack(false, "melody")];
-  if (m.patterns.length === 0) m.patterns = [newPattern("pattern 1")];
   const trackIds = new Set(m.tracks.map((t) => t.id));
-  for (const p of m.patterns) {
-    // Notes keyed by a track that no longer exists are invisible and never played.
-    for (const id of Object.keys(p.notesByTrack)) {
-      if (!trackIds.has(id)) delete p.notesByTrack[id];
-    }
-    for (const notes of Object.values(p.notesByTrack)) {
-      for (let i = 0; i < notes.length; i++) notes[i] = sanitizeNote(notes[i]);
-    }
-  }
+  // A pattern of a track that no longer exists is invisible and never played.
+  m.patterns = (m.patterns ?? []).filter((p) => trackIds.has(p.trackId));
+  for (const p of m.patterns) p.notes = (p.notes ?? []).map(sanitizeNote);
   m.clips = (m.clips ?? []).filter((c) => m.patterns.some((p) => p.id === c.patternId));
+  m.chords = m.chords ?? [];
+  m.songLengthBeats = Number.isFinite(m.songLengthBeats) ? Math.max(barOf(m), m.songLengthBeats) : defaultSongBars() * barOf(m);
   return m;
+}
+
+/**
+ * `AddClip` / `UpdateClip` clamping: a clip may not start at or after the song end, and its end
+ * is cut back to it. Returns the clamped length.
+ */
+function clampToSong(m: ProjectModel, startBeat: number, lengthBeats: number): number {
+  if (startBeat >= m.songLengthBeats) fail(PAST_SONG_END);
+  return Math.min(lengthBeats, m.songLengthBeats - startBeat);
+}
+
+/** `UpdateClip`: the clip id, then values; the pattern never changes (a clip stays on its track). */
+function updateClip(m: ProjectModel, clip: Clip): void {
+  const i = m.clips.findIndex((cl) => cl.id === clip.id);
+  if (i < 0) fail(NO_SUCH_CLIP);
+  if (!allFinite(clip.startBeat, clip.lengthBeats, clip.offsetBeats)) fail(INVALID_VALUE);
+  if (clip.startBeat < 0 || clip.lengthBeats <= 0 || clip.offsetBeats < 0) fail(INVALID_VALUE);
+  const lengthBeats = clampToSong(m, clip.startBeat, clip.lengthBeats);
+  m.clips[i] = { ...clip, patternId: m.clips[i].patternId, lengthBeats };
 }
 
 function clone<T>(x: T): T {
@@ -458,9 +533,13 @@ function reduce(m: ProjectModel, c: Command): void {
     case "setKey":
       m.key = { ...c.key };
       break;
-    case "addTrack":
-      m.tracks.push(newTrack(c.isDrum, c.isDrum ? "drums" : `track ${m.tracks.length + 1}`));
+    case "addTrack": {
+      // A new track comes with one empty pattern, so there is something to open right away.
+      const t = newTrack(c.isDrum, c.isDrum ? "drums" : `track ${m.tracks.length + 1}`);
+      m.tracks.push(t);
+      m.patterns.push(newPattern(t.id, `${t.name} 1`));
       break;
+    }
     case "setTrackColor":
       if (c.color !== null && !/^#[0-9a-f]{6}$/i.test(c.color)) fail(INVALID_VALUE);
       track(c.id).color = c.color === null ? null : c.color.toLowerCase();
@@ -470,7 +549,10 @@ function reduce(m: ProjectModel, c: Command): void {
       const before = m.tracks.length;
       m.tracks = m.tracks.filter((t) => t.id !== c.id);
       if (m.tracks.length === before) fail(NO_SUCH_TRACK);
-      for (const p of m.patterns) delete p.notesByTrack[c.id];
+      // Its patterns go with it, and their clips with them.
+      const gone = new Set(m.patterns.filter((p) => p.trackId === c.id).map((p) => p.id));
+      m.patterns = m.patterns.filter((p) => !gone.has(p.id));
+      m.clips = m.clips.filter((cl) => !gone.has(cl.patternId));
       break;
     }
     case "renameTrack":
@@ -498,26 +580,17 @@ function reduce(m: ProjectModel, c: Command): void {
       track(c.id)[c.param] = clamp(c.value, lo, hi);
       break;
     }
-    case "addPattern": {
-      const p = newPattern(`pattern ${m.patterns.length + 1}`);
-      const root = m.key.rootPitchClass ?? 0;
-      p.chords = { chords: progression(STARTERS[0].degrees, root, m.key.scale, p.lengthBeats) };
-      m.patterns.push(p);
+    case "addPattern":
+      m.patterns.push(newPattern(c.trackId, nextPatternName(m, track(c.trackId))));
       break;
-    }
     case "duplicatePattern": {
       const i = m.patterns.findIndex((p) => p.id === c.id);
       if (i < 0) fail(NO_SUCH_PATTERN);
-      const copy = clone(m.patterns[i]);
-      copy.id = uuid();
-      copy.name = `${copy.name} copy`;
-      for (const notes of Object.values(copy.notesByTrack)) for (const n of notes) n.id = uuid();
-      for (const ch of copy.chords.chords) ch.id = uuid();
-      m.patterns.splice(i + 1, 0, copy);
+      m.patterns.splice(i + 1, 0, copyPattern(m.patterns[i]));
       break;
     }
     case "deletePattern": {
-      if (m.patterns.length <= 1) fail(LAST_PATTERN);
+      // No last-pattern guard: a track may end up with no patterns at all.
       const before = m.patterns.length;
       m.patterns = m.patterns.filter((p) => p.id !== c.id);
       if (m.patterns.length === before) fail(NO_SUCH_PATTERN);
@@ -532,47 +605,66 @@ function reduce(m: ProjectModel, c: Command): void {
       if (!allFinite(c.beats) || c.beats < 1) fail(INVALID_VALUE);
       pattern(c.id).lengthBeats = c.beats;
       break;
-    case "setNotes": {
-      track(c.trackId); // Rust checks the track before the pattern.
-      const p = pattern(c.patternId);
-      const notes: NoteEvent[] = c.notes
-        .map(sanitizeNote)
-        .sort((a, b) => a.startBeat - b.startBeat || a.pitch - b.pitch);
-      if (notes.length === 0) delete p.notesByTrack[c.trackId];
-      else p.notesByTrack[c.trackId] = notes;
+    case "setNotes":
+      pattern(c.patternId).notes = c.notes.map(sanitizeNote).sort((a, b) => a.startBeat - b.startBeat || a.pitch - b.pitch);
       break;
-    }
-    case "setChords": {
-      const p = pattern(c.patternId);
-      const chords: ChordEvent[] = c.chords
-        .filter((ch) => ch.lengthBeats > 0 && ch.startBeat >= 0)
-        .map((ch) => ({ ...ch, pitchClasses: [...new Set(ch.pitchClasses.map(normalize))].sort((a, b) => a - b) }))
-        .sort((a, b) => a.startBeat - b.startBeat);
-      p.chords = { chords };
+    case "setChords":
+      // The project progression, in song beats.
+      // Mirrors `tidy_chords`: pitch classes keep their order (root first), each chord is cut
+      // at the next one's start.
+      m.chords = c.chords
+        .filter((ch) => allFinite(ch.startBeat, ch.lengthBeats) && ch.lengthBeats > 0 && ch.startBeat >= 0)
+        .map((ch) => ({ ...ch, pitchClasses: [...new Set(ch.pitchClasses.map(normalize))] }))
+        .sort((a, b) => a.startBeat - b.startBeat)
+        .map((ch, i, all) => (all[i + 1] ? { ...ch, lengthBeats: Math.min(ch.lengthBeats, all[i + 1].startBeat - ch.startBeat) } : ch))
+        .filter((ch) => ch.lengthBeats > 1e-9);
       break;
-    }
     case "addClip": {
       const p = pattern(c.patternId);
       const length = c.lengthBeats ?? p.lengthBeats;
       if (!allFinite(c.startBeat, length) || c.startBeat < 0 || length <= 0) fail(INVALID_VALUE);
-      m.clips.push({ id: uuid(), patternId: p.id, startBeat: c.startBeat, lengthBeats: length, offsetBeats: 0, muted: false });
+      const lengthBeats = clampToSong(m, c.startBeat, length);
+      m.clips.push({ id: uuid(), patternId: p.id, startBeat: c.startBeat, lengthBeats, offsetBeats: 0, muted: false });
       m.clips.sort((a, b) => a.startBeat - b.startBeat);
       break;
     }
-    case "updateClip": {
-      pattern(c.clip.patternId); // Rust validates the pattern, then the values, then the clip id.
-      if (!allFinite(c.clip.startBeat, c.clip.lengthBeats, c.clip.offsetBeats)) fail(INVALID_VALUE);
-      if (c.clip.startBeat < 0 || c.clip.lengthBeats <= 0 || c.clip.offsetBeats < 0) fail(INVALID_VALUE);
-      const i = m.clips.findIndex((cl) => cl.id === c.clip.id);
-      if (i < 0) fail(NO_SUCH_CLIP);
-      m.clips[i] = { ...c.clip };
+    case "updateClip":
+      updateClip(m, c.clip);
       m.clips.sort((a, b) => a.startBeat - b.startBeat);
       break;
-    }
+    case "updateClips":
+      // One command, so one undo step: a group move.
+      for (const clip of c.clips) updateClip(m, clip);
+      m.clips.sort((a, b) => a.startBeat - b.startBeat);
+      break;
     case "removeClip": {
       const before = m.clips.length;
       m.clips = m.clips.filter((cl) => cl.id !== c.id);
       if (m.clips.length === before) fail(NO_SUCH_CLIP);
+      break;
+    }
+    case "removeClips": {
+      // Unknown ids are skipped, as in the Rust document.
+      const ids = new Set(c.ids);
+      m.clips = m.clips.filter((cl) => !ids.has(cl.id));
+      break;
+    }
+    case "makeClipUnique": {
+      // Fork the clip's pattern (like duplicatePattern) and point just this clip at the copy.
+      const clip = m.clips.find((cl) => cl.id === c.id) ?? fail(NO_SUCH_CLIP);
+      const i = m.patterns.findIndex((p) => p.id === clip.patternId);
+      if (i < 0) fail(NO_SUCH_PATTERN);
+      const copy = copyPattern(m.patterns[i]);
+      m.patterns.splice(i + 1, 0, copy);
+      clip.patternId = copy.id;
+      break;
+    }
+    case "setSongLength": {
+      if (!allFinite(c.beats)) fail(INVALID_VALUE);
+      const end = Math.max(barOf(m), c.beats);
+      m.songLengthBeats = end;
+      // Clips starting at or after the new end go; clips crossing it are trimmed.
+      m.clips = m.clips.filter((cl) => cl.startBeat < end).map((cl) => (cl.startBeat + cl.lengthBeats > end ? { ...cl, lengthBeats: end - cl.startBeat } : cl));
       break;
     }
     case "addSection":
@@ -637,6 +729,7 @@ const MAX_UNDO = 200;
 
 /** The mock's stand-in for the filesystem: one slot, written by save, read by open. */
 const STORAGE_KEY = "dissonant.mock.project";
+const TEMPLATES_KEY = "dissonant.mock.templates";
 
 function mockBridge(): Bridge {
   let model = starterModel();
@@ -706,12 +799,10 @@ function mockBridge(): Bridge {
     });
   }
 
+  /** Song mode ends at the song's hard end; pattern mode loops the context pattern. */
   const loopLength = () => {
-    if (mode === "song" && model.clips.length > 0) {
-      return model.clips.reduce((max, c) => Math.max(max, c.startBeat + c.lengthBeats), 0);
-    }
-    const p = model.patterns.find((x) => x.id === patternId) ?? model.patterns[0];
-    return p?.lengthBeats ?? 16;
+    if (mode === "song") return model.songLengthBeats;
+    return model.patterns.find((x) => x.id === patternId)?.lengthBeats ?? 16;
   };
 
   const tick = () => {
@@ -830,7 +921,7 @@ function mockBridge(): Bridge {
       let useStarter = starter;
       if (useStarter === undefined) {
         try {
-          useStarter = withDefaults(JSON.parse(localStorage.getItem("dissonant.mock.settings") ?? "null")).editing.newProject === "starter";
+          useStarter = mockSettings().editing.newProject === "starter";
         } catch {
           useStarter = true;
         }
@@ -857,6 +948,7 @@ function mockBridge(): Bridge {
       }
       return snapshot();
     },
+    // The mock plays no sound, so the chord offset and the ghost only matter to the engine.
     setPlaybackContext: async (m, pid) => {
       if (m !== mode || pid !== patternId) beat = 0;
       mode = m;
@@ -890,21 +982,21 @@ function mockBridge(): Bridge {
     },
     listTemplates: async () => {
       try {
-        return Object.keys(JSON.parse(localStorage.getItem("dissonant.mock.templates") ?? "{}")).map((name) => ({ name, path: name }));
+        return Object.keys(JSON.parse(localStorage.getItem(TEMPLATES_KEY) ?? "{}")).map((name) => ({ name, path: name }));
       } catch {
         return [];
       }
     },
     saveTemplate: async (name) => {
-      const all = JSON.parse(localStorage.getItem("dissonant.mock.templates") ?? "{}") as Record<string, ProjectModel>;
+      const all = JSON.parse(localStorage.getItem(TEMPLATES_KEY) ?? "{}") as Record<string, ProjectModel>;
       all[name] = clone(model);
-      localStorage.setItem("dissonant.mock.templates", JSON.stringify(all));
+      localStorage.setItem(TEMPLATES_KEY, JSON.stringify(all));
       return { name, path: name };
     },
     deleteTemplate: async (name) => {
-      const all = JSON.parse(localStorage.getItem("dissonant.mock.templates") ?? "{}") as Record<string, ProjectModel>;
+      const all = JSON.parse(localStorage.getItem(TEMPLATES_KEY) ?? "{}") as Record<string, ProjectModel>;
       delete all[name];
-      localStorage.setItem("dissonant.mock.templates", JSON.stringify(all));
+      localStorage.setItem(TEMPLATES_KEY, JSON.stringify(all));
     },
     listVibes: async () => MOCK_VIBES.map(({ id, name, blurb, tempo, key }) => ({ id, name, blurb, tempo, key: { ...key } })),
     newFromVibe: async (id) => {
@@ -912,8 +1004,9 @@ function mockBridge(): Bridge {
       return snapshot();
     },
     newFromTemplate: async (name) => {
-      const all = JSON.parse(localStorage.getItem("dissonant.mock.templates") ?? "{}") as Record<string, ProjectModel>;
-      if (all[name]) replace(clone(all[name]), null);
+      const all = JSON.parse(localStorage.getItem(TEMPLATES_KEY) ?? "{}") as Record<string, ProjectModel>;
+      // A template is a project file: an old one is refused like any other.
+      if (all[name]) replace(normalizedModel(clone(all[name])), null);
       return snapshot();
     },
     onPlayhead: (cb) => {
@@ -949,19 +1042,19 @@ function mockBridge(): Bridge {
       const h = held.get(pitch);
       held.delete(pitch);
       if (!h) return;
-      const track = liveTrack ?? model.tracks[0]?.id;
-      const p = model.patterns.find((x) => x.id === patternId) ?? model.patterns[0];
-      if (!track || !p) return;
+      // Recording lands in the context pattern, and only while the live track is its track.
+      const p = model.patterns.find((x) => x.id === patternId);
+      if (!p || (liveTrack ?? model.tracks[0]?.id) !== p.trackId) return;
       const grid = quantize > 0 ? quantize : 1 / 32;
       let len = beat - h.start;
       if (len < 0) len += p.lengthBeats;
       const start = Math.round((h.start % p.lengthBeats) / grid) * grid;
-      const notes = (p.notesByTrack[track] ?? []).filter((n) => !(n.pitch === pitch && Math.abs(n.startBeat - start) < grid / 2));
+      const notes = p.notes.filter((n) => !(n.pitch === pitch && Math.abs(n.startBeat - start) < grid / 2));
       notes.push({ id: uuid(), startBeat: Math.min(start, p.lengthBeats - grid), lengthBeats: Math.max(grid, Math.round(len / grid) * grid), pitch, velocity: h.velocity });
       pushUndo(clone(model), "record notes");
       redo.length = 0;
       redoLabels.length = 0;
-      reduce(model, { type: "setNotes", patternId: p.id, trackId: track, notes });
+      reduce(model, { type: "setNotes", patternId: p.id, notes });
       for (const cb of docListeners) cb(snapshot());
     },
     setLoop: async (s, e) => {
@@ -1001,16 +1094,10 @@ function mockBridge(): Bridge {
     restoreAutosave: async () => snapshot(),
     discardAutosave: async () => {},
     autosaveNow: async () => null,
-    getSettings: async () => {
-      try {
-        return withDefaults(JSON.parse(localStorage.getItem("dissonant.mock.settings") ?? "null"));
-      } catch {
-        return withDefaults(null);
-      }
-    },
+    getSettings: async () => mockSettings(),
     setSettings: async (settings) => {
       try {
-        localStorage.setItem("dissonant.mock.settings", JSON.stringify(settings));
+        localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
       } catch {
         /* storage unavailable */
       }

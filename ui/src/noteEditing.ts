@@ -415,3 +415,21 @@ export function stepSelection(notes: NoteEvent[], ids: Set<string>, dir: 1 | -1)
   const next = (anchor + dir + ordered.length) % ordered.length;
   return ordered[next].id;
 }
+
+/**
+ * A ghost pattern's notes laid under a pattern `lengthBeats` long: looped every
+ * `ghostLengthBeats` the way the song would loop it, cut at the end, muted notes left out
+ * (they aren't heard either). Ids get a `~<loop>` suffix so they stay unique per pass.
+ */
+export function tileGhost(ghost: NoteEvent[], ghostLengthBeats: number, lengthBeats: number): NoteEvent[] {
+  const step = ghostLengthBeats > 0 ? ghostLengthBeats : lengthBeats;
+  const out: NoteEvent[] = [];
+  for (let loop = 0, off = 0; off < lengthBeats - 1e-9; loop++, off += step) {
+    for (const n of ghost) {
+      const start = n.startBeat + off;
+      if (n.muted || n.startBeat >= step - 1e-9 || start >= lengthBeats - 1e-9) continue;
+      out.push({ ...n, id: `${n.id}~${loop}`, startBeat: start, lengthBeats: Math.min(n.lengthBeats, lengthBeats - start) });
+    }
+  }
+  return out;
+}

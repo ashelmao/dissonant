@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { beatsPerBar, effectiveKey, selectedPattern, selectedTrack, selectedTrackIndex, useStore } from "../store";
+import { beatsPerBar, effectiveKey, selectedPattern, selectedTrack, selectedTrackIndex, usePatternChords, useStore } from "../store";
 import { chordAt, explainNote, midiName, tierMap } from "../theory";
 import {
   adjustVelocity,
@@ -21,17 +21,22 @@ import {
   snapRound,
   splitNotes,
   stepSelection,
+  tileGhost,
   toggleMute,
 } from "../noteEditing";
 import { mixHex, swingWarp, TIER_COLORS, trackColor, uuid, type NoteEvent, type Tier } from "../types";
 import { BASE_BEAT_W, GUTTER } from "./ChordLane";
+import { useMediaQuery, usePixelRatio } from "../uiScale";
 
 // Geometry (from the handoff: 18px rows, 96px beats at 1×, 64px keyboard, 28px ruler)
 const LOW = 24; // C1
 const HIGH = 96; // C7
 const RULER_H = 28;
 const EDGE_PX = 7;
-const VEL_H = 110;
+/** Velocity lane height; shorter when the page is short (a small window or a large ui scale). */
+const VEL_H_TALL = 110;
+const VEL_H_SHORT = 64;
+const SHORT_PAGE = "(max-height: 600px)";
 /** Grid used while ⌥ bypasses snap. */
 const FINE = 1 / 64;
 const BLACK = new Set([1, 3, 6, 8, 10]);
@@ -116,12 +121,22 @@ export function PianoRoll() {
   const playing = useStore((s) => s.playing);
   const selectionRequest = useStore((s) => s.selectionRequest);
   const fold = useStore((s) => s.fold);
-  const ghostTrackId = useStore((s) => s.ghostTrackId);
+  const ghostPatternId = useStore((s) => s.ghostPatternId);
+  const ghostPattern = useStore((s) => s.snapshot?.model.patterns.find((p) => p.id === ghostPatternId) ?? null);
+  // A drum ghost has no pitches worth tiering: it's drawn as the rhythm (hit lines), in its track's color.
+  const ghostDrum = useStore((s) => !!ghostPattern && !!s.snapshot?.model.tracks.find((t) => t.id === ghostPattern.trackId)?.isDrum);
+  const ghostColor = useStore((s) => {
+    const ts = s.snapshot?.model.tracks ?? [];
+    const i = ghostPattern ? ts.findIndex((t) => t.id === ghostPattern.trackId) : -1;
+    return i >= 0 ? trackColor(ts[i], i) : C.text4;
+  });
   const commitGesture = useStore((s) => s.commitGesture);
   const editing = useStore((s) => s.settings.editing);
   const swing = useStore((s) => s.snapshot?.model.swing ?? 50);
   const swingGrid = useStore((s) => s.snapshot?.model.swingGrid ?? 0.5);
   const appearance = useStore((s) => s.settings.appearance);
+  const pixelRatio = usePixelRatio();
+  const VEL_H = useMediaQuery(SHORT_PAGE) ? VEL_H_SHORT : VEL_H_TALL;
   const ROW_H = appearance.rowHeight;
   const defaultVelocity = editing.defaultVelocity;
   // Audition only when the setting says so; drags still audition pitch changes. `beats` is the
@@ -140,13 +155,18 @@ export function PianoRoll() {
   const [scrollLeft, setScrollLeft] = useState(0);
   const [viewW, setViewW] = useState(800);
 
-  const notes = useMemo(() => (pattern && track ? (pattern.notesByTrack[track.id] ?? []) : []), [pattern, track]);
-  const ghostNotes = useMemo(
-    () => (pattern && ghostTrackId && ghostTrackId !== track?.id ? (pattern.notesByTrack[ghostTrackId] ?? []) : []),
-    [pattern, ghostTrackId, track],
-  );
-  const chords = pattern?.chords.chords ?? [];
+  const notes = useMemo(() => (pattern && track ? pattern.notes : []), [pattern, track]);
   const beats = pattern?.lengthBeats ?? 16;
+  // Another pattern's notes, drawn faint behind this one (and heard while hearGhost is on); looped under this
+  // pattern the way the song would loop it. A drum ghost is kept apart (rhythm lines, no rows).
+  const ghostAll = useMemo(
+    () => (ghostPattern && ghostPattern.id !== pattern?.id ? tileGhost(ghostPattern.notes, ghostPattern.lengthBeats, beats) : []),
+    [ghostPattern, pattern?.id, beats],
+  );
+  const ghostNotes = useMemo(() => (ghostDrum ? [] : ghostAll), [ghostDrum, ghostAll]);
+  const ghostHits = useMemo(() => (ghostDrum ? ghostAll : []), [ghostDrum, ghostAll]);
+  // The project chords from where this pattern was opened (`chordOffsetBeats`), shifted to 0.
+  const chords = usePatternChords();
   const beatW = BASE_BEAT_W * zoom;
   const gridW = beats * beatW;
   const shown = preview ?? notes;
@@ -176,7 +196,7 @@ export function PianoRoll() {
 
   const commit = useCallback(
     (next: NoteEvent[], label = "edit notes") => {
-      if (pattern && track) void dispatch({ type: "setNotes", patternId: pattern.id, trackId: track.id, notes: next }, false, label);
+      if (pattern && track) void dispatch({ type: "setNotes", patternId: pattern.id, notes: next }, false, label);
     },
     [dispatch, pattern, track],
   );
@@ -223,7 +243,7 @@ export function PianoRoll() {
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
-    const dpr = window.devicePixelRatio || 1;
+    const dpr = pixelRatio;
     const W = GUTTER + gridW;
     const H = RULER_H + gridH;
     if (canvas.width !== Math.round(W * dpr) || canvas.height !== Math.round(H * dpr)) {
@@ -344,7 +364,7 @@ export function PianoRoll() {
       ctx.fillText(label, x + c.lengthBeats * beatW - tw - 4, 19);
     }
 
-    // Ghost notes: another track, dashed, behind everything else.
+    // Ghost notes: another pattern, dashed, tiered against these chords, behind everything else.
     if (ghostNotes.length) {
       ctx.setLineDash([3, 2]);
       ctx.lineWidth = 1;
@@ -365,6 +385,20 @@ export function PianoRoll() {
       }
       ctx.globalAlpha = 1;
       ctx.setLineDash([]);
+    }
+    // A drum ghost: one faint line per hit (kick and snare/clap stronger than hats), plus a
+    // tick along the ruler's foot, so you can lock a bassline to the kick.
+    if (ghostHits.length) {
+      ctx.fillStyle = ghostColor;
+      for (const h of ghostHits) {
+        const x = Math.round(GUTTER + h.startBeat * beatW);
+        const strong = h.pitch === 36 || h.pitch === 38 || h.pitch === 39;
+        ctx.globalAlpha = (strong ? 0.26 : 0.1) * (0.5 + 0.5 * (h.velocity / 127));
+        ctx.fillRect(x, RULER_H, h.pitch === 36 ? 2 : 1, gridH);
+        ctx.globalAlpha = strong ? 0.9 : 0.45;
+        ctx.fillRect(x, RULER_H - (h.pitch === 36 ? 7 : 4), h.pitch === 36 ? 2 : 1, h.pitch === 36 ? 6 : 3);
+      }
+      ctx.globalAlpha = 1;
     }
 
     // Notes
@@ -525,13 +559,13 @@ export function PianoRoll() {
       ctx.fillStyle = "#b8b8c0";
       ctx.fillText(why, hx + 6, hy + 20);
     }
-  }, [shown, ghostNotes, chords, key, playhead, showLandscape, highlightRows, noteLength, beatW, beats, gridW, gridH, selection, hover, preview, color, rootPc, bpb, loopRegion, looping, ROW_H, appearance, swing, swingGrid, visiblePitches, rowOf, fold]);
+  }, [shown, ghostNotes, ghostHits, ghostColor, chords, key, playhead, showLandscape, highlightRows, noteLength, beatW, beats, gridW, gridH, selection, hover, preview, color, rootPc, bpb, loopRegion, looping, ROW_H, appearance, swing, swingGrid, visiblePitches, rowOf, fold, pixelRatio]);
 
   // ─── Velocity lane canvas ─────────────────────────────────────────────────────────────────
   useEffect(() => {
     const canvas = velRef.current;
     if (!canvas) return;
-    const dpr = window.devicePixelRatio || 1;
+    const dpr = pixelRatio;
     const W = viewW;
     const H = VEL_H;
     if (canvas.width !== Math.round(W * dpr) || canvas.height !== Math.round(H * dpr)) {
@@ -578,7 +612,7 @@ export function PianoRoll() {
     ctx.fillText("127", GUTTER - 8 - ctx.measureText("127").width, 8);
     ctx.fillText("64", GUTTER - 8 - ctx.measureText("64").width, H / 2);
     ctx.fillText("0", GUTTER - 8 - ctx.measureText("0").width, H - 8);
-  }, [shown, chords, key, playhead, beatW, beats, gridW, selection, scrollLeft, viewW, bpb]);
+  }, [shown, chords, key, playhead, beatW, beats, gridW, selection, scrollLeft, viewW, bpb, pixelRatio, VEL_H]);
 
   // ─── Interaction ──────────────────────────────────────────────────────────────────────────
   const local = (e: React.PointerEvent, el: HTMLElement) => {
@@ -821,7 +855,7 @@ export function PianoRoll() {
       const step = (e.deltaY < 0 ? 1 : -1) * (e.shiftKey ? 12 : 1);
       const next = moveNotes(notes, selection, 0, step, { min: LOW, max: HIGH }, beats);
       if (next !== notes && pattern && track) {
-        void dispatch({ type: "setNotes", patternId: pattern.id, trackId: track.id, notes: next }, true, "transpose notes");
+        void dispatch({ type: "setNotes", patternId: pattern.id, notes: next }, true, "transpose notes");
         if (wheelCommit.current) clearTimeout(wheelCommit.current);
         wheelCommit.current = setTimeout(() => void commitGesture(), 400);
       }
@@ -1031,7 +1065,7 @@ export function PianoRoll() {
         <span className="on">velocity</span>
         <span className="sum">{velSummary}</span>
       </div>
-      <div className="vellane">
+      <div className="vellane" style={{ height: VEL_H }}>
         <canvas ref={velRef} onPointerDown={onVelDown} onPointerMove={onVelMove} onPointerUp={endDrag} onPointerCancel={endDrag} onContextMenu={(e) => e.preventDefault()} />
       </div>
     </div>

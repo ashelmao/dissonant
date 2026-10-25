@@ -6,9 +6,8 @@
 //! per gesture.
 
 use crate::midi_file::ImportedTrack;
-use crate::model::{ChordEvent, Clip, KeyState, MasterSettings, NoteEvent, ProjectModel, Section, SongPattern, Track};
+use crate::model::{tidy_chords, ChordEvent, Clip, KeyState, MasterSettings, NoteEvent, ProjectModel, Section, SongPattern, Track};
 use crate::tempo::TempoPoint;
-use crate::theory::harmony;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
@@ -28,7 +27,9 @@ pub enum TrackParam {
 pub enum Command {
     SetTempo { bpm: f64 },
     SetKey { key: KeyState },
+    /// A new track, with one empty pattern ("<track name> 1") to write into.
     AddTrack { is_drum: bool },
+    /// Removes the track, its patterns and their clips.
     DeleteTrack { id: Uuid },
     RenameTrack { id: Uuid, name: String },
     SetTrackMuted { id: Uuid, muted: bool },
@@ -38,20 +39,34 @@ pub enum Command {
     SetTrackParam { id: Uuid, param: TrackParam, value: f64 },
     /// `#rrggbb`, or `None` to fall back to the palette.
     SetTrackColor { id: Uuid, color: Option<String> },
-    AddPattern,
+    /// A new empty pattern on a track, named "<track name> <n>".
+    AddPattern { track_id: Uuid },
+    /// A copy on the same track, with fresh note ids.
     DuplicatePattern { id: Uuid },
+    /// Removes the pattern and its clips. A track may end up with no patterns.
     DeletePattern { id: Uuid },
     RenamePattern { id: Uuid, name: String },
     SetPatternLength { id: Uuid, beats: f64 },
-    /// Replace the notes of one track in one pattern (the roll commits whole arrays).
-    SetNotes { pattern_id: Uuid, track_id: Uuid, notes: Vec<NoteEvent> },
-    /// Replace a pattern's chord track.
-    SetChords { pattern_id: Uuid, chords: Vec<ChordEvent> },
-    /// Place a pattern on the song. `length_beats` defaults to the pattern length.
+    /// Replace a pattern's notes (the roll commits whole arrays).
+    SetNotes { pattern_id: Uuid, notes: Vec<NoteEvent> },
+    /// Replace the project's chord progression (song beats).
+    SetChords { chords: Vec<ChordEvent> },
+    /// Place a pattern on the song (on its own track). `length_beats` defaults to the pattern
+    /// length. Refused at or past the song end; a clip crossing it is cut there.
     AddClip { pattern_id: Uuid, start_beat: f64, length_beats: Option<f64> },
-    /// Move / resize / re-offset / mute a clip (matched by id).
+    /// Move / resize / re-offset / mute a clip (matched by id). The clip keeps its pattern
+    /// (a changed `pattern_id` is ignored) and is held inside the song like `AddClip`.
     UpdateClip { clip: Clip },
+    /// Several `UpdateClip`s as one undo step (a group move). All or nothing.
+    UpdateClips { clips: Vec<Clip> },
     RemoveClip { id: Uuid },
+    /// Remove several clips as one undo step. Unknown ids are skipped.
+    RemoveClips { ids: Vec<Uuid> },
+    /// Fork the clip's pattern into a copy on the same track and point this one clip at it.
+    MakeClipUnique { id: Uuid },
+    /// Move the song's hard end (at least one bar). Clips starting at or after it are
+    /// removed; clips crossing it are cut.
+    SetSongLength { beats: f64 },
     AddSection { name: String, start_beat: f64 },
     UpdateSection { section: Section },
     RemoveSection { id: Uuid },
@@ -59,9 +74,9 @@ pub enum Command {
     SetTimeSignature { numerator: u32, denominator: u32 },
     /// Global swing in percent (50–75) and its grid in beats (0.5 or 0.25).
     SetSwing { swing: f64, grid: f64 },
-    /// Add one track per imported MIDI track, with its notes in `pattern_id`, in one undo step.
-    /// The pattern grows to `length_beats` when that is longer.
-    ImportTracks { pattern_id: Uuid, tracks: Vec<ImportedTrack>, length_beats: f64 },
+    /// Add one track per imported MIDI track, each with one `length_beats` pattern holding its
+    /// notes and one clip of it at beat 0, in one undo step. The song grows to fit.
+    ImportTracks { tracks: Vec<ImportedTrack>, length_beats: f64 },
     /// A tempo change on the song timeline (replaces any point already on that beat).
     AddTempoPoint { beat: f64, bpm: f64, ramp: bool },
     UpdateTempoPoint { point: TempoPoint },
@@ -76,10 +91,10 @@ pub enum EditError {
     NoSuchPattern,
     #[error("a project needs at least one track")]
     LastTrack,
-    #[error("a project needs at least one pattern")]
-    LastPattern,
     #[error("invalid value")]
     InvalidValue,
+    #[error("that is past the end of the song")]
+    PastSongEnd,
     #[error("no such clip")]
     NoSuchClip,
     #[error("no such section")]
@@ -292,7 +307,7 @@ impl Command {
                 TrackParam::Pan => "change pan",
             },
             SetTrackColor { .. } => "color track",
-            AddPattern => "add pattern",
+            AddPattern { .. } => "add pattern",
             DuplicatePattern { .. } => "duplicate pattern",
             DeletePattern { .. } => "delete pattern",
             RenamePattern { .. } => "rename pattern",
@@ -301,7 +316,11 @@ impl Command {
             SetChords { .. } => "edit chords",
             AddClip { .. } => "add clip",
             UpdateClip { .. } => "edit clip",
+            UpdateClips { .. } => "edit clips",
             RemoveClip { .. } => "remove clip",
+            RemoveClips { .. } => "remove clips",
+            MakeClipUnique { .. } => "make clip unique",
+            SetSongLength { .. } => "set song length",
             AddSection { .. } => "add section",
             UpdateSection { .. } => "edit section",
             RemoveSection { .. } => "remove section",
@@ -329,24 +348,22 @@ fn apply_to(m: &mut ProjectModel, command: Command) -> Result<(), EditError> {
         SetKey { key } => m.key = key,
         AddTrack { is_drum } => {
             let n = m.tracks.len() + 1;
-            m.tracks.push(if is_drum {
-                Track::drums("drums")
-            } else {
-                Track::new(format!("track {n}"))
-            });
+            let track = if is_drum { Track::drums("drums") } else { Track::new(format!("track {n}")) };
+            let pattern = SongPattern::new(track.id, next_pattern_name(m, &track));
+            m.tracks.push(track);
+            m.patterns.push(pattern);
         }
         DeleteTrack { id } => {
+            if m.track(&id).is_none() {
+                return Err(EditError::NoSuchTrack);
+            }
             if m.tracks.len() <= 1 {
                 return Err(EditError::LastTrack);
             }
-            let before = m.tracks.len();
             m.tracks.retain(|t| t.id != id);
-            if m.tracks.len() == before {
-                return Err(EditError::NoSuchTrack);
-            }
-            for p in &mut m.patterns {
-                p.notes_by_track.remove(&id);
-            }
+            let gone: Vec<Uuid> = m.patterns_of(&id).map(|p| p.id).collect();
+            m.patterns.retain(|p| p.track_id != id);
+            m.clips.retain(|c| !gone.contains(&c.pattern_id));
         }
         RenameTrack { id, name } => {
             // Matches RenamePattern: a blank name makes the track unidentifiable everywhere.
@@ -386,45 +403,17 @@ fn apply_to(m: &mut ProjectModel, command: Command) -> Result<(), EditError> {
             }
             m.track_mut(&id).ok_or(EditError::NoSuchTrack)?.color = color.map(|c| c.to_lowercase());
         }
-        AddPattern => {
-            let mut p = SongPattern::new(format!("pattern {}", m.patterns.len() + 1));
-            let root = m.key.root_pitch_class.unwrap_or(0);
-            p.chords = crate::chord_track::ChordTrack::new(harmony::progression(
-                &harmony::starters()[0].degrees,
-                root,
-                m.key.scale,
-                p.length_beats,
-                4.0,
-            ));
-            m.patterns.push(p);
+        AddPattern { track_id } => {
+            let track = m.track(&track_id).ok_or(EditError::NoSuchTrack)?;
+            let pattern = SongPattern::new(track_id, next_pattern_name(m, track));
+            // Right after the track's last pattern, so the tree's order is creation order.
+            let at = m.patterns.iter().rposition(|p| p.track_id == track_id).map_or(m.patterns.len(), |i| i + 1);
+            m.patterns.insert(at, pattern);
         }
         DuplicatePattern { id } => {
-            let i = m.patterns.iter().position(|p| p.id == id).ok_or(EditError::NoSuchPattern)?;
-            let mut copy = m.patterns[i].clone();
-            copy.id = Uuid::new_v4();
-            copy.name = format!("{} copy", copy.name);
-            for notes in copy.notes_by_track.values_mut() {
-                for n in notes.iter_mut() {
-                    n.id = Uuid::new_v4();
-                }
-            }
-            let chords: Vec<ChordEvent> = copy
-                .chords
-                .chords()
-                .iter()
-                .cloned()
-                .map(|mut c| {
-                    c.id = Uuid::new_v4();
-                    c
-                })
-                .collect();
-            copy.chords = crate::chord_track::ChordTrack::new(chords);
-            m.patterns.insert(i + 1, copy);
+            duplicate_pattern(m, &id)?;
         }
         DeletePattern { id } => {
-            if m.patterns.len() <= 1 {
-                return Err(EditError::LastPattern);
-            }
             let before = m.patterns.len();
             m.patterns.retain(|p| p.id != id);
             if m.patterns.len() == before {
@@ -444,52 +433,34 @@ fn apply_to(m: &mut ProjectModel, command: Command) -> Result<(), EditError> {
             }
             m.pattern_mut(&id).ok_or(EditError::NoSuchPattern)?.length_beats = beats;
         }
-        SetNotes { pattern_id, track_id, notes } => {
-            if m.track(&track_id).is_none() {
-                return Err(EditError::NoSuchTrack);
-            }
+        SetNotes { pattern_id, notes } => {
             let p = m.pattern_mut(&pattern_id).ok_or(EditError::NoSuchPattern)?;
             let mut notes: Vec<NoteEvent> = notes.into_iter().map(NoteEvent::sanitized).collect();
             notes.sort_by(|a, b| a.start_beat.total_cmp(&b.start_beat).then(a.pitch.cmp(&b.pitch)));
-            if notes.is_empty() {
-                p.notes_by_track.remove(&track_id);
-            } else {
-                p.notes_by_track.insert(track_id, notes);
-            }
+            p.notes = notes;
         }
-        SetChords { pattern_id, chords } => {
-            let p = m.pattern_mut(&pattern_id).ok_or(EditError::NoSuchPattern)?;
-            let chords: Vec<ChordEvent> = chords
-                .into_iter()
-                .filter(|c| c.length_beats > 0.0 && c.start_beat >= 0.0)
-                .map(|mut c| {
-                    c.pitch_classes = c.pitch_classes.iter().map(|&pc| crate::theory::normalize(pc)).collect();
-                    c.pitch_classes.sort_unstable();
-                    c.pitch_classes.dedup();
-                    c
-                })
-                .collect();
-            p.chords = crate::chord_track::ChordTrack::new(chords);
-        }
+        SetChords { chords } => m.chords = tidy_chords(chords),
         AddClip { pattern_id, start_beat, length_beats } => {
             let p = m.pattern(&pattern_id).ok_or(EditError::NoSuchPattern)?;
             let len = length_beats.unwrap_or(p.length_beats);
             if !start_beat.is_finite() || start_beat < 0.0 || !len.is_finite() || len <= 0.0 {
                 return Err(EditError::InvalidValue);
             }
+            if start_beat >= m.song_length_beats {
+                return Err(EditError::PastSongEnd);
+            }
+            let len = len.min(m.song_length_beats - start_beat);
             m.clips.push(Clip::new(pattern_id, start_beat, len));
             m.clips.sort_by(|a, b| a.start_beat.total_cmp(&b.start_beat));
         }
         UpdateClip { clip } => {
-            if m.pattern(&clip.pattern_id).is_none() {
-                return Err(EditError::NoSuchPattern);
+            update_clip(m, clip)?;
+            m.clips.sort_by(|a, b| a.start_beat.total_cmp(&b.start_beat));
+        }
+        UpdateClips { clips } => {
+            for clip in clips {
+                update_clip(m, clip)?;
             }
-            let bad = [clip.start_beat, clip.length_beats, clip.offset_beats].iter().any(|v| !v.is_finite());
-            if bad || clip.start_beat < 0.0 || clip.length_beats <= 0.0 || clip.offset_beats < 0.0 {
-                return Err(EditError::InvalidValue);
-            }
-            let slot = m.clips.iter_mut().find(|c| c.id == clip.id).ok_or(EditError::NoSuchClip)?;
-            *slot = clip;
             m.clips.sort_by(|a, b| a.start_beat.total_cmp(&b.start_beat));
         }
         RemoveClip { id } => {
@@ -498,6 +469,21 @@ fn apply_to(m: &mut ProjectModel, command: Command) -> Result<(), EditError> {
             if m.clips.len() == before {
                 return Err(EditError::NoSuchClip);
             }
+        }
+        RemoveClips { ids } => m.clips.retain(|c| !ids.contains(&c.id)),
+        MakeClipUnique { id } => {
+            let pattern_id = m.clip(&id).ok_or(EditError::NoSuchClip)?.pattern_id;
+            let copy = duplicate_pattern(m, &pattern_id)?;
+            if let Some(c) = m.clips.iter_mut().find(|c| c.id == id) {
+                c.pattern_id = copy;
+            }
+        }
+        SetSongLength { beats } => {
+            if !beats.is_finite() {
+                return Err(EditError::InvalidValue);
+            }
+            m.song_length_beats = beats.max(m.bar_beats());
+            m.fit_clips_to_song();
         }
         AddSection { name, start_beat } => {
             if !start_beat.is_finite() || start_beat < 0.0 {
@@ -527,12 +513,11 @@ fn apply_to(m: &mut ProjectModel, command: Command) -> Result<(), EditError> {
                 return Err(EditError::InvalidValue);
             }
             m.time_signature = crate::model::TimeSignature { numerator, denominator };
+            // The song stays at least one (new) bar long.
+            m.song_length_beats = m.song_length_beats.max(m.bar_beats());
         }
-        ImportTracks { pattern_id, tracks, length_beats } => {
-            if m.pattern(&pattern_id).is_none() {
-                return Err(EditError::NoSuchPattern);
-            }
-            if tracks.is_empty() || !length_beats.is_finite() {
+        ImportTracks { tracks, length_beats } => {
+            if tracks.is_empty() || !length_beats.is_finite() || length_beats < 1.0 {
                 return Err(EditError::InvalidValue);
             }
             for t in tracks {
@@ -540,18 +525,16 @@ fn apply_to(m: &mut ProjectModel, command: Command) -> Result<(), EditError> {
                 if track.name.trim().is_empty() {
                     track.name = format!("track {}", m.tracks.len() + 1);
                 }
-                let mut notes: Vec<NoteEvent> = t.notes.into_iter().map(NoteEvent::sanitized).collect();
-                notes.sort_by(|a, b| a.start_beat.total_cmp(&b.start_beat).then(a.pitch.cmp(&b.pitch)));
-                let id = track.id;
+                let mut pattern = SongPattern::new(track.id, next_pattern_name(m, &track));
+                pattern.length_beats = length_beats;
+                pattern.notes = t.notes.into_iter().map(NoteEvent::sanitized).collect();
+                pattern.notes.sort_by(|a, b| a.start_beat.total_cmp(&b.start_beat).then(a.pitch.cmp(&b.pitch)));
+                m.clips.push(Clip::new(pattern.id, 0.0, length_beats));
                 m.tracks.push(track);
-                if !notes.is_empty() {
-                    m.pattern_mut(&pattern_id).ok_or(EditError::NoSuchPattern)?.notes_by_track.insert(id, notes);
-                }
+                m.patterns.push(pattern);
             }
-            let p = m.pattern_mut(&pattern_id).ok_or(EditError::NoSuchPattern)?;
-            if length_beats > p.length_beats {
-                p.length_beats = length_beats;
-            }
+            m.song_length_beats = m.song_length_beats.max(length_beats);
+            m.clips.sort_by(|a, b| a.start_beat.total_cmp(&b.start_beat));
         }
         AddTempoPoint { beat, bpm, ramp } => {
             if !beat.is_finite() || beat < 0.0 || !bpm.is_finite() {
@@ -614,11 +597,56 @@ fn apply_to(m: &mut ProjectModel, command: Command) -> Result<(), EditError> {
     Ok(())
 }
 
+/// "<track name> <n>" with the first n past the track's pattern count that no pattern of that
+/// track already uses ("bass 1", "bass 2", …).
+fn next_pattern_name(m: &ProjectModel, track: &Track) -> String {
+    let mut n = m.patterns_of(&track.id).count() + 1;
+    loop {
+        let name = format!("{} {n}", track.name);
+        if !m.patterns_of(&track.id).any(|p| p.name == name) {
+            return name;
+        }
+        n += 1;
+    }
+}
+
+/// Insert a copy of a pattern right after it (same track, fresh ids, "<name> copy") and return
+/// the copy's id.
+fn duplicate_pattern(m: &mut ProjectModel, id: &Uuid) -> Result<Uuid, EditError> {
+    let i = m.patterns.iter().position(|p| &p.id == id).ok_or(EditError::NoSuchPattern)?;
+    let copy = m.patterns[i].duplicated();
+    let copy_id = copy.id;
+    m.patterns.insert(i + 1, copy);
+    Ok(copy_id)
+}
+
+/// Replace a clip's placement, keeping its pattern and holding it inside the song: refused at
+/// or past the end, cut where it crosses it. The caller re-sorts.
+fn update_clip(m: &mut ProjectModel, clip: Clip) -> Result<(), EditError> {
+    let end = m.song_length_beats;
+    let slot = m.clips.iter_mut().find(|c| c.id == clip.id).ok_or(EditError::NoSuchClip)?;
+    let bad = [clip.start_beat, clip.length_beats, clip.offset_beats].iter().any(|v| !v.is_finite());
+    if bad || clip.start_beat < 0.0 || clip.length_beats <= 0.0 || clip.offset_beats < 0.0 {
+        return Err(EditError::InvalidValue);
+    }
+    if clip.start_beat >= end {
+        return Err(EditError::PastSongEnd);
+    }
+    *slot = Clip {
+        pattern_id: slot.pattern_id,
+        length_beats: clip.length_beats.min(end - clip.start_beat),
+        ..clip
+    };
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::model::ScaleType;
 
+    /// The starter: melody + drums, one pattern each ("melody 1", "drums 1"), each placed once
+    /// across the whole 128-beat song.
     fn doc() -> Document {
         Document::new(ProjectModel::starter())
     }
@@ -670,31 +698,68 @@ mod tests {
     }
 
     #[test]
-    fn delete_track_removes_notes_and_guards_last() {
-        let mut d = Document::new(ProjectModel::empty());
-        assert_eq!(d.apply(Command::DeleteTrack { id: d.model().tracks[0].id }, false), Err(EditError::LastTrack));
+    fn add_track_comes_with_an_empty_pattern() {
+        let mut d = doc();
         d.apply(Command::AddTrack { is_drum: false }, false).unwrap();
-        let (pid, tid) = (d.model().patterns[0].id, d.model().tracks[1].id);
-        d.apply(
-            Command::SetNotes { pattern_id: pid, track_id: tid, notes: vec![NoteEvent::new(0.0, 1.0, 60)] },
-            false,
-        )
-        .unwrap();
-        d.apply(Command::DeleteTrack { id: tid }, false).unwrap();
+        let t = d.model().tracks.last().unwrap().clone();
+        assert_eq!(t.name, "track 3");
+        let mine: Vec<&SongPattern> = d.model().patterns_of(&t.id).collect();
+        assert_eq!(mine.len(), 1);
+        assert_eq!(mine[0].name, "track 3 1");
+        assert!(mine[0].notes.is_empty());
+        assert_eq!(d.undo_label(), Some("add track"));
+        d.undo();
+        assert_eq!(d.model().patterns.len(), 2, "undo takes the pattern with the track");
+    }
+
+    #[test]
+    fn delete_track_takes_its_patterns_and_clips_and_guards_last() {
+        let mut d = doc();
+        let (melody, drums) = (d.model().tracks[0].id, d.model().tracks[1].id);
+        d.apply(Command::AddPattern { track_id: drums }, false).unwrap();
+        let fill = d.model().patterns_of(&drums).nth(1).unwrap().id;
+        d.apply(Command::AddClip { pattern_id: fill, start_beat: 0.0, length_beats: None }, false).unwrap();
+        assert_eq!(d.model().clips.len(), 3);
+
+        d.apply(Command::DeleteTrack { id: drums }, false).unwrap();
         assert_eq!(d.model().tracks.len(), 1);
-        assert!(d.model().patterns[0].notes_by_track.is_empty());
+        assert!(d.model().patterns.iter().all(|p| p.track_id == melody), "the drum patterns went with the track");
+        assert_eq!(d.model().clips.len(), 1, "and so did their clips");
+        assert_eq!(d.model().clips[0].pattern_id, d.model().patterns[0].id);
+        assert_eq!(d.apply(Command::DeleteTrack { id: melody }, false), Err(EditError::LastTrack));
+        assert_eq!(d.apply(Command::DeleteTrack { id: drums }, false), Err(EditError::NoSuchTrack));
+
+        assert!(d.undo());
+        assert_eq!(d.model().patterns_of(&drums).count(), 2);
+        assert_eq!(d.model().clips.len(), 3);
+    }
+
+    #[test]
+    fn add_pattern_names_after_the_track_and_skips_taken_names() {
+        let mut d = doc();
+        let melody = d.model().tracks[0].id;
+        d.apply(Command::AddPattern { track_id: melody }, false).unwrap();
+        let names: Vec<&str> = d.model().patterns.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["melody 1", "melody 2", "drums 1"], "next to its siblings");
+        let second = d.model().patterns[1].clone();
+        assert_eq!(second.track_id, melody);
+        assert_eq!(second.length_beats, 16.0);
+        d.apply(Command::RenamePattern { id: second.id, name: "melody 3".into() }, false).unwrap();
+        d.apply(Command::AddPattern { track_id: melody }, false).unwrap();
+        assert_eq!(d.model().patterns[2].name, "melody 4");
+        assert_eq!(d.apply(Command::AddPattern { track_id: Uuid::new_v4() }, false), Err(EditError::NoSuchTrack));
     }
 
     #[test]
     fn set_notes_sanitizes_and_sorts() {
         let mut d = doc();
-        let (pid, tid) = (d.model().patterns[0].id, d.model().tracks[0].id);
+        let pid = d.model().patterns[0].id;
         let notes = vec![
             NoteEvent::new(4.0, 1.0, 200).with_velocity(999),
             NoteEvent::new(-3.0, 0.0, 60),
         ];
-        d.apply(Command::SetNotes { pattern_id: pid, track_id: tid, notes }, false).unwrap();
-        let stored = d.model().patterns[0].notes(&tid);
+        d.apply(Command::SetNotes { pattern_id: pid, notes }, false).unwrap();
+        let stored = &d.model().patterns[0].notes;
         assert_eq!(stored[0].start_beat, 0.0);
         assert!(stored[0].length_beats > 0.0);
         assert_eq!(stored[1].pitch, 127);
@@ -702,50 +767,155 @@ mod tests {
     }
 
     #[test]
-    fn add_pattern_seeds_chords_in_the_project_key() {
+    fn set_chords_sorts_and_removes_overlaps() {
         let mut d = doc();
-        d.apply(Command::SetKey { key: KeyState::locked(7, ScaleType::Major) }, false).unwrap();
-        d.apply(Command::AddPattern, false).unwrap();
-        let p = &d.model().patterns[1];
-        assert_eq!(p.chords.chord_at(0.0).unwrap().name.as_deref(), Some("G"));
+        let chords = vec![
+            ChordEvent::new(8.0, 4.0, vec![19, 11, 2, 2], Some("G".into())),
+            ChordEvent::new(0.0, 12.0, vec![0, 4, 7], Some("C".into())),
+            ChordEvent::new(-1.0, 4.0, vec![0], None),
+            ChordEvent::new(12.0, 0.0, vec![0], None),
+        ];
+        d.apply(Command::SetChords { chords }, false).unwrap();
+        let spans: Vec<(f64, f64, Vec<i32>)> =
+            d.model().chords.iter().map(|c| (c.start_beat, c.length_beats, c.pitch_classes.clone())).collect();
+        assert_eq!(spans, vec![(0.0, 8.0, vec![0, 4, 7]), (8.0, 4.0, vec![7, 11, 2])], "root first, folded, no repeats");
+        assert_eq!(d.undo_label(), Some("edit chords"));
     }
 
     #[test]
-    fn delete_pattern_removes_its_clips_and_guards_last() {
+    fn deleting_patterns_removes_their_clips_down_to_none() {
         let mut d = doc();
-        let first = d.model().patterns[0].id;
-        assert_eq!(d.apply(Command::DeletePattern { id: first }, false), Err(EditError::LastPattern));
-        d.apply(Command::DuplicatePattern { id: first }, false).unwrap();
-        let second = d.model().patterns[1].id;
-        d.apply(Command::AddClip { pattern_id: second, start_beat: 16.0, length_beats: None }, false).unwrap();
-        d.apply(Command::AddClip { pattern_id: first, start_beat: 32.0, length_beats: Some(8.0) }, false).unwrap();
-        assert_eq!(d.model().clips.len(), 3);
-        d.apply(Command::DeletePattern { id: first }, false).unwrap();
+        let (melody, drums) = (d.model().patterns[0].id, d.model().patterns[1].id);
+        d.apply(Command::DeletePattern { id: melody }, false).unwrap();
         assert_eq!(d.model().clips.len(), 1);
-        assert_eq!(d.model().clips[0].pattern_id, second);
+        assert_eq!(d.model().clips[0].pattern_id, drums);
+        d.apply(Command::DeletePattern { id: drums }, false).unwrap();
+        assert!(d.model().patterns.is_empty(), "a project may have no patterns at all");
+        assert!(d.model().clips.is_empty());
+        assert_eq!(d.model().tracks.len(), 2, "the tracks stay");
+        assert_eq!(d.apply(Command::DeletePattern { id: drums }, false), Err(EditError::NoSuchPattern));
     }
 
     #[test]
-    fn clips_are_validated_sorted_and_removable() {
+    fn add_clip_is_held_inside_the_song() {
         let mut d = doc();
         let pid = d.model().patterns[0].id;
-        assert_eq!(d.apply(Command::AddClip { pattern_id: Uuid::new_v4(), start_beat: 0.0, length_beats: None }, false), Err(EditError::NoSuchPattern));
+        assert_eq!(d.model().song_length_beats, 128.0);
+        assert_eq!(
+            d.apply(Command::AddClip { pattern_id: Uuid::new_v4(), start_beat: 0.0, length_beats: None }, false),
+            Err(EditError::NoSuchPattern)
+        );
         assert_eq!(d.apply(Command::AddClip { pattern_id: pid, start_beat: -1.0, length_beats: None }, false), Err(EditError::InvalidValue));
-        d.apply(Command::AddClip { pattern_id: pid, start_beat: 64.0, length_beats: Some(8.0) }, false).unwrap();
+        assert_eq!(d.apply(Command::AddClip { pattern_id: pid, start_beat: 128.0, length_beats: None }, false), Err(EditError::PastSongEnd));
+        d.apply(Command::AddClip { pattern_id: pid, start_beat: 120.0, length_beats: None }, false).unwrap();
+        let last = d.model().clips.last().unwrap();
+        assert_eq!((last.start_beat, last.length_beats), (120.0, 8.0), "the 16-beat pattern is cut at the end");
         d.apply(Command::AddClip { pattern_id: pid, start_beat: 32.0, length_beats: Some(8.0) }, false).unwrap();
         let starts: Vec<f64> = d.model().clips.iter().map(|c| c.start_beat).collect();
-        assert_eq!(starts, vec![0.0, 32.0, 64.0]);
-        assert_eq!(d.model().song_length(), 72.0);
-        let mut c = d.model().clips[1].clone();
+        assert_eq!(starts, vec![0.0, 0.0, 32.0, 120.0], "sorted");
+    }
+
+    #[test]
+    fn update_clip_is_clamped_and_keeps_its_pattern() {
+        let mut d = doc();
+        let drums = d.model().patterns[1].id;
+        let mut c = d.model().clips[0].clone();
+        let melody = c.pattern_id;
         c.length_beats = 0.0;
         assert_eq!(d.apply(Command::UpdateClip { clip: c.clone() }, false), Err(EditError::InvalidValue));
-        c.length_beats = 24.0;
+        c.start_beat = 128.0;
+        c.length_beats = 8.0;
+        assert_eq!(d.apply(Command::UpdateClip { clip: c.clone() }, false), Err(EditError::PastSongEnd));
+        c.start_beat = 112.0;
+        c.length_beats = 64.0;
         c.offset_beats = 4.0;
+        c.pattern_id = drums;
         d.apply(Command::UpdateClip { clip: c.clone() }, false).unwrap();
-        assert_eq!(d.model().clip(&c.id).unwrap().offset_beats, 4.0);
-        d.apply(Command::RemoveClip { id: c.id }, false).unwrap();
-        assert_eq!(d.model().clips.len(), 2);
-        assert_eq!(d.apply(Command::RemoveClip { id: c.id }, false), Err(EditError::NoSuchClip));
+        let stored = d.model().clip(&c.id).unwrap();
+        assert_eq!((stored.start_beat, stored.length_beats, stored.offset_beats), (112.0, 16.0, 4.0));
+        assert_eq!(stored.pattern_id, melody, "a clip never changes pattern (or track) by update");
+        let ghost = Clip::new(melody, 0.0, 4.0);
+        assert_eq!(d.apply(Command::UpdateClip { clip: ghost }, false), Err(EditError::NoSuchClip));
+    }
+
+    #[test]
+    fn update_clips_moves_a_group_in_one_step_or_not_at_all() {
+        let mut d = doc();
+        let before = d.model().clone();
+        let mut moved: Vec<Clip> = d.model().clips.clone();
+        for c in &mut moved {
+            c.start_beat = 16.0;
+            c.length_beats = 32.0;
+        }
+        d.apply(Command::UpdateClips { clips: moved.clone() }, false).unwrap();
+        assert!(d.model().clips.iter().all(|c| c.start_beat == 16.0 && c.length_beats == 32.0));
+        assert_eq!(d.undo_label(), Some("edit clips"));
+        assert!(d.undo());
+        assert_eq!(d.model(), &before, "one undo puts the whole group back");
+
+        moved[1].start_beat = 500.0;
+        assert_eq!(d.apply(Command::UpdateClips { clips: moved }, false), Err(EditError::PastSongEnd));
+        assert_eq!(d.model(), &before, "one bad clip refuses the whole move");
+    }
+
+    #[test]
+    fn remove_clips_takes_a_selection_in_one_step() {
+        let mut d = doc();
+        let pid = d.model().patterns[0].id;
+        d.apply(Command::AddClip { pattern_id: pid, start_beat: 64.0, length_beats: None }, false).unwrap();
+        let ids: Vec<Uuid> = d.model().clips.iter().take(2).map(|c| c.id).collect();
+        d.apply(Command::RemoveClips { ids: [ids.clone(), vec![Uuid::new_v4()]].concat() }, false).unwrap();
+        assert_eq!(d.model().clips.len(), 1);
+        assert!(!ids.contains(&d.model().clips[0].id));
+        assert_eq!(d.undo_label(), Some("remove clips"));
+        d.undo();
+        assert_eq!(d.model().clips.len(), 3);
+    }
+
+    #[test]
+    fn make_clip_unique_forks_the_pattern_for_that_clip_only() {
+        let mut d = doc();
+        let melody = d.model().patterns[0].clone();
+        let first = d.model().clips.iter().find(|c| c.pattern_id == melody.id).unwrap().id;
+        d.apply(Command::UpdateClip { clip: Clip { length_beats: 16.0, ..d.model().clip(&first).unwrap().clone() } }, false).unwrap();
+        d.apply(Command::AddClip { pattern_id: melody.id, start_beat: 16.0, length_beats: None }, false).unwrap();
+        let second = d.model().clips.iter().find(|c| c.start_beat == 16.0).unwrap().id;
+
+        d.apply(Command::MakeClipUnique { id: second }, false).unwrap();
+        assert_eq!(d.undo_label(), Some("make clip unique"));
+        let m = d.model();
+        let fork = m.pattern(&m.clip(&second).unwrap().pattern_id).unwrap();
+        assert_ne!(fork.id, melody.id);
+        assert_eq!(fork.track_id, melody.track_id, "the fork stays on the same track");
+        assert_eq!(fork.name, "melody 1 copy");
+        assert_eq!(m.patterns[1].id, fork.id, "listed right after the original");
+        let musical = |p: &SongPattern| p.notes.iter().map(|n| (n.start_beat, n.pitch)).collect::<Vec<_>>();
+        assert_eq!(musical(fork), musical(&melody));
+        assert!(fork.notes.iter().all(|n| melody.notes.iter().all(|o| o.id != n.id)), "fresh note ids");
+        assert_eq!(m.clip(&first).unwrap().pattern_id, melody.id, "the other clip still plays the original");
+        assert_eq!(d.apply(Command::MakeClipUnique { id: Uuid::new_v4() }, false), Err(EditError::NoSuchClip));
+    }
+
+    #[test]
+    fn set_song_length_removes_and_trims_clips_past_the_end() {
+        let mut d = doc();
+        let (melody, drums) = (d.model().patterns[0].id, d.model().patterns[1].id);
+        d.apply(Command::AddClip { pattern_id: melody, start_beat: 48.0, length_beats: Some(16.0) }, false).unwrap();
+        d.apply(Command::AddClip { pattern_id: drums, start_beat: 32.0, length_beats: Some(16.0) }, false).unwrap();
+        d.apply(Command::SetSongLength { beats: 40.0 }, false).unwrap();
+        let m = d.model();
+        assert_eq!(m.song_length_beats, 40.0);
+        let spans: Vec<(f64, f64)> = m.clips.iter().map(|c| (c.start_beat, c.end_beat())).collect();
+        assert_eq!(spans, vec![(0.0, 40.0), (0.0, 40.0), (32.0, 40.0)], "the clip at 48 is gone, the rest end at 40");
+        assert_eq!(d.undo_label(), Some("set song length"));
+
+        d.apply(Command::SetSongLength { beats: 1.0 }, false).unwrap();
+        assert_eq!(d.model().song_length_beats, 4.0, "at least one bar");
+        assert!(d.model().clips.iter().all(|c| c.end_beat() <= 4.0));
+        assert_eq!(d.apply(Command::SetSongLength { beats: f64::NAN }, false), Err(EditError::InvalidValue));
+        d.undo();
+        d.undo();
+        assert_eq!(d.model().clips.len(), 4, "undo brings removed clips back");
     }
 
     #[test]
@@ -766,20 +936,16 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_pattern_gets_fresh_ids() {
+    fn duplicate_pattern_gets_fresh_ids_on_the_same_track() {
         let mut d = doc();
-        let (pid, tid) = (d.model().patterns[0].id, d.model().tracks[0].id);
-        d.apply(
-            Command::SetNotes { pattern_id: pid, track_id: tid, notes: vec![NoteEvent::new(0.0, 1.0, 60)] },
-            false,
-        )
-        .unwrap();
+        let pid = d.model().patterns[0].id;
+        d.apply(Command::SetNotes { pattern_id: pid, notes: vec![NoteEvent::new(0.0, 1.0, 60)] }, false).unwrap();
         d.apply(Command::DuplicatePattern { id: pid }, false).unwrap();
         let (a, b) = (&d.model().patterns[0], &d.model().patterns[1]);
         assert_ne!(a.id, b.id);
-        assert_ne!(a.notes(&tid)[0].id, b.notes(&tid)[0].id);
-        assert_ne!(a.chords.chords()[0].id, b.chords.chords()[0].id);
-        assert_eq!(b.name, "pattern 1 copy");
+        assert_eq!(a.track_id, b.track_id);
+        assert_ne!(a.notes[0].id, b.notes[0].id);
+        assert_eq!(b.name, "melody 1 copy");
     }
 
     #[test]
@@ -799,8 +965,10 @@ mod tests {
     #[test]
     fn time_signature_is_validated() {
         let mut d = doc();
-        d.apply(Command::SetTimeSignature { numerator: 7, denominator: 8 }, false).unwrap();
-        assert_eq!(d.model().time_signature.beats_per_bar(), 3.5);
+        d.apply(Command::SetSongLength { beats: 4.0 }, false).unwrap();
+        d.apply(Command::SetTimeSignature { numerator: 7, denominator: 4 }, false).unwrap();
+        assert_eq!(d.model().time_signature.beats_per_bar(), 7.0);
+        assert_eq!(d.model().song_length_beats, 7.0, "the song stays at least one bar");
         assert_eq!(d.apply(Command::SetTimeSignature { numerator: 0, denominator: 4 }, false), Err(EditError::InvalidValue));
         assert_eq!(d.apply(Command::SetTimeSignature { numerator: 4, denominator: 3 }, false), Err(EditError::InvalidValue));
     }
@@ -813,7 +981,7 @@ mod tests {
         assert_eq!(d.undo_label(), Some("set tempo"));
         let (pid, tid) = (d.model().patterns[0].id, d.model().tracks[0].id);
         d.apply_labeled(
-            Command::SetNotes { pattern_id: pid, track_id: tid, notes: vec![NoteEvent::new(0.0, 1.0, 60)] },
+            Command::SetNotes { pattern_id: pid, notes: vec![NoteEvent::new(0.0, 1.0, 60)] },
             false,
             Some("place note".into()),
         )
@@ -855,29 +1023,39 @@ mod tests {
     }
 
     #[test]
-    fn import_tracks_is_one_undo_step() {
+    fn import_tracks_adds_a_track_pattern_and_clip_each_in_one_undo_step() {
         let mut d = doc();
-        let pid = d.model().patterns[0].id;
-        let before = d.model().tracks.len();
+        let before = d.model().clone();
         d.apply(
             Command::ImportTracks {
-                pattern_id: pid,
                 tracks: vec![
                     ImportedTrack { name: "piano".into(), is_drum: false, notes: vec![NoteEvent::new(0.0, 1.0, 60)] },
                     ImportedTrack { name: "kit".into(), is_drum: true, notes: vec![NoteEvent::new(0.0, 0.25, 36)] },
                 ],
-                length_beats: 32.0,
+                length_beats: 160.0,
             },
             false,
         )
         .unwrap();
-        assert_eq!(d.model().tracks.len(), before + 2);
-        assert!(d.model().tracks[before + 1].is_drum);
-        assert_eq!(d.model().patterns[0].length_beats, 32.0);
+        let m = d.model();
+        assert_eq!(m.tracks.len(), before.tracks.len() + 2);
+        let kit = m.tracks.last().unwrap();
+        assert!(kit.is_drum);
+        let kit_patterns: Vec<&SongPattern> = m.patterns_of(&kit.id).collect();
+        assert_eq!(kit_patterns.len(), 1);
+        assert_eq!(kit_patterns[0].name, "kit 1");
+        assert_eq!(kit_patterns[0].length_beats, 160.0);
+        assert_eq!(kit_patterns[0].notes.len(), 1);
+        let clip = m.clips.iter().find(|c| c.pattern_id == kit_patterns[0].id).unwrap();
+        assert_eq!((clip.start_beat, clip.length_beats), (0.0, 160.0));
+        assert_eq!(m.song_length_beats, 160.0, "the song grows to fit");
         assert_eq!(d.undo_label(), Some("import MIDI"));
         d.undo();
-        assert_eq!(d.model().tracks.len(), before);
-        assert_eq!(d.model().patterns[0].length_beats, 16.0);
+        assert_eq!(d.model(), &before);
+        assert_eq!(
+            d.apply(Command::ImportTracks { tracks: vec![], length_beats: 16.0 }, false),
+            Err(EditError::InvalidValue)
+        );
     }
 
     #[test]
@@ -913,11 +1091,10 @@ mod tests {
     #[test]
     fn intentional_flag_survives_set_notes() {
         let mut d = doc();
-        let (pid, tid) = (d.model().patterns[0].id, d.model().tracks[0].id);
+        let pid = d.model().patterns[0].id;
         let mut n = NoteEvent::new(0.0, 1.0, 65);
         n.intentional = true;
-        d.apply(Command::SetNotes { pattern_id: pid, track_id: tid, notes: vec![n] }, false).unwrap();
-        assert!(d.model().patterns[0].notes(&tid)[0].intentional);
+        d.apply(Command::SetNotes { pattern_id: pid, notes: vec![n] }, false).unwrap();
+        assert!(d.model().patterns[0].notes[0].intentional);
     }
-
 }

@@ -27,7 +27,15 @@ pub enum PlayMode {
 
 struct PlaybackContext {
     mode: PlayMode,
+    /// The pattern being edited (pattern mode plays it; recording writes into it).
     pattern_id: Option<Uuid>,
+    /// The song beat the edited pattern's beat 0 sits on, for the chords it hears and tiers
+    /// against (0 = from song bar 1).
+    chord_offset_beats: f64,
+    /// Another pattern played along in pattern mode (the ghost the user chose to hear), and
+    /// how loud (1 = the track's own level).
+    ghost_pattern_id: Option<Uuid>,
+    ghost_level: f64,
     hear_chords: bool,
     /// The track live input (MIDI / typing keyboard) plays and records into.
     live_track: Option<Uuid>,
@@ -43,6 +51,9 @@ impl Default for PlaybackContext {
         PlaybackContext {
             mode: PlayMode::Pattern,
             pattern_id: None,
+            chord_offset_beats: 0.0,
+            ghost_pattern_id: None,
+            ghost_level: 1.0,
             hear_chords: false,
             live_track: None,
             looping: true,
@@ -105,13 +116,15 @@ pub struct RecoveryCandidate {
     pub saved_at_ms: u64,
 }
 
-/// The on-disk autosave format: the model plus where it belongs.
+/// The on-disk autosave format: the model plus where it belongs. The model is kept as raw
+/// JSON so an autosave from an older schema is still listed, and refused on restore with the
+/// same message as opening an old file.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct AutosaveFile {
     project_path: Option<String>,
     saved_at_ms: u64,
-    model: ProjectModel,
+    model: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -331,7 +344,7 @@ impl AppState {
             let file = AutosaveFile {
                 project_path: doc.path.as_ref().map(|p| p.display().to_string()),
                 saved_at_ms: now_ms(),
-                model: doc.model().clone(),
+                model: serde_json::to_value(doc.model()).ok()?,
             };
             (serde_json::to_string(&file).ok()?, target, doc.revision())
         };
@@ -409,7 +422,12 @@ impl AppState {
                 doc.replace(model, path);
             }
         }
-        self.playback.lock().unwrap().pattern_id = None;
+        {
+            let mut ctx = self.playback.lock().unwrap();
+            ctx.pattern_id = None;
+            ctx.chord_offset_beats = 0.0;
+            ctx.ghost_pattern_id = None;
+        }
         self.send(EngineCommand::Stop);
         self.send(EngineCommand::Seek { beat: 0.0 });
         self.sync_engine();
@@ -428,7 +446,7 @@ impl AppState {
         let seq = {
             let doc = self.doc.lock().unwrap();
             let ctx = self.playback.lock().unwrap();
-            build_sequence(doc.model(), ctx.mode, ctx.pattern_id)
+            build_sequence(doc.model(), ctx.mode, ctx.pattern_id, ctx.chord_offset_beats, ctx.ghost_pattern_id.map(|g| (g, ctx.ghost_level)))
         };
         let master = self.doc.lock().unwrap().model().master.clone();
         self.send(EngineCommand::SetSequence(Arc::new(seq)));
@@ -457,16 +475,36 @@ fn autosave_path_for(project: &std::path::Path) -> PathBuf {
     project.with_file_name(name)
 }
 
-fn build_sequence(model: &ProjectModel, mode: PlayMode, pattern_id: Option<Uuid>) -> Sequence {
+/// Song mode (SETUP and SONG in the UI) plays the whole song, empty or not. Pattern mode plays
+/// the context pattern alone against the chords from `chord_offset_beats`; with no pattern (or
+/// one that is gone) it plays nothing, but every track is still there for live input. A ghost
+/// pattern, when given, loops along on its own track (live listening only; exports pass none).
+fn build_sequence(
+    model: &ProjectModel,
+    mode: PlayMode,
+    pattern_id: Option<Uuid>,
+    chord_offset_beats: f64,
+    ghost: Option<(Uuid, f64)>,
+) -> Sequence {
     match mode {
-        PlayMode::Song if !model.clips.is_empty() => Sequence::from_song(model),
-        _ => {
-            let pid = pattern_id
-                .filter(|id| model.pattern(id).is_some())
-                .or_else(|| model.patterns.first().map(|p| p.id));
-            pid.and_then(|id| Sequence::from_pattern(model, &id))
-                .unwrap_or_else(|| Sequence::from_song(model))
-        }
+        PlayMode::Song => Sequence::from_song(model),
+        PlayMode::Pattern => pattern_id
+            .and_then(|id| Sequence::from_pattern(model, &id, chord_offset_beats))
+            .map(|seq| match ghost.filter(|(g, _)| Some(*g) != pattern_id) {
+                Some((id, level)) => seq.with_ghost(model, &id, level),
+                None => seq,
+            })
+            .unwrap_or_else(|| Sequence::silent(model, model.bar_beats() * 4.0)),
+    }
+}
+
+/// The message for a project file that would not open. The old-schema refusal is shown as is.
+fn open_error(e: serde_json::Error) -> String {
+    let message = e.to_string();
+    if message == dissonant_core::OLD_SCHEMA_ERROR {
+        message
+    } else {
+        format!("not a dissonant project: {message}")
     }
 }
 
@@ -509,19 +547,23 @@ fn redo(state: State<'_, AppState>) -> Snapshot {
     state.snapshot()
 }
 
-/// A new project shaped by the editing defaults (tempo, time signature, pattern length,
-/// starter vs empty). An explicit `starter` overrides the setting.
+/// A new project shaped by the editing defaults (tempo, time signature, pattern length, song
+/// length, starter vs empty). An explicit `starter` overrides the setting.
 #[tauri::command]
 fn new_project(state: State<'_, AppState>, starter: Option<bool>) -> Snapshot {
     let e = state.settings().editing;
     let starter = starter.unwrap_or(e.new_project == NewProjectKind::Starter);
     let bar = e.default_time_signature.beats_per_bar();
     let beats = (e.default_pattern_bars.max(1) as f64) * bar;
+    let song_bars = e.default_song_bars.max(1);
     // The starter is built at the default size, so its melody and groove fill the pattern.
-    let mut model = if starter { ProjectModel::starter_shaped(beats, bar) } else { ProjectModel::empty() };
+    let mut model = if starter { ProjectModel::starter_shaped(beats, bar, song_bars) } else { ProjectModel::empty() };
     model.tempo = e.default_tempo;
     model.time_signature = e.default_time_signature;
-    model.patterns[0].length_beats = beats;
+    model.song_length_beats = song_bars as f64 * bar;
+    for p in &mut model.patterns {
+        p.length_beats = beats;
+    }
     state.load_model(model, None, false);
     state.snapshot()
 }
@@ -529,7 +571,7 @@ fn new_project(state: State<'_, AppState>, starter: Option<bool>) -> Snapshot {
 #[tauri::command]
 fn open_project(state: State<'_, AppState>, path: String) -> Result<Snapshot, String> {
     let json = std::fs::read_to_string(&path).map_err(|e| format!("could not read {path}: {e}"))?;
-    let model = ProjectModel::from_json(&json).map_err(|e| format!("not a dissonant project: {e}"))?;
+    let model = ProjectModel::from_json(&json).map_err(open_error)?;
     let file = PathBuf::from(&path);
     state.remember_recent(&file);
     state.load_model(model, Some(file), false);
@@ -585,8 +627,9 @@ fn recovery_candidates(state: State<'_, AppState>) -> Vec<RecoveryCandidate> {
 fn restore_autosave(state: State<'_, AppState>, autosave_path: String) -> Result<Snapshot, String> {
     let json = std::fs::read_to_string(&autosave_path).map_err(|e| format!("could not read autosave: {e}"))?;
     let file: AutosaveFile = serde_json::from_str(&json).map_err(|e| format!("not an autosave: {e}"))?;
+    let model = ProjectModel::from_value(file.model).map_err(open_error)?;
     let path = file.project_path.map(PathBuf::from);
-    state.load_model(file.model.normalized(), path, true);
+    state.load_model(model, path, true);
     // The restored document now owns this autosave file.
     *state.autosave_path.lock().unwrap() = Some(PathBuf::from(autosave_path));
     Ok(state.snapshot())
@@ -605,13 +648,28 @@ fn autosave_now(state: State<'_, AppState>) -> Option<String> {
 
 // ─── Transport ───────────────────────────────────────────────────────────────────────────────
 
+/// What ▶ plays: the song, or one pattern heard against the project chords from song beat
+/// `chord_offset_beats` (default 0, song bar 1), with `ghost_pattern_id` looping along when the
+/// user wants to hear it, at `ghost_level` (default 1). Switching mode or pattern rewinds;
+/// moving only the chord offset or changing the ghost does not.
 #[tauri::command]
-fn set_playback_context(state: State<'_, AppState>, mode: PlayMode, pattern_id: Option<Uuid>) {
+fn set_playback_context(
+    state: State<'_, AppState>,
+    mode: PlayMode,
+    pattern_id: Option<Uuid>,
+    chord_offset_beats: Option<f64>,
+    ghost_pattern_id: Option<Uuid>,
+    ghost_level: Option<f64>,
+) {
+    let offset = chord_offset_beats.filter(|b| b.is_finite()).unwrap_or(0.0).max(0.0);
     {
         let mut ctx = state.playback.lock().unwrap();
         let changed = ctx.mode != mode || ctx.pattern_id != pattern_id;
         ctx.mode = mode;
         ctx.pattern_id = pattern_id;
+        ctx.chord_offset_beats = offset;
+        ctx.ghost_pattern_id = ghost_pattern_id;
+        ctx.ghost_level = ghost_level.filter(|l| l.is_finite()).unwrap_or(1.0).clamp(0.0, 1.5);
         if changed {
             state.send(EngineCommand::Seek { beat: 0.0 });
         }
@@ -724,7 +782,8 @@ fn live_note_on(app: &AppHandle, pitch: u8, velocity: u8) {
     let _ = app.emit("midi-activity", pitch);
 }
 
-/// A note ended: release it and, if it was being recorded, write it into the pattern.
+/// A note ended: release it and, if it was being recorded, write it into the context pattern.
+/// Only a pattern of the live track can take it; playing another track records nothing.
 fn live_note_off(app: &AppHandle, pitch: u8) {
     let state = app.state::<AppState>();
     let Some(track_id) = state.live_track() else { return };
@@ -738,14 +797,10 @@ fn live_note_off(app: &AppHandle, pitch: u8) {
         let ctx = state.playback.lock().unwrap();
         let doc = state.doc.lock().unwrap();
         let model = doc.model();
-        let Some(p) = ctx
-            .pattern_id
-            .and_then(|id| model.pattern(&id))
-            .or_else(|| model.patterns.first())
-        else {
+        let Some(p) = ctx.pattern_id.and_then(|id| model.pattern(&id)).filter(|p| p.track_id == track_id) else {
             return;
         };
-        (p.id, p.length_beats, p.notes(&track_id).to_vec())
+        (p.id, p.length_beats, p.notes.clone())
     };
     // In song mode the engine position is a song position; fold it into the pattern.
     let start_in = start % length_beats;
@@ -766,7 +821,7 @@ fn live_note_off(app: &AppHandle, pitch: u8) {
         .doc
         .lock()
         .unwrap()
-        .apply(Command::SetNotes { pattern_id, track_id, notes }, false);
+        .apply(Command::SetNotes { pattern_id, notes }, false);
     if applied.is_ok() {
         state.sync_engine();
         let _ = app.emit("document", state.snapshot());
@@ -936,7 +991,6 @@ pub struct ExportRequest {
     pub loops: Option<u32>,
     /// Also write one WAV per track next to the mix (`<name> - <track>.wav`).
     pub stems: bool,
-    pub hear_chords: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -954,24 +1008,30 @@ pub struct ExportResult {
 }
 
 /// Render to WAV faster than real time on a worker thread: the mix, and with `stems` one file
-/// per track with everything else muted. Progress goes out as `export-progress` events.
+/// per track with everything else muted (for a pattern, just its own track). The chord bed is
+/// a monitor and is never rendered. Progress goes out as `export-progress` events.
 #[tauri::command]
 async fn export_wav(app: AppHandle, state: State<'_, AppState>, request: ExportRequest) -> Result<ExportResult, String> {
     if state.exporting.swap(true, Ordering::SeqCst) {
         return Err("an export is already running".into());
     }
     let x = state.settings().export;
-    let (model, pattern_id, hear_chords) = {
+    let (model, pattern_id, offset) = {
         let doc = state.doc.lock().unwrap();
         let ctx = state.playback.lock().unwrap();
-        (doc.model().clone(), ctx.pattern_id, request.hear_chords.unwrap_or(ctx.hear_chords))
+        (doc.model().clone(), ctx.pattern_id, ctx.chord_offset_beats)
     };
     let song = request.scope != "pattern" && !model.clips.is_empty();
-    let build = move |m: &ProjectModel| if song { Sequence::from_song(m) } else { build_sequence(m, PlayMode::Pattern, pattern_id) };
+    let mode = if song { PlayMode::Song } else { PlayMode::Pattern };
+    let build = move |m: &ProjectModel| build_sequence(m, mode, pattern_id, offset, None);
+    let pattern_track = pattern_id.and_then(|id| model.pattern(&id)).map(|p| p.track_id);
+    if !song && pattern_track.is_none() {
+        state.exporting.store(false, Ordering::SeqCst);
+        return Err("no pattern to export".into());
+    }
     let options = RenderOptions {
         sample_rate: request.sample_rate.unwrap_or(x.sample_rate),
         tail_seconds: request.tail_seconds.unwrap_or(x.tail_seconds),
-        hear_chords,
         master: model.master.clone(),
         bit_depth: request.bit_depth.unwrap_or(x.bit_depth),
         normalize_db: request.normalize_db,
@@ -980,37 +1040,32 @@ async fn export_wav(app: AppHandle, state: State<'_, AppState>, request: ExportR
     };
     let mix_path = PathBuf::from(&request.path);
     // Stem jobs: (file, model with only that track audible).
-    let mut jobs: Vec<(PathBuf, ProjectModel, bool)> = vec![(mix_path.clone(), model.clone(), hear_chords)];
+    let mut jobs: Vec<(PathBuf, ProjectModel)> = vec![(mix_path.clone(), model.clone())];
     if request.stems {
         let stem = mix_path.file_stem().and_then(|s| s.to_str()).unwrap_or("export").to_string();
         let dir = mix_path.parent().map(|p| p.to_path_buf()).unwrap_or_default();
         for (i, t) in model.tracks.iter().enumerate() {
+            // A pattern only sounds on its own track; the other stems would be silent files.
+            if !song && pattern_track != Some(t.id) {
+                continue;
+            }
             let mut m = model.clone();
             for (j, mt) in m.tracks.iter_mut().enumerate() {
                 mt.muted = j != i;
                 mt.soloed = false;
             }
             let safe: String = t.name.chars().map(|c| if c.is_alphanumeric() || c == ' ' || c == '-' || c == '_' { c } else { '_' }).collect();
-            jobs.push((dir.join(format!("{stem} - {:02} {}.wav", i + 1, safe.trim())), m, false));
-        }
-        if hear_chords {
-            let mut m = model.clone();
-            for mt in m.tracks.iter_mut() {
-                mt.muted = true;
-                mt.soloed = false;
-            }
-            jobs.push((dir.join(format!("{stem} - chords.wav")), m, true));
+            jobs.push((dir.join(format!("{stem} - {:02} {}.wav", i + 1, safe.trim())), m));
         }
     }
     let total = jobs.len() as u32;
     let handle = app.clone();
     let result = tauri::async_runtime::spawn_blocking(move || {
         let mut files = Vec::new();
-        for (i, (path, m, chords)) in jobs.into_iter().enumerate() {
+        for (i, (path, m)) in jobs.into_iter().enumerate() {
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
             let _ = handle.emit("export-progress", ExportProgress { done: i as u32, total, current: name });
-            let opts = RenderOptions { hear_chords: chords, ..options.clone() };
-            render_wav(Arc::new(build(&m)), &path, &opts).map_err(|e| e.to_string())?;
+            render_wav(Arc::new(build(&m)), &path, &options).map_err(|e| e.to_string())?;
             files.push(path.display().to_string());
         }
         let _ = handle.emit("export-progress", ExportProgress { done: total, total, current: String::new() });
@@ -1025,18 +1080,15 @@ async fn export_wav(app: AppHandle, state: State<'_, AppState>, request: ExportR
 
 // ─── MIDI files ──────────────────────────────────────────────────────────────────────────────
 
-/// Write the selected pattern (`scope` = "pattern") or the song as a Standard MIDI File.
+/// Write the context pattern on its own track (`scope` = "pattern") or every track over the
+/// song length as a Standard MIDI File.
 #[tauri::command]
 fn export_midi(state: State<'_, AppState>, path: String, scope: String) -> Result<String, String> {
     let doc = state.doc.lock().unwrap();
     let ctx = state.playback.lock().unwrap();
     let midi_scope = if scope == "pattern" || doc.model().clips.is_empty() {
-        let pid = ctx
-            .pattern_id
-            .filter(|id| doc.model().pattern(id).is_some())
-            .or_else(|| doc.model().patterns.first().map(|p| p.id))
-            .ok_or("no pattern")?;
-        MidiScope::Pattern(pid)
+        let id = ctx.pattern_id.filter(|id| doc.model().pattern(id).is_some()).ok_or("no pattern to export")?;
+        MidiScope::Pattern { id, chord_offset_beats: ctx.chord_offset_beats }
     } else {
         MidiScope::Song
     };
@@ -1045,9 +1097,10 @@ fn export_midi(state: State<'_, AppState>, path: String, scope: String) -> Resul
     Ok(path)
 }
 
-/// Read a MIDI file and add its tracks (with their notes) to a pattern, in one undo step.
+/// Read a MIDI file and add each of its tracks as a new track with one pattern holding its
+/// notes and one clip of it at beat 0 (the song grows to fit), in one undo step.
 #[tauri::command]
-fn import_midi(state: State<'_, AppState>, path: String, pattern_id: Uuid) -> Result<Snapshot, String> {
+fn import_midi(state: State<'_, AppState>, path: String) -> Result<Snapshot, String> {
     let bytes = std::fs::read(&path).map_err(|e| format!("could not read {path}: {e}"))?;
     let bpb = state.doc.lock().unwrap().model().time_signature.beats_per_bar();
     let imported = midi_file::import(&bytes, bpb).map_err(|e| e.to_string())?;
@@ -1057,7 +1110,7 @@ fn import_midi(state: State<'_, AppState>, path: String, pattern_id: Uuid) -> Re
         .lock()
         .unwrap()
         .apply_labeled(
-            Command::ImportTracks { pattern_id, tracks: imported.tracks, length_beats: imported.length_beats },
+            Command::ImportTracks { tracks: imported.tracks, length_beats: imported.length_beats },
             false,
             Some(format!("import {count} MIDI track{}", if count == 1 { "" } else { "s" })),
         )
@@ -1128,7 +1181,7 @@ fn delete_template(state: State<'_, AppState>, name: String) -> Result<(), Strin
 fn new_from_template(state: State<'_, AppState>, name: String) -> Result<Snapshot, String> {
     let dir = state.templates_dir().ok_or("no app data dir")?;
     let json = std::fs::read_to_string(dir.join(format!("{name}.dissonant"))).map_err(|e| format!("could not read template: {e}"))?;
-    let model = ProjectModel::from_json(&json).map_err(|e| format!("not a dissonant project: {e}"))?;
+    let model = ProjectModel::from_json(&json).map_err(open_error)?;
     state.load_model(model, None, false);
     Ok(state.snapshot())
 }
@@ -1139,10 +1192,12 @@ fn list_vibes() -> Vec<dissonant_core::VibeInfo> {
     dissonant_core::vibes()
 }
 
-/// A new, untitled project from a vibe (`ProjectModel::from_vibe`).
+/// A new, untitled project from a vibe (`ProjectModel::from_vibe`), as long as the default
+/// song length setting says.
 #[tauri::command]
 fn new_from_vibe(state: State<'_, AppState>, id: String) -> Result<Snapshot, String> {
-    let model = ProjectModel::from_vibe(&id).ok_or_else(|| format!("no vibe called {id}"))?;
+    let song_bars = state.settings().editing.default_song_bars.max(1);
+    let model = ProjectModel::from_vibe(&id, song_bars).ok_or_else(|| format!("no vibe called {id}"))?;
     state.load_model(model, None, false);
     Ok(state.snapshot())
 }

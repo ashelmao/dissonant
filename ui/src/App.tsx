@@ -2,8 +2,9 @@ import { useEffect } from "react";
 import { MenuBar } from "./components/MenuBar";
 import { Transport } from "./components/Transport";
 import { StatusBar } from "./components/StatusBar";
-import { PatternsPanel } from "./components/PatternsPanel";
+import { TrackTree } from "./components/TrackTree";
 import { Arrangement } from "./components/Arrangement";
+import { Setup } from "./components/Setup";
 import { BottomPanel } from "./components/BottomPanel";
 import { Inspector } from "./components/Inspector";
 import { Editor } from "./components/Editor";
@@ -11,7 +12,7 @@ import { Dialog } from "./components/Dialog";
 import { SettingsWindow } from "./components/Settings";
 import { ExportDialog, ExportProgressBar } from "./components/ExportDialog";
 import { NewProjectScreen } from "./components/NewProjectScreen";
-import { useStore } from "./store";
+import { selectedPattern, useStore } from "./store";
 import { useLiveKeyboard } from "./liveKeyboard";
 import { splitNotes } from "./noteEditing";
 
@@ -81,12 +82,15 @@ export default function App() {
         e.preventDefault();
         void s.requestClose();
       } else if (!mod && e.key === "Tab") {
+        // Pattern ⇄ song; from SETUP it goes to the pattern editor.
         e.preventDefault();
         s.setMode(s.mode === "pattern" ? "song" : "pattern");
       } else if (!mod && s.liveKeyboard === "off" && k === "l") {
         s.toggleLooping();
       } else if (!mod && s.liveKeyboard === "off" && k === "r") {
-        s.toggleRecord();
+        // Recording lands in the selected pattern, so there has to be one to arm.
+        if (!s.armed && !selectedPattern(s)) s.showToast("pick a pattern to record into first");
+        else s.toggleRecord();
       } else if (!mod && s.liveKeyboard === "off" && k === "m") {
         s.toggleMetronome();
       }
@@ -108,18 +112,23 @@ export default function App() {
       <MenuBar />
       <Transport />
       <div className="content">
-        {mode === "song" ? (
+        {mode === "setup" ? (
+          <Setup />
+        ) : mode === "song" ? (
           <>
-            <PatternsPanel />
+            <TrackTree />
             <div className="center">
               <Arrangement />
               <BottomPanel />
             </div>
           </>
         ) : (
+          // The tree is the left panel; the inspector sits on the right and folds to a rail,
+          // so the roll keeps most of the width.
           <>
-            <Inspector />
+            <TrackTree />
             <Editor />
+            <Inspector />
           </>
         )}
       </div>

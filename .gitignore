@@ -28,3 +28,9 @@ node_modules
 ui/dist
 ui/node_modules
 *.log
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key
+.beads/proxieddb/

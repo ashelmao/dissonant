@@ -12,11 +12,10 @@ export function ExportDialog() {
   const settings = useStore((s) => s.settings.export);
   const update = useStore((s) => s.updateSettings);
   const run = useStore((s) => s.runExport);
-  const hearChords = useStore((s) => s.hearChords);
   const mode = useStore((s) => s.mode);
   const model = useStore((s) => s.snapshot?.model);
   const pattern = useStore(selectedPattern);
-  const [scope, setScope] = useState<"song" | "pattern">(mode === "song" && (model?.clips.length ?? 0) > 0 ? "song" : "pattern");
+  const [scope, setScope] = useState<"song" | "pattern">(mode !== "pattern" && (model?.clips.length ?? 0) > 0 ? "song" : "pattern");
   const [rate, setRate] = useState(settings.sampleRate);
   const [depth, setDepth] = useState<16 | 24 | 32>(settings.bitDepth);
   const [dither, setDither] = useState(settings.dither);
@@ -25,12 +24,11 @@ export function ExportDialog() {
   const [tail, setTail] = useState(settings.tailSeconds);
   const [loops, setLoops] = useState(1);
   const [stems, setStems] = useState(false);
-  const [chords, setChords] = useState(hearChords);
   const [saveDefaults, setSaveDefaults] = useState(false);
 
   if (!open || !model) return null;
   const hasSong = model.clips.length > 0;
-  const beats = scope === "song" ? model.clips.reduce((m, c) => Math.max(m, c.startBeat + c.lengthBeats), 0) : (pattern?.lengthBeats ?? 0);
+  const beats = scope === "song" ? model.songLengthBeats : (pattern?.lengthBeats ?? 0);
   const seconds = (beats * loops * 60) / model.tempo + tail;
   const mm = Math.floor(seconds / 60);
   const ss = Math.round(seconds - mm * 60);
@@ -46,7 +44,6 @@ export function ExportDialog() {
       tailSeconds: tail,
       loops,
       stems,
-      hearChords: chords,
     };
     void run(req);
   };
@@ -88,12 +85,9 @@ export function ExportDialog() {
             <Seg value={loops} options={[[1, "1"], [2, "2"], [4, "4"], [8, "8"]]} onChange={setLoops} />
             <span className="k mono">{beats ? `${mm}:${String(ss).padStart(2, "0")} with tail` : "nothing to render"}</span>
           </Row>
-          <Row label="chord bed" hint="include the chord track's pad in the mix">
-            <Toggle on={chords} onChange={setChords} />
-          </Row>
           <Row label="stems" hint="also write one WAV per track (everything else muted) next to the mix">
             <Toggle on={stems} onChange={setStems} />
-            {stems && <span className="k">{model.tracks.length + (chords ? 1 : 0)} files next to the mix</span>}
+            {stems && <span className="k">{model.tracks.length} files next to the mix</span>}
           </Row>
           <div className="sdiv" />
           <Row label="sample rate">

@@ -12,7 +12,6 @@ function pad(n: number, w: number) {
 export function Transport() {
   const s = useStore();
   const model = s.snapshot!.model;
-  const pattern = useStore(selectedPattern);
   const [editingBpm, setEditingBpm] = useState(false);
   const [bpmText, setBpmText] = useState(model.tempo.toFixed(3));
   useEffect(() => setBpmText(model.tempo.toFixed(3)), [model.tempo]);
@@ -26,19 +25,19 @@ export function Transport() {
   const bar = Math.floor(beat / 4) + 1;
   const bib = Math.floor(beat % 4) + 1;
   const six = Math.floor((beat % 1) * 4) + 1;
-  const map = s.mode === "song" ? tempoMap(model.tempo, model.tempoPoints) : null;
+  const map = s.mode !== "pattern" ? tempoMap(model.tempo, model.tempoPoints) : null;
   const secs = map && !map.isConstant ? map.secondsAt(beat) : (beat * 60) / model.tempo;
   const liveBpm = map && !map.isConstant ? map.bpmAt(beat) : null;
   const mm = Math.floor(secs / 60);
   const ss = secs - mm * 60;
 
-  // Key: locked value, or a suggestion from the melodic notes of the selected pattern.
+  // Key: locked value, or a suggestion from the notes of every melodic pattern (each pattern
+  // belongs to one track, so drum patterns are left out by their track; muted notes too).
   const drumIds = new Set(model.tracks.filter((t) => t.isDrum).map((t) => t.id));
-  const pcs = pattern
-    ? Object.entries(pattern.notesByTrack)
-        .filter(([tid]) => !drumIds.has(tid))
-        .flatMap(([, notes]) => notes.map((n) => n.pitch))
-    : [];
+  const pcs = model.patterns.filter((p) => !drumIds.has(p.trackId)).flatMap((p) => p.notes.filter((n) => !n.muted).map((n) => n.pitch));
+  // Record target: the selected pattern, on its track.
+  const recPattern = selectedPattern(s);
+  const recInto = recPattern ? `${model.tracks.find((t) => t.id === recPattern.trackId)?.name ?? "?"} › ${recPattern.name}` : null;
   const detected = detectKey(pcs);
   const suggestion = !model.key.isLocked && detected.isConfident ? detected.candidates[0] : null;
 
@@ -56,8 +55,9 @@ export function Transport() {
       <div className="tgroup">
         <span className="cap">mode</span>
         <div className="seg">
-          <div className={s.mode === "pattern" ? "on" : ""} onClick={() => s.setMode("pattern")}>pat</div>
-          <div className={s.mode === "song" ? "on" : ""} onClick={() => s.setMode("song")}>song</div>
+          <div className={s.mode === "setup" ? "on" : ""} onClick={() => s.setMode("setup")} title="setup: chords, sections, tempo, song length">setup</div>
+          <div className={s.mode === "pattern" ? "on" : ""} onClick={() => s.setMode("pattern")} title="pattern: the piano roll (Tab toggles with song)">pat</div>
+          <div className={s.mode === "song" ? "on" : ""} onClick={() => s.setMode("song")} title="song: the arrangement (Tab toggles with pattern)">song</div>
         </div>
       </div>
       <div className="tdiv" />
@@ -80,7 +80,8 @@ export function Transport() {
           className="tbtn"
           style={s.armed ? { background: "var(--rec-bg)", borderColor: "var(--rec-border)" } : undefined}
           onClick={() => s.toggleRecord()}
-          title="record arm (R): played notes land in the selected pattern while playing"
+          disabled={!s.armed && !recInto}
+          title={recInto ? `record arm (R): notes you play land in ${recInto} while playing` : "record arm (R): pick a pattern to record into first"}
         >
           <div style={{ width: 11, height: 11, borderRadius: "50%", background: s.armed ? "#ff3b30" : "#5f5f68", boxShadow: s.armed ? "0 0 8px #ff3b30" : "none" }} />
         </button>

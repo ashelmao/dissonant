@@ -9,6 +9,7 @@ import {
   placeNote,
   resizeNotes,
   snapFloor,
+  tileGhost,
 } from "./noteEditing";
 import type { NoteEvent } from "./types";
 
@@ -107,5 +108,24 @@ describe("duplicate / paste", () => {
     const { notes: out } = pasteNotes([], clip, 8);
     expect(out.map((x) => x.startBeat).sort()).toEqual([8, 9]);
     expect(out.every((x) => x.id !== "x" && x.id !== "y")).toBe(true);
+  });
+});
+
+describe("tileGhost", () => {
+  it("loops a shorter ghost across the pattern and cuts at the end", () => {
+    const ghost = [n("a", 0, 1, 60), n("b", 3, 2, 62)];
+    const out = tileGhost(ghost, 4, 10);
+    expect(out.map((x) => [x.startBeat, x.lengthBeats])).toEqual([
+      [0, 1],
+      [3, 2],
+      [4, 1],
+      [7, 2],
+      [8, 1],
+    ]);
+    expect(new Set(out.map((x) => x.id)).size).toBe(out.length);
+  });
+  it("leaves muted notes and notes past the ghost's own end out", () => {
+    const ghost = [n("a", 0, 1, 60), { ...n("m", 1, 1, 61), muted: true }, n("late", 5, 1, 64)];
+    expect(tileGhost(ghost, 4, 4).map((x) => x.pitch)).toEqual([60]);
   });
 });
