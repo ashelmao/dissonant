@@ -3,14 +3,13 @@ import { useStore } from "../store";
 import { tempoMap, type TempoPoint } from "../types";
 import { keys } from "../platform";
 
-const H = 40;
-
 /**
- * SONG mode: the tempo map under the ruler. Double-click adds a point at the tempo in force
- * there; drag a point up/down for bpm (⇧ fine) and sideways to move it (snapped to beats);
- * ⌥-click toggles ramp (a glide from the previous point); right-click removes.
+ * The tempo map along the song (SETUP, under the chords). Double-click adds a point at the
+ * tempo in force there; drag a point up/down for bpm (⇧ fine) and sideways to move it (snapped
+ * to beats); ⌥-click toggles ramp (a glide from the previous point); right-click removes.
  */
-export function TempoLane({ headW, timelineW, pxPerBeat, bpb }: { headW: number; timelineW: number; pxPerBeat: number; bpb: number }) {
+export function TempoLane({ headW, timelineW, pxPerBeat, bpb, height = 40 }: { headW: number; timelineW: number; pxPerBeat: number; bpb: number; height?: number }) {
+  const H = height;
   const model = useStore((s) => s.snapshot!.model);
   const playhead = useStore((s) => s.playhead);
   const dispatch = useStore((s) => s.dispatch);
@@ -72,7 +71,7 @@ export function TempoLane({ headW, timelineW, pxPerBeat, bpb }: { headW: number;
 
   const now = map.bpmAt(playhead);
   return (
-    <div className="tempolane" style={{ width: headW + timelineW + 12 }}>
+    <div className="tempolane" style={{ width: headW + timelineW + 12, height }}>
       <div className="head" style={{ width: headW }}>
         <span className="cap">tempo</span>
         <span className="mono" style={{ color: map.isConstant ? "var(--text-5)" : "var(--accent)" }}>{now.toFixed(1)}</span>
