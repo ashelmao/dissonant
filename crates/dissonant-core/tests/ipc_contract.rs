@@ -52,7 +52,7 @@ fn every_command_variant_round_trips_from_the_ui_payload() {
     );
     assert_eq!(parse(json!({"type": "setTrackColor", "id": id, "color": null})), Command::SetTrackColor { id, color: None });
 
-    assert_eq!(parse(json!({"type": "addPattern"})), Command::AddPattern);
+    assert_eq!(parse(json!({"type": "addPattern", "trackId": track_id})), Command::AddPattern { track_id });
     assert_eq!(parse(json!({"type": "duplicatePattern", "id": id})), Command::DuplicatePattern { id });
     assert_eq!(parse(json!({"type": "deletePattern", "id": id})), Command::DeletePattern { id });
     assert_eq!(
@@ -68,12 +68,11 @@ fn every_command_variant_round_trips_from_the_ui_payload() {
     let notes = parse(json!({
         "type": "setNotes",
         "patternId": pattern_id,
-        "trackId": track_id,
         "notes": [{"id": Uuid::new_v4(), "startBeat": 1.5, "lengthBeats": 0.25, "pitch": 60, "velocity": 100}],
     }));
     match notes {
-        Command::SetNotes { pattern_id: p, track_id: t, notes } => {
-            assert_eq!((p, t), (pattern_id, track_id));
+        Command::SetNotes { pattern_id: p, notes } => {
+            assert_eq!(p, pattern_id);
             assert_eq!(notes.len(), 1);
             assert_eq!(notes[0].start_beat, 1.5);
             assert_eq!(notes[0].length_beats, 0.25);
@@ -83,16 +82,13 @@ fn every_command_variant_round_trips_from_the_ui_payload() {
         other => panic!("expected SetNotes, got {other:?}"),
     }
 
+    // The project progression, in song beats.
     let chords = parse(json!({
         "type": "setChords",
-        "patternId": pattern_id,
         "chords": [{"id": Uuid::new_v4(), "startBeat": 0.0, "lengthBeats": 4.0, "pitchClasses": [0, 4, 7], "name": "C"}],
     }));
     match chords {
-        Command::SetChords { pattern_id: p, chords } => {
-            assert_eq!(p, pattern_id);
-            assert_eq!(chords[0].pitch_classes, vec![0, 4, 7]);
-        }
+        Command::SetChords { chords } => assert_eq!(chords[0].pitch_classes, vec![0, 4, 7]),
         other => panic!("expected SetChords, got {other:?}"),
     }
 
@@ -118,6 +114,27 @@ fn every_command_variant_round_trips_from_the_ui_payload() {
         other => panic!("expected UpdateClip, got {other:?}"),
     }
     assert_eq!(parse(json!({"type": "removeClip", "id": clip_id})), Command::RemoveClip { id: clip_id });
+    match parse(json!({
+        "type": "updateClips",
+        "clips": [{"id": clip_id, "patternId": pattern_id, "startBeat": 8.0, "lengthBeats": 4.0, "offsetBeats": 0.0, "muted": false}],
+    })) {
+        Command::UpdateClips { clips } => assert_eq!((clips[0].id, clips[0].start_beat), (clip_id, 8.0)),
+        other => panic!("expected UpdateClips, got {other:?}"),
+    }
+    assert_eq!(
+        parse(json!({"type": "removeClips", "ids": [clip_id, id]})),
+        Command::RemoveClips { ids: vec![clip_id, id] }
+    );
+    assert_eq!(parse(json!({"type": "makeClipUnique", "id": clip_id})), Command::MakeClipUnique { id: clip_id });
+    assert_eq!(parse(json!({"type": "setSongLength", "beats": 96.0})), Command::SetSongLength { beats: 96.0 });
+    match parse(json!({
+        "type": "importTracks",
+        "tracks": [{"name": "piano", "isDrum": false, "notes": []}],
+        "lengthBeats": 16.0,
+    })) {
+        Command::ImportTracks { tracks, length_beats } => assert_eq!((tracks[0].name.as_str(), length_beats), ("piano", 16.0)),
+        other => panic!("expected ImportTracks, got {other:?}"),
+    }
 
     let section_id = Uuid::new_v4();
     assert_eq!(

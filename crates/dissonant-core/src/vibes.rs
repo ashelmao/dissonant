@@ -5,7 +5,7 @@
 //! track empty for the player's own melody. Everything is ordinary model data afterwards.
 
 use crate::chord_track::ChordTrack;
-use crate::model::{Clip, KeyState, NoteEvent, ProjectModel, ScaleType, Track};
+use crate::model::{tile_chords, KeyState, NoteEvent, ProjectModel, ScaleType, SongPattern, Track};
 use crate::theory::harmony;
 use serde::{Deserialize, Serialize};
 
@@ -285,10 +285,11 @@ fn apply_sound(track: &mut Track, sound: Sound) {
 }
 
 impl ProjectModel {
-    /// A new project from a vibe: one 4-bar 4/4 pattern in the song, the key locked, an empty
-    /// lead track (selected first, for the player's own melody), a bass line and a groove.
+    /// A new project from a vibe: the key locked, an empty lead track (selected first, for the
+    /// player's own melody), a bass line and a groove, each in its own 4-bar 4/4 pattern placed
+    /// from beat 0 to the end of a `song_bars`-bar song, with the progression tiled across it.
     /// `None` for an unknown id.
-    pub fn from_vibe(id: &str) -> Option<Self> {
+    pub fn from_vibe(id: &str, song_bars: u32) -> Option<Self> {
         let v = VIBES.iter().find(|v| v.id == id)?;
         let (length, bar) = (16.0, 4.0);
         let mut model = ProjectModel::empty();
@@ -296,23 +297,30 @@ impl ProjectModel {
         model.swing = v.swing;
         model.swing_grid = v.swing_grid;
         model.key = KeyState::locked(v.root, v.scale);
-        let chords = ChordTrack::new(harmony::progression(v.degrees, v.root, v.scale, length, v.chord_beats));
+        model.song_length_beats = song_bars.max(1) as f64 * bar;
+        let progression = harmony::progression(v.degrees, v.root, v.scale, length, v.chord_beats);
+        let chords = ChordTrack::new(progression.clone());
+        model.chords = tile_chords(&progression, length, model.song_length_beats);
 
         model.tracks[0].name = v.lead_name.into();
         apply_sound(&mut model.tracks[0], v.lead);
+        model.patterns[0].name = format!("{} 1", v.lead_name);
+        model.patterns[0].length_beats = length;
         let mut bass = Track::new("bass");
         apply_sound(&mut bass, v.bass);
         let drums = Track::drums("drums");
 
-        let p = &mut model.patterns[0];
-        p.length_beats = length;
-        p.notes_by_track.insert(bass.id, bass_line(&chords, length, bar, v.bass_rhythm));
-        p.notes_by_track.insert(drums.id, v.groove.hits(length, bar));
-        p.chords = chords;
+        let mut bass_pattern = SongPattern::new(bass.id, "bass 1");
+        bass_pattern.length_beats = length;
+        bass_pattern.notes = bass_line(&chords, length, bar, v.bass_rhythm);
+        let mut groove = SongPattern::new(drums.id, "drums 1");
+        groove.length_beats = length;
+        groove.notes = v.groove.hits(length, bar);
         model.tracks.push(bass);
         model.tracks.push(drums);
-        let p = &model.patterns[0];
-        model.clips = vec![Clip::new(p.id, 0.0, p.length_beats)];
+        model.patterns.push(bass_pattern);
+        model.patterns.push(groove);
+        model.place_every_pattern_across_the_song();
         Some(model)
     }
 }

@@ -810,12 +810,10 @@ mod tests {
     fn sequence_with_note(start: f64, len_beats: f64, loop_len: f64) -> Arc<Sequence> {
         let mut model = ProjectModel::empty();
         model.tracks[0].voice = "sine".into();
-        let (tid, pid) = (model.tracks[0].id, model.patterns[0].id);
+        let pid = model.patterns[0].id;
         model.patterns[0].length_beats = loop_len;
-        model.patterns[0]
-            .notes_by_track
-            .insert(tid, vec![NoteEvent::new(start, len_beats, 69)]);
-        Arc::new(Sequence::from_pattern(&model, &pid).unwrap())
+        model.patterns[0].notes = vec![NoteEvent::new(start, len_beats, 69)];
+        Arc::new(Sequence::from_pattern(&model, &pid, 0.0).unwrap())
     }
 
     fn render(engine: &mut Engine, total_frames: usize, block: usize) -> Vec<f32> {
@@ -877,10 +875,10 @@ mod tests {
         let mut model = ProjectModel::empty();
         model.tracks[0].voice = "sine".into();
         model.tracks[0].muted = true;
-        let (tid, pid) = (model.tracks[0].id, model.patterns[0].id);
-        model.patterns[0].notes_by_track.insert(tid, vec![NoteEvent::new(0.0, 1.0, 69)]);
+        let pid = model.patterns[0].id;
+        model.patterns[0].notes = vec![NoteEvent::new(0.0, 1.0, 69)];
         let mut e = Engine::new(SR, Arc::new(Shared::default()), &MasterSettings::default());
-        e.handle(EngineCommand::SetSequence(Arc::new(Sequence::from_pattern(&model, &pid).unwrap())));
+        e.handle(EngineCommand::SetSequence(Arc::new(Sequence::from_pattern(&model, &pid, 0.0).unwrap())));
         e.handle(EngineCommand::Play);
         assert!(render(&mut e, 8_000, 256).iter().all(|s| s.abs() < 1e-6));
     }
@@ -888,12 +886,11 @@ mod tests {
     #[test]
     fn drums_and_chord_bed_make_sound() {
         let mut model = ProjectModel::starter();
-        let drums = model.tracks[1].id;
-        let pid = model.patterns[0].id;
-        model.patterns[0].notes_by_track.insert(drums, vec![NoteEvent::new(0.0, 0.5, 36)]);
+        let pid = model.patterns[1].id; // the drum pattern
+        model.patterns[1].notes = vec![NoteEvent::new(0.0, 0.5, 36)];
         let shared = Arc::new(Shared::default());
         let mut e = Engine::new(SR, shared.clone(), &MasterSettings::default());
-        e.handle(EngineCommand::SetSequence(Arc::new(Sequence::from_pattern(&model, &pid).unwrap())));
+        e.handle(EngineCommand::SetSequence(Arc::new(Sequence::from_pattern(&model, &pid, 0.0).unwrap())));
         e.handle(EngineCommand::SetHearChords(true));
         e.handle(EngineCommand::Play);
         let left = render(&mut e, 20_000, 512);
@@ -903,15 +900,35 @@ mod tests {
         assert!(shared.master_peak().0 > 0.0);
     }
 
-    /// The starter has to make music on the first press of space, chord bed or not.
+    /// The starter has to make music on the first press of space, chord bed or not: in the
+    /// song (where a new project opens) and in each of its patterns on its own.
     #[test]
     fn starter_makes_sound_without_the_chord_bed() {
         let model = ProjectModel::starter();
-        let pid = model.patterns[0].id;
-        let mut e = Engine::new(SR, Arc::new(Shared::default()), &MasterSettings::default());
-        e.handle(EngineCommand::SetSequence(Arc::new(Sequence::from_pattern(&model, &pid).unwrap())));
-        e.handle(EngineCommand::Play);
-        assert!(render(&mut e, 20_000, 512).iter().any(|s| s.abs() > 0.05));
+        let mut sequences = vec![Sequence::from_song(&model)];
+        sequences.extend(model.patterns.iter().map(|p| Sequence::from_pattern(&model, &p.id, 0.0).unwrap()));
+        for seq in sequences {
+            let mut e = Engine::new(SR, Arc::new(Shared::default()), &MasterSettings::default());
+            e.handle(EngineCommand::SetSequence(Arc::new(seq)));
+            e.handle(EngineCommand::Play);
+            assert!(render(&mut e, 20_000, 512).iter().any(|s| s.abs() > 0.05));
+        }
+    }
+
+    /// The bed is a live monitor in song mode too: an empty song with chords is silent until
+    /// it is switched on.
+    #[test]
+    fn the_chord_bed_monitors_the_song_when_switched_on() {
+        let mut model = ProjectModel::starter();
+        model.clips.clear();
+        for on in [false, true] {
+            let mut e = Engine::new(SR, Arc::new(Shared::default()), &MasterSettings::default());
+            e.handle(EngineCommand::SetSequence(Arc::new(Sequence::from_song(&model))));
+            e.handle(EngineCommand::SetHearChords(on));
+            e.handle(EngineCommand::Play);
+            let loud = render(&mut e, 20_000, 512).iter().any(|s| s.abs() > 0.01);
+            assert_eq!(loud, on, "hear chords {on}");
+        }
     }
 
     #[test]
@@ -919,7 +936,7 @@ mod tests {
         let model = ProjectModel::empty();
         let (tid, pid) = (model.tracks[0].id, model.patterns[0].id);
         let mut e = Engine::new(SR, Arc::new(Shared::default()), &MasterSettings::default());
-        e.handle(EngineCommand::SetSequence(Arc::new(Sequence::from_pattern(&model, &pid).unwrap())));
+        e.handle(EngineCommand::SetSequence(Arc::new(Sequence::from_pattern(&model, &pid, 0.0).unwrap())));
         e.handle(EngineCommand::Audition { track_id: tid, pitch: 60, velocity: 100, seconds: 0.8 });
         let left = render(&mut e, 44_100 * 2, 512);
         assert!(left[..4000].iter().any(|s| s.abs() > 0.01));
@@ -934,7 +951,7 @@ mod tests {
         let model = ProjectModel::empty();
         let (tid, pid) = (model.tracks[0].id, model.patterns[0].id);
         let mut e = Engine::new(SR, Arc::new(Shared::default()), &MasterSettings::default());
-        e.handle(EngineCommand::SetSequence(Arc::new(Sequence::from_pattern(&model, &pid).unwrap())));
+        e.handle(EngineCommand::SetSequence(Arc::new(Sequence::from_pattern(&model, &pid, 0.0).unwrap())));
         e.handle(EngineCommand::Audition { track_id: tid, pitch: 60, velocity: 100, seconds: 0.125 });
         let left = render(&mut e, SR as usize, 512);
         let sr = SR as usize;
@@ -950,7 +967,7 @@ mod tests {
         let model = ProjectModel::empty();
         let (tid, pid) = (model.tracks[0].id, model.patterns[0].id);
         let mut e = Engine::new(SR, Arc::new(Shared::default()), &MasterSettings::default());
-        e.handle(EngineCommand::SetSequence(Arc::new(Sequence::from_pattern(&model, &pid).unwrap())));
+        e.handle(EngineCommand::SetSequence(Arc::new(Sequence::from_pattern(&model, &pid, 0.0).unwrap())));
         e.handle(EngineCommand::Audition { track_id: tid, pitch: 60, velocity: 100, seconds: 0.0 });
         let left = render(&mut e, SR as usize, 512);
         let at_floor = (SR * MIN_AUDITION_SECS * 0.8) as usize;
@@ -962,9 +979,9 @@ mod tests {
         use dissonant_core::{Clip, TempoPoint};
         let mut model = ProjectModel::empty();
         model.tracks[0].voice = "sine".into();
-        let (tid, pid) = (model.tracks[0].id, model.patterns[0].id);
+        let pid = model.patterns[0].id;
         model.patterns[0].length_beats = 16.0;
-        model.patterns[0].notes_by_track.insert(tid, vec![NoteEvent::new(8.0, 1.0, 69)]);
+        model.patterns[0].notes = vec![NoteEvent::new(8.0, 1.0, 69)];
         model.clips = vec![Clip::new(pid, 0.0, 16.0)];
         // 120 for 4 beats (2 s), then 60: beat 8 is reached at 2 + 4 = 6 s.
         model.tempo_points = vec![TempoPoint::new(4.0, 60.0, false)];
@@ -985,11 +1002,11 @@ mod tests {
     fn muted_notes_are_skipped() {
         let mut model = ProjectModel::empty();
         model.tracks[0].voice = "sine".into();
-        let (tid, pid) = (model.tracks[0].id, model.patterns[0].id);
+        let pid = model.patterns[0].id;
         let mut n = NoteEvent::new(0.0, 1.0, 69);
         n.muted = true;
-        model.patterns[0].notes_by_track.insert(tid, vec![n]);
-        let seq = Arc::new(Sequence::from_pattern(&model, &pid).unwrap());
+        model.patterns[0].notes = vec![n];
+        let seq = Arc::new(Sequence::from_pattern(&model, &pid, 0.0).unwrap());
         let mut e = Engine::new(SR, Arc::new(Shared::default()), &MasterSettings::default());
         e.handle(EngineCommand::SetSequence(seq));
         e.handle(EngineCommand::Play);
@@ -1001,11 +1018,11 @@ mod tests {
     fn swing_delays_the_offbeat_only() {
         let mut model = ProjectModel::empty();
         model.tracks[0].voice = "sine".into();
-        let (tid, pid) = (model.tracks[0].id, model.patterns[0].id);
+        let pid = model.patterns[0].id;
         model.patterns[0].length_beats = 4.0;
-        model.patterns[0].notes_by_track.insert(tid, vec![NoteEvent::new(0.5, 0.25, 69)]);
+        model.patterns[0].notes = vec![NoteEvent::new(0.5, 0.25, 69)];
         model.swing = 200.0 / 3.0; // triplet feel: the "and" of 1 lands at 2/3 beat
-        let seq = Arc::new(Sequence::from_pattern(&model, &pid).unwrap());
+        let seq = Arc::new(Sequence::from_pattern(&model, &pid, 0.0).unwrap());
         let mut e = Engine::new(SR, Arc::new(Shared::default()), &MasterSettings::default());
         e.handle(EngineCommand::SetSequence(seq));
         e.handle(EngineCommand::Play);
@@ -1054,12 +1071,10 @@ mod tests {
         // sounds, once per 4 beats.
         let mut model = ProjectModel::empty();
         model.tracks[0].voice = "sine".into();
-        let (tid, pid) = (model.tracks[0].id, model.patterns[0].id);
-        model.patterns[0]
-            .notes_by_track
-            .insert(tid, vec![NoteEvent::new(0.0, 0.5, 69), NoteEvent::new(4.0, 0.5, 69)]);
+        let pid = model.patterns[0].id;
+        model.patterns[0].notes = vec![NoteEvent::new(0.0, 0.5, 69), NoteEvent::new(4.0, 0.5, 69)];
         let mut e = Engine::new(SR, Arc::new(Shared::default()), &MasterSettings::default());
-        e.handle(EngineCommand::SetSequence(Arc::new(Sequence::from_pattern(&model, &pid).unwrap())));
+        e.handle(EngineCommand::SetSequence(Arc::new(Sequence::from_pattern(&model, &pid, 0.0).unwrap())));
         e.handle(EngineCommand::SetLoop { start: 4.0, end: 8.0 });
         e.handle(EngineCommand::Seek { beat: 0.0 });
         assert_eq!(e.position(), 0.0, "seeking before the loop is allowed");
@@ -1079,7 +1094,7 @@ mod tests {
         let model = ProjectModel::empty();
         let (tid, pid) = (model.tracks[0].id, model.patterns[0].id);
         let mut e = Engine::new(SR, Arc::new(Shared::default()), &MasterSettings::default());
-        e.handle(EngineCommand::SetSequence(Arc::new(Sequence::from_pattern(&model, &pid).unwrap())));
+        e.handle(EngineCommand::SetSequence(Arc::new(Sequence::from_pattern(&model, &pid, 0.0).unwrap())));
         e.handle(EngineCommand::NoteOn { track_id: tid, pitch: 60, velocity: 100 });
         let held = render(&mut e, 44_100 * 2, 512);
         assert!(held[80_000..].iter().any(|s| s.abs() > 0.01), "a held note must not auto-release");
