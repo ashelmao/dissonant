@@ -2412,6 +2412,7 @@ select {
 .tt-dl-sub {
   font-size: 9px;
   color: color-mix(in srgb, var(--text-1) 60%, var(--tc));
+}
 
 /* ── song view ── */
 /* The selected track reads at a glance: a brand-colour edge on its header and a lit lane. */
@@ -2561,6 +2562,7 @@ select {
   font-family: var(--font-mono);
   font-size: 10px;
   color: var(--text-5);
+}
 
 /* ── pattern editor ── */
 /* PAT mode: tree (left) · editor · inspector (right, folds to a rail). */
