@@ -452,8 +452,8 @@ describe("clips", () => {
 
   it("refuses a clip at or past the song end and clamps one running over it", async () => {
     const { pattern } = await ids();
-    await rejectsAndKeepsModel({ type: "addClip", patternId: pattern, startBeat: 128, lengthBeats: null }, "invalid value");
-    await rejectsAndKeepsModel({ type: "addClip", patternId: pattern, startBeat: 200, lengthBeats: 4 }, "invalid value");
+    await rejectsAndKeepsModel({ type: "addClip", patternId: pattern, startBeat: 128, lengthBeats: null }, "that is past the end of the song");
+    await rejectsAndKeepsModel({ type: "addClip", patternId: pattern, startBeat: 200, lengthBeats: 4 }, "that is past the end of the song");
     await b.apply({ type: "addClip", patternId: pattern, startBeat: 120, lengthBeats: null });
     const placed = (await model()).clips.find((c) => c.startBeat === 120)!;
     expect(placed.lengthBeats).toBe(8);
@@ -465,7 +465,7 @@ describe("clips", () => {
     await b.apply({ type: "updateClip", clip: { ...c, startBeat: 100, lengthBeats: 64, patternId: drumPattern } });
     const moved = await clip(c.id);
     expect([moved.startBeat, moved.lengthBeats, moved.patternId]).toEqual([100, 28, c.patternId]);
-    await rejectsAndKeepsModel({ type: "updateClip", clip: { ...moved, startBeat: 128 } }, "invalid value");
+    await rejectsAndKeepsModel({ type: "updateClip", clip: { ...moved, startBeat: 128 } }, "that is past the end of the song");
     await rejectsAndKeepsModel({ type: "updateClip", clip: { ...moved, id: FAKE_ID } }, "no such clip");
     await rejectsAndKeepsModel({ type: "updateClip", clip: { ...moved, lengthBeats: Number.NaN } }, "invalid value");
   });
@@ -483,8 +483,8 @@ describe("clips", () => {
 
   it("removes a group of clips with removeClips as one undo step", async () => {
     const [a, c] = (await model()).clips;
-    await rejectsAndKeepsModel({ type: "removeClips", ids: [a.id, FAKE_ID] }, "no such clip");
-    await b.apply({ type: "removeClips", ids: [a.id, c.id] });
+    // Unknown ids are skipped, as in the Rust document.
+    await b.apply({ type: "removeClips", ids: [a.id, c.id, FAKE_ID] });
     expect((await model()).clips).toEqual([]);
     expect((await b.undo()).model.clips).toHaveLength(2);
   });

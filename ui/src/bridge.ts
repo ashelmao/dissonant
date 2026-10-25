@@ -228,6 +228,7 @@ const NO_SUCH_CLIP = "no such clip";
 const NO_SUCH_SECTION = "no such section";
 const LAST_TRACK = "a project needs at least one track";
 const INVALID_VALUE = "invalid value";
+const PAST_SONG_END = "that is past the end of the song";
 /** `ProjectModel` decoding refuses schema < 6 with this text (no migration). */
 export const OLD_SCHEMA = "This project was made with an older version of dissonant and can't be opened.";
 
@@ -495,16 +496,16 @@ function normalizedModel(m: ProjectModel): ProjectModel {
  * is cut back to it. Returns the clamped length.
  */
 function clampToSong(m: ProjectModel, startBeat: number, lengthBeats: number): number {
-  if (startBeat >= m.songLengthBeats) fail(INVALID_VALUE);
+  if (startBeat >= m.songLengthBeats) fail(PAST_SONG_END);
   return Math.min(lengthBeats, m.songLengthBeats - startBeat);
 }
 
-/** `UpdateClip`: values, then the clip id; the pattern never changes (a clip stays on its track). */
+/** `UpdateClip`: the clip id, then values; the pattern never changes (a clip stays on its track). */
 function updateClip(m: ProjectModel, clip: Clip): void {
-  if (!allFinite(clip.startBeat, clip.lengthBeats, clip.offsetBeats)) fail(INVALID_VALUE);
-  if (clip.startBeat < 0 || clip.lengthBeats <= 0 || clip.offsetBeats < 0) fail(INVALID_VALUE);
   const i = m.clips.findIndex((cl) => cl.id === clip.id);
   if (i < 0) fail(NO_SUCH_CLIP);
+  if (!allFinite(clip.startBeat, clip.lengthBeats, clip.offsetBeats)) fail(INVALID_VALUE);
+  if (clip.startBeat < 0 || clip.lengthBeats <= 0 || clip.offsetBeats < 0) fail(INVALID_VALUE);
   const lengthBeats = clampToSong(m, clip.startBeat, clip.lengthBeats);
   m.clips[i] = { ...clip, patternId: m.clips[i].patternId, lengthBeats };
 }
@@ -636,8 +637,8 @@ function reduce(m: ProjectModel, c: Command): void {
       break;
     }
     case "removeClips": {
+      // Unknown ids are skipped, as in the Rust document.
       const ids = new Set(c.ids);
-      for (const id of ids) if (!m.clips.some((cl) => cl.id === id)) fail(NO_SUCH_CLIP);
       m.clips = m.clips.filter((cl) => !ids.has(cl.id));
       break;
     }
