@@ -2412,4 +2412,153 @@ select {
 .tt-dl-sub {
   font-size: 9px;
   color: color-mix(in srgb, var(--text-1) 60%, var(--tc));
+
+/* ── song view ── */
+/* The selected track reads at a glance: a brand-colour edge on its header and a lit lane. */
+.arr.song .thead.on {
+  box-shadow: inset -2px 0 0 var(--accent);
+}
+.arr.song .lane.on {
+  background-color: color-mix(in srgb, var(--accent) 7%, var(--bg-lane-row));
+  box-shadow:
+    inset 0 1px 0 var(--accent-border),
+    inset 0 -1px 0 var(--accent-border);
+}
+.arr.song .lanes {
+  position: relative;
+}
+.arr.song .clip .edge {
+  position: absolute;
+  right: 0;
+  top: 0;
+  width: 7px;
+  height: 100%;
+  cursor: ew-resize;
+}
+.arr.song .clip .edge:hover {
+  background: rgba(255, 255, 255, 0.15);
+}
+/* Selection: a solid brand-colour frame drawn over the clip's header and notes. */
+.arr.song .clip.sel::after,
+.arr.song .clip.ghost::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border: 2px solid var(--accent);
+  border-radius: 2px;
+  pointer-events: none;
+}
+.arr.song .clip.sel {
+  z-index: 2;
+}
+.arr.song .clip.dragging {
+  z-index: 3;
+  opacity: 0.8;
+}
+.arr.song .clip.ghost {
+  pointer-events: none;
+  z-index: 3;
+  opacity: 0.6;
+}
+.arr.song .clip.ghost::after {
+  border-style: dashed;
+}
+.arr.song .marquee {
+  position: absolute;
+  z-index: 4;
+  border: 1px solid var(--accent);
+  background: rgba(var(--accent-rgb), 0.08);
+  pointer-events: none;
+}
+
+/* Help under the lanes, pinned to the timeline's left edge. */
+.arr.song .songhint {
+  position: sticky;
+  left: 220px;
+  display: flex;
+  align-items: center;
+  padding-left: 12px;
+  font-size: 10px;
+  color: var(--text-5);
+  letter-spacing: 0.06em;
+  white-space: nowrap;
+}
+
+/* Past the song's hard end: hatched and dimmed, nothing lands there. */
+.arr.song .oob {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  right: 0;
+  pointer-events: none;
+  background: repeating-linear-gradient(135deg, rgba(0, 0, 0, 0.55) 0 6px, rgba(0, 0, 0, 0.35) 6px 12px);
+  border-left: 2px solid var(--text-6);
+  z-index: 1;
+}
+.arr.song .timeline .oob {
+  pointer-events: auto;
+  cursor: not-allowed;
+}
+.arr.song .bar.past {
+  color: var(--text-7);
+  border-left-color: var(--line-1);
+}
+.arr.song .songend {
+  position: absolute;
+  top: 6px;
+  margin-left: 4px;
+  font-family: var(--font-mono);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  color: var(--text-4);
+  text-transform: uppercase;
+  pointer-events: none;
+  z-index: 2;
+}
+
+/* The read-only chord bar, aligned to the timeline under the ruler. */
+.arr.song .songchords {
+  display: flex;
+  height: 30px;
+  position: sticky;
+  top: 44px;
+  z-index: 3;
+  background: var(--bg-1);
+  border-bottom: 1px solid var(--line-1);
+}
+.arr.song .songchords .schead {
+  width: var(--sc-head);
+  flex: none;
+  display: flex;
+  align-items: center;
+  padding: 0 8px;
+  position: sticky;
+  left: 0;
+  z-index: 3;
+  background: var(--bg-1);
+}
+.arr.song .songchords .chordlane {
+  flex: none;
+  overflow: visible;
+  border-bottom: 0;
+}
+/* Its own gutter sticks just right of the head cell, so the pair fills the header column. */
+.arr.song .songchords .chordlane .gut {
+  left: var(--sc-head);
+}
+
+/* Right-click menu on a clip. */
+.dropdown.clipmenu {
+  position: fixed;
+  min-width: 170px;
+  z-index: 60;
+}
+.dropdown.clipmenu .item.danger {
+  color: var(--rec-text);
+}
+.dropdown.clipmenu .item .k {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-5);
 }
