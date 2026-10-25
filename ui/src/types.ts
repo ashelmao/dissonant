@@ -65,19 +65,16 @@ export interface Track {
   color: string | null;
 }
 
-export interface ChordTrack {
-  chords: ChordEvent[];
-}
-
+/** A pattern belongs to one track; its clips play on that track's lane. */
 export interface SongPattern {
   id: string;
+  trackId: string;
   name: string;
   lengthBeats: number;
-  chords: ChordTrack;
-  notesByTrack: Record<string, NoteEvent[]>;
+  notes: NoteEvent[];
 }
 
-/** A pattern placed on the song; loops from `offsetBeats` for `lengthBeats`. */
+/** A pattern placed on the song; loops from `offsetBeats` for `lengthBeats`. Its track is its pattern's track. */
 export interface Clip {
   id: string;
   patternId: string;
@@ -107,6 +104,7 @@ export interface MasterSettings {
 }
 
 export interface ProjectModel {
+  /** 6 for everything this build reads or writes; older files are refused. */
   schemaVersion: number;
   tempo: number;
   key: KeyState;
@@ -122,6 +120,10 @@ export interface ProjectModel {
   swingGrid?: number;
   /** Tempo changes along the song (absent / empty = constant). */
   tempoPoints?: TempoPoint[];
+  /** The project-wide progression in song beats: sorted, non-overlapping. Monitor only. */
+  chords: ChordEvent[];
+  /** The song's hard end: clips can't start at or run past it. At least one bar. */
+  songLengthBeats: number;
 }
 
 export interface TempoPoint {
@@ -184,8 +186,53 @@ export function swingWarp(beat: number, swing: number, grid: number): number {
   return base + (u <= grid ? u * (late / grid) : late + (u - grid) * ((pair - late) / grid));
 }
 
+/** The song's explicit length in beats. */
 export function songLength(m: ProjectModel): number {
-  return m.clips.reduce((max, c) => Math.max(max, c.startBeat + c.lengthBeats), 0);
+  return m.songLengthBeats;
+}
+
+/** The track a clip plays on (its pattern's track), or null for a dangling clip. */
+export function clipTrackId(m: ProjectModel, clip: Clip): string | null {
+  return m.patterns.find((p) => p.id === clip.patternId)?.trackId ?? null;
+}
+
+/**
+ * The song chords inside `[offset, offset + length)`, shifted to start at 0 and clipped to the
+ * window: what a pattern edited at `offset` is tiered against (the engine's pattern-mode bed).
+ */
+export function chordsInWindow(chords: ChordEvent[], offset: number, length: number): ChordEvent[] {
+  const end = offset + length;
+  const out: ChordEvent[] = [];
+  for (const c of chords) {
+    const s = Math.max(c.startBeat, offset);
+    const e = Math.min(c.startBeat + c.lengthBeats, end);
+    if (e - s > 1e-9) out.push({ ...c, startBeat: s - offset, lengthBeats: e - s });
+  }
+  return out;
+}
+
+/**
+ * Song chords with the window `[offset, offset + length)` replaced by `local` (window-relative,
+ * clipped to the window). Chords crossing the window's edges are trimmed to the outside part.
+ */
+export function replaceChordWindow(chords: ChordEvent[], offset: number, length: number, local: ChordEvent[]): ChordEvent[] {
+  const end = offset + length;
+  const out: ChordEvent[] = [];
+  for (const c of chords) {
+    const cEnd = c.startBeat + c.lengthBeats;
+    if (c.startBeat < offset) out.push({ ...c, lengthBeats: Math.min(cEnd, offset) - c.startBeat });
+    if (cEnd > end) {
+      const s = Math.max(c.startBeat, end);
+      // A chord spanning the whole window splits in two: give the right half its own id.
+      out.push({ ...c, id: c.startBeat < offset ? uuid() : c.id, startBeat: s, lengthBeats: cEnd - s });
+    }
+  }
+  for (const c of local) {
+    const s = Math.max(0, c.startBeat);
+    const e = Math.min(length, c.startBeat + c.lengthBeats);
+    if (e - s > 1e-9) out.push({ ...c, startBeat: offset + s, lengthBeats: e - s });
+  }
+  return out.filter((c) => c.lengthBeats > 1e-9).sort((a, b) => a.startBeat - b.startBeat);
 }
 
 export function sectionAt(m: ProjectModel, beat: number): Section | null {
@@ -222,7 +269,10 @@ export function fileNameOf(path: string | null | undefined, fallback = "untitled
 }
 
 export type TrackParam = "volume" | "reverbSend" | "tone" | "pan";
+/** What the engine plays: one pattern (looped) or the whole song. */
 export type PlayMode = "pattern" | "song";
+/** What the window shows. SETUP and SONG both play the song. */
+export type ViewMode = "setup" | "pattern" | "song";
 export type Tier = "chordTone" | "tension" | "dissonance";
 
 export type Command =
@@ -237,16 +287,20 @@ export type Command =
   | { type: "setTrackVoice"; id: string; voice: string }
   | { type: "setTrackParam"; id: string; param: TrackParam; value: number }
   | { type: "setTrackColor"; id: string; color: string | null }
-  | { type: "addPattern" }
+  | { type: "addPattern"; trackId: string }
   | { type: "duplicatePattern"; id: string }
   | { type: "deletePattern"; id: string }
   | { type: "renamePattern"; id: string; name: string }
   | { type: "setPatternLength"; id: string; beats: number }
-  | { type: "setNotes"; patternId: string; trackId: string; notes: NoteEvent[] }
-  | { type: "setChords"; patternId: string; chords: ChordEvent[] }
+  | { type: "setNotes"; patternId: string; notes: NoteEvent[] }
+  | { type: "setChords"; chords: ChordEvent[] }
   | { type: "addClip"; patternId: string; startBeat: number; lengthBeats: number | null }
   | { type: "updateClip"; clip: Clip }
+  | { type: "updateClips"; clips: Clip[] }
   | { type: "removeClip"; id: string }
+  | { type: "removeClips"; ids: string[] }
+  | { type: "makeClipUnique"; id: string }
+  | { type: "setSongLength"; beats: number }
   | { type: "addSection"; name: string; startBeat: number }
   | { type: "updateSection"; section: Section }
   | { type: "removeSection"; id: string }
@@ -289,7 +343,6 @@ export interface ExportRequest {
   tailSeconds: number | null;
   loops: number | null;
   stems: boolean;
-  hearChords: boolean | null;
 }
 
 export interface ExportProgress {
@@ -343,6 +396,8 @@ export interface Settings {
     defaultNoteLength: number;
     defaultVelocity: number;
     defaultPatternBars: number;
+    /** Length of a new project's song, in bars. */
+    defaultSongBars: number;
     defaultTempo: number;
     defaultTimeSignature: TimeSignature;
     newProject: NewProjectKind;
@@ -374,6 +429,7 @@ export const DEFAULT_SETTINGS: Settings = {
     defaultNoteLength: 0.25,
     defaultVelocity: 100,
     defaultPatternBars: 4,
+    defaultSongBars: 32,
     defaultTempo: 120,
     defaultTimeSignature: { numerator: 4, denominator: 4 },
     newProject: "starter",

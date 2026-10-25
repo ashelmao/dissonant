@@ -19,7 +19,7 @@ export function DrumGrid() {
 
   if (!pattern || !track) return null;
   const color = trackColor(track, idx);
-  const committed = pattern.notesByTrack[track.id] ?? [];
+  const committed = pattern.notes;
   const notes = working ?? committed;
   const stepBeats = Math.min(0.5, Math.max(0.125, noteLength));
   const steps = Math.max(1, Math.round(pattern.lengthBeats / stepBeats));
@@ -31,7 +31,7 @@ export function DrumGrid() {
 
   const commit = () => {
     if (working) {
-      void dispatch({ type: "setNotes", patternId: pattern.id, trackId: track.id, notes: working }, false, "edit drum steps");
+      void dispatch({ type: "setNotes", patternId: pattern.id, notes: working }, false, "edit drum steps");
       setWorking(null);
     }
     dragMode.current = null;

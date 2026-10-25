@@ -1,8 +1,8 @@
 import { useState } from "react";
-import { beatsPerBar, dbText, effectiveKey, GRID_OPTIONS, gridLabel, selectedPattern, selectedTrack, selectedTrackIndex, useStore } from "../store";
+import { beatsPerBar, dbText, effectiveKey, GRID_OPTIONS, gridLabel, selectedPattern, selectedTrack, selectedTrackIndex, usePatternChords, useStore } from "../store";
 import { chordAt, explainNote, midiName, NOTE_NAMES, noteName, progression, startersFor, tierMap } from "../theory";
 import { arpeggiateNotes, chopNotes, humanizeNotes, invertNotes, legatoNotes, quantizeNotes, resolveTargets, reverseNotes, scaleNotes, setLength, strumNotes, toggleMute } from "../noteEditing";
-import { DRUM_KIT, SOUND_PRESETS, soundPresetOf, TRACK_PALETTE, trackColor, VOICES, type ScaleType, type TrackParam } from "../types";
+import { DRUM_KIT, replaceChordWindow, SOUND_PRESETS, soundPresetOf, TRACK_PALETTE, trackColor, VOICES, type ScaleType, type TrackParam } from "../types";
 import { hz, Knob, lin, log, panText, pct } from "./Knob";
 
 const VOL = lin(0, 1.5);
@@ -20,10 +20,12 @@ export function Inspector() {
   const [renaming, setRenaming] = useState<string | null>(null);
   const [draft, setDraft] = useState("");
   const [renamingPattern, setRenamingPattern] = useState(false);
+  // The project chords under this pattern (from where it was opened), pattern-relative.
+  const chords = usePatternChords();
 
   if (!pattern || !track) return null;
   const color = trackColor(track, trackIdx);
-  const notes = pattern.notesByTrack[track.id] ?? [];
+  const notes = pattern.notes;
   const selected = notes.filter((n) => s.selectedNoteIds.includes(n.id));
   const stats = selected.length ? selected : notes;
 
@@ -32,7 +34,6 @@ export function Inspector() {
   const velR = range(stats.map((n) => n.velocity));
   const lenR = range(stats.map((n) => n.lengthBeats));
 
-  const chords = pattern.chords.chords;
   const chord = chordAt(chords, s.playhead);
   const liveKey = effectiveKey(s);
   const map = tierMap(s.playhead, chords, liveKey);
@@ -47,12 +48,15 @@ export function Inspector() {
   const setKey = (rootPc: number | null, scale: ScaleType) =>
     void s.dispatch({ type: "setKey", key: { rootPitchClass: rootPc, scale, isLocked: rootPc !== null } });
 
-  const commitChords = (next: typeof chords) => void s.dispatch({ type: "setChords", patternId: pattern.id, chords: next });
+  // Writes the window under this pattern back into the song progression.
+  const commitChords = (next: typeof chords) =>
+    void s.dispatch({ type: "setChords", chords: replaceChordWindow(model.chords, s.chordOffsetBeats, pattern.lengthBeats, next) });
   const param = (p: TrackParam, value: number) => void s.dispatch({ type: "setTrackParam", id: track.id, param: p, value }, true);
   const commit = () => void s.commitGesture();
 
   // Overview geometry
-  const total = model.clips.reduce((max, c) => Math.max(max, c.startBeat + c.lengthBeats), 0);
+  const total = model.songLengthBeats;
+  const trackPatternIds = new Set(model.patterns.filter((p) => p.trackId === track.id).map((p) => p.id));
 
   return (
     <aside className="side inspector">
@@ -97,7 +101,7 @@ export function Inspector() {
                   title="delete track"
                   onClick={async (e) => {
                     e.stopPropagation();
-                    if (await s.confirm("Delete track?", `“${t.name}” and its notes in every pattern will be removed.`, "Delete", true)) {
+                    if (await s.confirm("Delete track?", `“${t.name}”, its patterns and their clips in the song will be removed.`, "Delete", true)) {
                       void s.dispatch({ type: "deleteTrack", id: t.id });
                     }
                   }}
@@ -146,7 +150,7 @@ export function Inspector() {
         <div className="field">
           <span className="flabel">pattern</span>
           <select value={pattern.id} onChange={(e) => s.selectPattern(e.target.value)} style={{ minWidth: 150 }}>
-            {model.patterns.map((p) => (
+            {model.patterns.filter((p) => p.trackId === track.id).map((p) => (
               <option key={p.id} value={p.id}>{p.name}</option>
             ))}
           </select>
@@ -166,10 +170,9 @@ export function Inspector() {
           <span className="val">{notes.length}</span>
         </div>
         <div className="row" style={{ gap: 4 }}>
-          <button onClick={() => s.dispatch({ type: "addPattern" })}>+ new</button>
+          <button onClick={() => s.dispatch({ type: "addPattern", trackId: track.id })}>+ new</button>
           <button onClick={() => s.dispatch({ type: "duplicatePattern", id: pattern.id })}>dup</button>
           <button
-            disabled={model.patterns.length <= 1}
             onClick={async () => {
               if (await s.confirm("Delete pattern?", `“${pattern.name}” and its clips in the song will be removed.`, "Delete", true)) {
                 void s.dispatch({ type: "deletePattern", id: pattern.id });
@@ -363,14 +366,14 @@ export function Inspector() {
       <div className="section" style={{ borderBottom: 0, borderTop: "1px solid var(--line-1)", gap: 6 }}>
         <span className="cap">song overview · {track.name}</span>
         <div className="overview" title="the song; the pattern you're editing is highlighted">
-          {model.clips.map((c) => {
+          {model.clips.filter((c) => trackPatternIds.has(c.patternId)).map((c) => {
             const p = model.patterns.find((x) => x.id === c.patternId);
             const current = c.patternId === pattern.id;
             return (
               <div
                 key={c.id}
                 style={{ left: `${(c.startBeat / Math.max(1, total)) * 100}%`, width: `calc(${(c.lengthBeats / Math.max(1, total)) * 100}% - 1px)`, background: current ? color : `${color}55`, boxShadow: current ? "0 0 0 1px #fff" : undefined, cursor: "pointer", opacity: c.muted ? 0.4 : 1 }}
-                onClick={() => s.selectPattern(c.patternId)}
+                onClick={() => s.openPattern(c.patternId, c.startBeat)}
                 title={p?.name}
               />
             );
@@ -391,13 +394,13 @@ function TransformGrid() {
   const pattern = useStore(selectedPattern);
   const track = useStore(selectedTrack);
   const key = s.snapshot!.model.key;
+  const chords = usePatternChords();
   if (!pattern || !track) return null;
-  const notes = pattern.notesByTrack[track.id] ?? [];
+  const notes = pattern.notes;
   const ids = new Set(s.selectedNoteIds);
   const grid = s.noteLength;
-  const chords = pattern.chords.chords;
   const tierOf = (n: { pitch: number; startBeat: number }) => tierMap(n.startBeat, chords, key)[((n.pitch % 12) + 12) % 12];
-  const apply = (next: typeof notes, label: string) => void s.dispatch({ type: "setNotes", patternId: pattern.id, trackId: track.id, notes: next }, false, label);
+  const apply = (next: typeof notes, label: string) => void s.dispatch({ type: "setNotes", patternId: pattern.id, notes: next }, false, label);
   const tools: [string, string, () => void][] = [
     ["quantize", "snap starts and lengths to the grid", () => apply(quantizeNotes(notes, ids, grid), "quantize")],
     ["humanize", "loosen timing and velocity; chord tones stay tighter", () => apply(humanizeNotes(notes, ids, { timing: grid * 0.15, velocity: 12 }, tierOf), "humanize")],
@@ -430,15 +433,15 @@ function ResolveKeep({ note }: { note: { id: string; pitch: number; startBeat: n
   const pattern = useStore(selectedPattern);
   const track = useStore(selectedTrack);
   const key = s.snapshot!.model.key;
+  const chords = usePatternChords();
   if (!pattern || !track) return null;
-  const chords = pattern.chords.chords;
   const tiers = tierMap(note.startBeat, chords, key);
   const t = tiers[((note.pitch % 12) + 12) % 12];
   const why = explainNote(note.pitch, chords, key, note.startBeat);
-  const notes = pattern.notesByTrack[track.id] ?? [];
+  const notes = pattern.notes;
   const update = (patch: Partial<{ pitch: number; intentional: boolean }>) =>
     void s.dispatch(
-      { type: "setNotes", patternId: pattern.id, trackId: track.id, notes: notes.map((n) => (n.id === note.id ? { ...n, ...patch } : n)) },
+      { type: "setNotes", patternId: pattern.id, notes: notes.map((n) => (n.id === note.id ? { ...n, ...patch } : n)) },
       false,
       "pitch" in patch ? "resolve note" : "keep note",
     );

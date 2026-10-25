@@ -11,9 +11,18 @@ export function Editor() {
   const pattern = useStore(selectedPattern);
   const track = useStore(selectedTrack);
   const idx = useStore(selectedTrackIndex);
-  if (!pattern || !track) return null;
+  if (!track) return null;
+  if (!pattern) {
+    return (
+      <div className="editor" style={{ alignItems: "center", justifyContent: "center", gap: 8, color: "var(--text-5)" }}>
+        <span className="mono">{track.name} has no patterns yet</span>
+        <button onClick={() => s.dispatch({ type: "addPattern", trackId: track.id })}>+ new pattern</button>
+      </div>
+    );
+  }
   const color = trackColor(track, idx);
-  const notes = pattern.notesByTrack[track.id] ?? [];
+  const model = s.snapshot!.model;
+  const notes = pattern.notes;
 
   return (
     <div className="editor">
@@ -43,13 +52,15 @@ export function Editor() {
             <button className={`chip${s.brush ? " on" : ""}`} onClick={() => s.toggleBrush()} title={keys("brush: left-drag on empty space paints notes (⌥-drag does this too when ⌥ is set to paint in Settings)")}>brush</button>
             <button className={`chip${s.follow ? " on" : ""}`} onClick={() => s.toggleFollow()} title="follow: keep the playhead in view while playing">follow</button>
             <button className={`chip${s.fold ? " on" : ""}`} onClick={() => s.toggleFold()} title="fold: show only rows that have notes, plus chord tones around them">fold</button>
-            <div className="opt" title="ghost: draw another track's notes behind this one (dashed, with their tiers)">
+            <div className="opt" title="ghost: draw another pattern's notes behind this one (dashed, with their tiers, never heard)">
               <span className="k">ghost</span>
-              <select value={s.ghostTrackId ?? ""} onChange={(e) => s.setGhostTrack(e.target.value || null)} style={{ maxWidth: 110 }}>
+              <select value={s.ghostPatternId ?? ""} onChange={(e) => s.setGhostPattern(e.target.value || null)} style={{ maxWidth: 110 }}>
                 <option value="">off</option>
-                {s.snapshot!.model.tracks.filter((t) => t.id !== track.id && !t.isDrum).map((t) => (
-                  <option key={t.id} value={t.id}>{t.name}</option>
-                ))}
+                {model.patterns
+                  .filter((p) => p.id !== pattern.id && !model.tracks.find((t) => t.id === p.trackId)?.isDrum)
+                  .map((p) => (
+                    <option key={p.id} value={p.id}>{p.name}</option>
+                  ))}
               </select>
             </div>
           </>
@@ -82,7 +93,7 @@ export function Editor() {
           ?
         </span>
       </div>
-      <ChordLane />
+      <ChordLane offsetBeats={s.chordOffsetBeats} lengthBeats={pattern.lengthBeats} beatW={BASE_BEAT_W * s.zoom} readOnly onEditInSetup={() => s.setMode("setup")} />
       {track.isDrum ? <DrumGrid /> : <PianoRoll />}
     </div>
   );

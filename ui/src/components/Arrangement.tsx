@@ -1,13 +1,13 @@
-import { useLayoutEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { beatsPerBar, dbText, useStore } from "../store";
-import { DRUM_KIT, TRACK_PALETTE, trackColor, type Clip, type NoteEvent, type ScaleType, type Section, type SongPattern, type Track } from "../types";
-import { NOTE_NAMES, noteName } from "../theory";
+import { DRUM_KIT, trackColor, type Clip, type NoteEvent, type Section, type SongPattern, type Track } from "../types";
+import { noteName } from "../theory";
 import { VMeter } from "./Meter";
 import { TempoLane } from "./TempoLane";
+import { SECTION_COLORS, SectionEditor } from "./SectionEditor";
 import { keys } from "../platform";
 
 const HEAD_W = 220;
-const SECTION_COLORS = ["#9a9aa4", "#ff9d2a", "#ff3b30", "#3dc8ff", "#b48cff", "#3dffb0"];
 
 type Drag =
   | { kind: "move"; clip: Clip; x0: number; dup: boolean }
@@ -43,7 +43,21 @@ export function Arrangement() {
   }, []);
 
   const pxPerBeat = pxPerBar / bpb;
-  const songEnd = model.clips.reduce((max, c) => Math.max(max, c.startBeat + c.lengthBeats), 0);
+  const songEnd = model.songLengthBeats;
+
+  // A pattern dragged in from the tree lands on its own track's lane, at the bar under the pointer.
+  const setPatternDropHandler = useStore((st) => st.setPatternDropHandler);
+  useEffect(() => {
+    setPatternDropHandler((patternId, clientX, clientY) => {
+      const el = scrollerRef.current;
+      if (!el) return;
+      const r = el.getBoundingClientRect();
+      if (clientX < r.left + HEAD_W || clientX > r.right || clientY < r.top || clientY > r.bottom) return;
+      const beat = (clientX - r.left + el.scrollLeft - HEAD_W) / pxPerBeat;
+      void useStore.getState().dispatch({ type: "addClip", patternId, startBeat: Math.max(0, Math.floor(beat / bpb) * bpb), lengthBeats: null });
+    });
+    return () => setPatternDropHandler(null);
+  }, [setPatternDropHandler, pxPerBeat, bpb]);
   const bars = Math.max(Math.ceil((viewW - HEAD_W - 12) / pxPerBar), Math.ceil(songEnd / bpb) + 8);
   const timelineW = bars * pxPerBar;
   const snap = (beat: number) => Math.max(0, Math.round(beat / bpb) * bpb);
@@ -206,8 +220,9 @@ export function Arrangement() {
             bpb={bpb}
           >
             {clipsShown.map((clip) => {
+              // A clip plays on its pattern's track only.
               const pattern = model.patterns.find((p) => p.id === clip.patternId);
-              if (!pattern) return null;
+              if (!pattern || pattern.trackId !== track.id) return null;
               return (
                 <ClipView
                   key={clip.id}
@@ -221,7 +236,7 @@ export function Arrangement() {
                   onDown={onClipDown}
                   onMove={onClipMove}
                   onUp={onClipUp}
-                  onDoubleClick={() => (s.selectPattern(pattern.id), s.selectTrack(track.id), s.setMode("pattern"))}
+                  onDoubleClick={() => s.openPattern(pattern.id, clip.startBeat)}
                 />
               );
             })}
@@ -229,75 +244,9 @@ export function Arrangement() {
         ))}
 
         <div className="addrow" style={{ width: HEAD_W + timelineW + 12 }}>
-          <div>{model.clips.length === 0 ? "← press ＋ on a pattern to add it to the song" : keys("＋ patterns on the left · drag clips, trim their right edge, ⌥-drag to copy")}</div>
+          <div>{model.clips.length === 0 ? "← drag a pattern from the left onto the song" : keys("drag patterns in from the left · drag clips, trim their right edge, ⌥-drag to copy")}</div>
         </div>
         <div className="playline" style={{ left: playX }} />
-      </div>
-    </div>
-  );
-}
-
-function SectionEditor({ section, color, onClose }: { section: Section; color: string; onClose: () => void }) {
-  const dispatch = useStore((s) => s.dispatch);
-  const [name, setName] = useState(section.name);
-  const update = (patch: Partial<Section>) => void dispatch({ type: "updateSection", section: { ...section, ...patch } });
-  const root = section.key?.rootPitchClass ?? null;
-  const scale: ScaleType = section.key?.scale ?? "major";
-  return (
-    <div
-      className="popover"
-      style={{ top: 16, left: 0, width: 260 }}
-      onPointerDown={(e) => e.stopPropagation()}
-      onPointerUp={(e) => e.stopPropagation()}
-      onDoubleClick={(e) => e.stopPropagation()}
-    >
-      <div className="row" style={{ justifyContent: "space-between" }}>
-        <span className="cap">section</span>
-        <span className="mono" style={{ fontSize: 9, color: "var(--text-5)" }}>from beat {section.startBeat}</span>
-      </div>
-      <input
-        type="text"
-        autoFocus
-        value={name}
-        onChange={(e) => setName(e.target.value)}
-        onBlur={() => name.trim() && name !== section.name && update({ name: name.trim() })}
-        onKeyDown={(e) => {
-          if (e.key === "Enter") (e.target as HTMLInputElement).blur();
-          if (e.key === "Escape") onClose();
-        }}
-        style={{ width: "100%", margin: "6px 0", fontFamily: "var(--font-ui)", fontWeight: 600, fontSize: 11 }}
-      />
-      <div className="field">
-        <span className="flabel">key</span>
-        <div className="row" style={{ gap: 4 }}>
-          <select
-            value={root ?? ""}
-            onChange={(e) => update({ key: e.target.value === "" ? null : { rootPitchClass: parseInt(e.target.value, 10), scale, isLocked: true } })}
-            title="a section key tiers the patterns placed inside it against this key"
-          >
-            <option value="">inherit</option>
-            {NOTE_NAMES.map((n, i) => (
-              <option key={n} value={i}>{n}</option>
-            ))}
-          </select>
-          <select value={scale} disabled={root === null} onChange={(e) => update({ key: { rootPitchClass: root, scale: e.target.value as ScaleType, isLocked: true } })}>
-            <option value="major">Major</option>
-            <option value="minor">Minor</option>
-          </select>
-        </div>
-      </div>
-      <div className="field">
-        <span className="flabel">color</span>
-        <div className="swatches" style={{ width: 150 }}>
-          {[...SECTION_COLORS, ...TRACK_PALETTE.slice(0, 6)].map((c) => (
-            <div key={c} className={c === color ? "on" : ""} style={{ background: c, height: 10 }} onClick={() => update({ color: c })} />
-          ))}
-        </div>
-      </div>
-      <div className="row" style={{ gap: 4, marginTop: 6 }}>
-        <button className="quiet danger" onClick={() => (onClose(), dispatch({ type: "removeSection", id: section.id }))}>delete</button>
-        <span className="spacer" />
-        <button className="solid" onClick={onClose}>done</button>
       </div>
     </div>
   );
@@ -410,7 +359,7 @@ function ClipView({
   onUp: (e: React.PointerEvent) => void;
   onDoubleClick: () => void;
 }) {
-  const notes = pattern.notesByTrack[track.id] ?? [];
+  const notes = pattern.notes;
   const w = Math.max(6, clip.lengthBeats * pxPerBeat - 1);
   const repeats = clip.lengthBeats / pattern.lengthBeats;
   return (

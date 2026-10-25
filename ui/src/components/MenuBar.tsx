@@ -46,8 +46,8 @@ export function MenuBar() {
       { label: "Save as…", sc: `⇧${mod}S`, action: () => s.saveProject(true) },
       { sep: true },
       { label: "Export audio…", sc: `${mod}E`, action: () => s.exportWav() },
-      { label: `Export MIDI (${s.mode === "song" && snapshot.model.clips.length ? "song" : "pattern"})…`, action: () => s.exportMidi() },
-      { label: "Import MIDI into this pattern…", action: () => s.importMidi() },
+      { label: `Export MIDI (${s.mode !== "pattern" && snapshot.model.clips.length ? "song" : "pattern"})…`, action: () => s.exportMidi() },
+      { label: "Import MIDI as new tracks…", action: () => s.importMidi() },
       { sep: true },
       { label: "Settings…", sc: `${mod},`, action: () => s.openSettings(true) },
       { label: "Quit", sc: `${mod}Q`, action: () => s.requestClose() },
@@ -56,7 +56,7 @@ export function MenuBar() {
       { label: snapshot.undoLabel ? `Undo ${snapshot.undoLabel}` : "Undo", sc: `${mod}Z`, action: () => s.undo(), disabled: !snapshot.canUndo },
       { label: snapshot.redoLabel ? `Redo ${snapshot.redoLabel}` : "Redo", sc: `⇧${mod}Z`, action: () => s.redo(), disabled: !snapshot.canRedo },
       { sep: true },
-      { label: "Select all notes", sc: `${mod}A`, disabled: !pattern || !track, action: () => s.requestSelection((pattern && track ? (pattern.notesByTrack[track.id] ?? []) : []).map((n) => n.id)) },
+      { label: "Select all notes", sc: `${mod}A`, disabled: !pattern || !track, action: () => s.requestSelection((pattern && track ? pattern.notes : []).map((n) => n.id)) },
       { label: "Select none", sc: "Esc", disabled: !hasSel, action: () => s.requestSelection([]) },
       { sep: true },
       { label: "Transpose up a semitone", sc: "↑", disabled: !hasSel, action: () => s.transformSelection((ns, ids) => moveNotes(ns, ids, 0, 1, range), "transpose notes") },
@@ -70,18 +70,20 @@ export function MenuBar() {
       { label: "Mute / unmute notes", sc: "0", disabled: !hasSel, action: () => s.transformSelection(toggleMute, "mute notes") },
       { sep: true },
       {
-        label: "Clear notes on this track",
+        label: "Clear notes in this pattern",
         disabled: !pattern || !track,
         action: async () => {
           if (!pattern || !track) return;
-          if (await s.confirm("Clear notes?", `Every note of “${track.name}” in “${pattern.name}” will be removed.`, "Clear", true)) {
-            void s.dispatch({ type: "setNotes", patternId: pattern.id, trackId: track.id, notes: [] }, false, "clear notes");
+          if (await s.confirm("Clear notes?", `Every note in “${pattern.name}” will be removed.`, "Clear", true)) {
+            void s.dispatch({ type: "setNotes", patternId: pattern.id, notes: [] }, false, "clear notes");
           }
         },
       },
     ],
     view: [
-      { label: `${s.mode === "pattern" ? "Song (arrangement)" : "Pattern (piano roll)"}`, sc: "Tab", action: () => s.setMode(s.mode === "pattern" ? "song" : "pattern") },
+      { label: `${s.mode === "setup" ? "✓ " : ""}Setup (chords, sections, tempo)`, action: () => s.setMode("setup") },
+      { label: `${s.mode === "pattern" ? "✓ " : ""}Pattern (piano roll)`, sc: s.mode === "song" ? "Tab" : undefined, action: () => s.setMode("pattern") },
+      { label: `${s.mode === "song" ? "✓ " : ""}Song (arrangement)`, sc: s.mode === "pattern" ? "Tab" : undefined, action: () => s.setMode("song") },
       { sep: true },
       { label: `${s.highlightRows ? "✓ " : ""}Highlight rows by tier`, action: () => s.toggleHighlight() },
       { label: `${s.showLandscape ? "✓ " : ""}Harmonic map`, action: () => s.toggleLandscape() },

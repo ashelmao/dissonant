@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { beatsPerBar, effectiveKey, selectedPattern, selectedTrack, selectedTrackIndex, useStore } from "../store";
+import { beatsPerBar, effectiveKey, selectedPattern, selectedTrack, selectedTrackIndex, usePatternChords, useStore } from "../store";
 import { chordAt, explainNote, midiName, tierMap } from "../theory";
 import {
   adjustVelocity,
@@ -120,7 +120,8 @@ export function PianoRoll() {
   const playing = useStore((s) => s.playing);
   const selectionRequest = useStore((s) => s.selectionRequest);
   const fold = useStore((s) => s.fold);
-  const ghostTrackId = useStore((s) => s.ghostTrackId);
+  const ghostPatternId = useStore((s) => s.ghostPatternId);
+  const ghostPattern = useStore((s) => s.snapshot?.model.patterns.find((p) => p.id === ghostPatternId) ?? null);
   const commitGesture = useStore((s) => s.commitGesture);
   const editing = useStore((s) => s.settings.editing);
   const swing = useStore((s) => s.snapshot?.model.swing ?? 50);
@@ -146,12 +147,11 @@ export function PianoRoll() {
   const [scrollLeft, setScrollLeft] = useState(0);
   const [viewW, setViewW] = useState(800);
 
-  const notes = useMemo(() => (pattern && track ? (pattern.notesByTrack[track.id] ?? []) : []), [pattern, track]);
-  const ghostNotes = useMemo(
-    () => (pattern && ghostTrackId && ghostTrackId !== track?.id ? (pattern.notesByTrack[ghostTrackId] ?? []) : []),
-    [pattern, ghostTrackId, track],
-  );
-  const chords = pattern?.chords.chords ?? [];
+  const notes = useMemo(() => (pattern && track ? pattern.notes : []), [pattern, track]);
+  // Another pattern's notes, drawn faint behind this one and never heard.
+  const ghostNotes = useMemo(() => (ghostPattern && ghostPattern.id !== pattern?.id ? ghostPattern.notes : []), [ghostPattern, pattern]);
+  // The project chords from where this pattern was opened (`chordOffsetBeats`), shifted to 0.
+  const chords = usePatternChords();
   const beats = pattern?.lengthBeats ?? 16;
   const beatW = BASE_BEAT_W * zoom;
   const gridW = beats * beatW;
@@ -182,7 +182,7 @@ export function PianoRoll() {
 
   const commit = useCallback(
     (next: NoteEvent[], label = "edit notes") => {
-      if (pattern && track) void dispatch({ type: "setNotes", patternId: pattern.id, trackId: track.id, notes: next }, false, label);
+      if (pattern && track) void dispatch({ type: "setNotes", patternId: pattern.id, notes: next }, false, label);
     },
     [dispatch, pattern, track],
   );
@@ -827,7 +827,7 @@ export function PianoRoll() {
       const step = (e.deltaY < 0 ? 1 : -1) * (e.shiftKey ? 12 : 1);
       const next = moveNotes(notes, selection, 0, step, { min: LOW, max: HIGH }, beats);
       if (next !== notes && pattern && track) {
-        void dispatch({ type: "setNotes", patternId: pattern.id, trackId: track.id, notes: next }, true, "transpose notes");
+        void dispatch({ type: "setNotes", patternId: pattern.id, notes: next }, true, "transpose notes");
         if (wheelCommit.current) clearTimeout(wheelCommit.current);
         wheelCommit.current = setTimeout(() => void commitGesture(), 400);
       }

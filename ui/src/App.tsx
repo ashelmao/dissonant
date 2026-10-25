@@ -2,8 +2,9 @@ import { useEffect } from "react";
 import { MenuBar } from "./components/MenuBar";
 import { Transport } from "./components/Transport";
 import { StatusBar } from "./components/StatusBar";
-import { PatternsPanel } from "./components/PatternsPanel";
+import { TrackTree } from "./components/TrackTree";
 import { Arrangement } from "./components/Arrangement";
+import { Setup } from "./components/Setup";
 import { BottomPanel } from "./components/BottomPanel";
 import { Inspector } from "./components/Inspector";
 import { Editor } from "./components/Editor";
@@ -81,6 +82,7 @@ export default function App() {
         e.preventDefault();
         void s.requestClose();
       } else if (!mod && e.key === "Tab") {
+        // Pattern ⇄ song; from SETUP it goes to the pattern editor.
         e.preventDefault();
         s.setMode(s.mode === "pattern" ? "song" : "pattern");
       } else if (!mod && s.liveKeyboard === "off" && k === "l") {
@@ -108,9 +110,11 @@ export default function App() {
       <MenuBar />
       <Transport />
       <div className="content">
-        {mode === "song" ? (
+        {mode === "setup" ? (
+          <Setup />
+        ) : mode === "song" ? (
           <>
-            <PatternsPanel />
+            <TrackTree />
             <div className="center">
               <Arrangement />
               <BottomPanel />
@@ -118,6 +122,7 @@ export default function App() {
           </>
         ) : (
           <>
+            <TrackTree />
             <Inspector />
             <Editor />
           </>

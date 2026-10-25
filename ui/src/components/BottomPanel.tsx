@@ -18,7 +18,7 @@ export function BottomPanel() {
   const index = useStore(selectedTrackIndex);
   const pattern = useStore(selectedPattern);
 
-  const noteCount = track && pattern ? (pattern.notesByTrack[track.id]?.length ?? 0) : 0;
+  const noteCount = track && pattern ? (pattern.notes.length) : 0;
 
   return (
     <div className="bottom">

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { peakDb, selectedPattern, useStore } from "../store";
+import { peakDb, useStore } from "../store";
 import { tempoMap, TIME_SIGNATURES } from "../types";
 import { detectKey, keyName } from "../theory";
 import { HMeter } from "./Meter";
@@ -12,7 +12,6 @@ function pad(n: number, w: number) {
 export function Transport() {
   const s = useStore();
   const model = s.snapshot!.model;
-  const pattern = useStore(selectedPattern);
   const [editingBpm, setEditingBpm] = useState(false);
   const [bpmText, setBpmText] = useState(model.tempo.toFixed(3));
   useEffect(() => setBpmText(model.tempo.toFixed(3)), [model.tempo]);
@@ -26,19 +25,15 @@ export function Transport() {
   const bar = Math.floor(beat / 4) + 1;
   const bib = Math.floor(beat % 4) + 1;
   const six = Math.floor((beat % 1) * 4) + 1;
-  const map = s.mode === "song" ? tempoMap(model.tempo, model.tempoPoints) : null;
+  const map = s.mode !== "pattern" ? tempoMap(model.tempo, model.tempoPoints) : null;
   const secs = map && !map.isConstant ? map.secondsAt(beat) : (beat * 60) / model.tempo;
   const liveBpm = map && !map.isConstant ? map.bpmAt(beat) : null;
   const mm = Math.floor(secs / 60);
   const ss = secs - mm * 60;
 
-  // Key: locked value, or a suggestion from the melodic notes of the selected pattern.
+  // Key: locked value, or a suggestion from the notes of every melodic pattern.
   const drumIds = new Set(model.tracks.filter((t) => t.isDrum).map((t) => t.id));
-  const pcs = pattern
-    ? Object.entries(pattern.notesByTrack)
-        .filter(([tid]) => !drumIds.has(tid))
-        .flatMap(([, notes]) => notes.map((n) => n.pitch))
-    : [];
+  const pcs = model.patterns.filter((p) => !drumIds.has(p.trackId)).flatMap((p) => p.notes.map((n) => n.pitch));
   const detected = detectKey(pcs);
   const suggestion = !model.key.isLocked && detected.isConfident ? detected.candidates[0] : null;
 
@@ -56,8 +51,9 @@ export function Transport() {
       <div className="tgroup">
         <span className="cap">mode</span>
         <div className="seg">
-          <div className={s.mode === "pattern" ? "on" : ""} onClick={() => s.setMode("pattern")}>pat</div>
-          <div className={s.mode === "song" ? "on" : ""} onClick={() => s.setMode("song")}>song</div>
+          <div className={s.mode === "setup" ? "on" : ""} onClick={() => s.setMode("setup")} title="setup: chords, sections, tempo, song length">setup</div>
+          <div className={s.mode === "pattern" ? "on" : ""} onClick={() => s.setMode("pattern")} title="pattern: the piano roll (Tab toggles with song)">pat</div>
+          <div className={s.mode === "song" ? "on" : ""} onClick={() => s.setMode("song")} title="song: the arrangement (Tab toggles with pattern)">song</div>
         </div>
       </div>
       <div className="tdiv" />
