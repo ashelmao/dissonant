@@ -85,6 +85,41 @@ impl Sequence {
         })
     }
 
+    /// Also play another pattern (the ghost) on its own track, looped from beat 0 under this
+    /// sequence's length and cut at its end, so the pattern being edited can be heard against
+    /// it (a melody over the drums). Repeats get stable, distinct ids derived from the note id
+    /// and the repetition. An unknown ghost id leaves the sequence as it was.
+    pub fn with_ghost(mut self, model: &ProjectModel, ghost_id: &Uuid) -> Self {
+        let Some(ghost) = model.pattern(ghost_id) else { return self };
+        let Some(track) = self.tracks.iter_mut().find(|t| t.id == ghost.track_id) else { return self };
+        if !(ghost.length_beats > 0.0) {
+            return self;
+        }
+        let end = self.length_beats;
+        let mut base = 0.0;
+        let mut rep = 0u64;
+        while base < end {
+            for note in &ghost.notes {
+                let start = base + note.start_beat;
+                if start >= end {
+                    continue;
+                }
+                let mut salt = b"ghost".to_vec();
+                salt.extend_from_slice(&rep.to_le_bytes());
+                track.notes.push(NoteEvent {
+                    id: Uuid::new_v5(&note.id, &salt),
+                    start_beat: start,
+                    length_beats: (note.length_beats.min(end - start)).max(1.0 / 64.0),
+                    ..note.clone()
+                });
+            }
+            base += ghost.length_beats;
+            rep += 1;
+        }
+        track.notes.sort_by(|a, b| a.start_beat.total_cmp(&b.start_beat));
+        self
+    }
+
     /// Every track with no notes and no chords, for pattern mode with nothing to edit.
     pub fn silent(model: &ProjectModel, length_beats: f64) -> Self {
         Sequence {
@@ -149,6 +184,23 @@ mod tests {
         let d = Sequence::from_pattern(&model, &drums.id, 0.0).unwrap();
         assert!(d.tracks[0].notes.is_empty());
         assert_eq!(d.tracks[1].notes.len(), drums.notes.len());
+    }
+
+    #[test]
+    fn a_ghost_pattern_loops_under_the_edited_one_on_its_own_track() {
+        let mut model = ProjectModel::starter();
+        let (melody, drums) = (model.patterns[0].id, model.patterns[1].id);
+        model.patterns[1].length_beats = 4.0;
+        model.patterns[1].notes = vec![NoteEvent::new(0.0, 0.25, 36), NoteEvent::new(3.0, 2.0, 38)];
+        let p = Sequence::from_pattern(&model, &melody, 0.0).unwrap().with_ghost(&model, &drums);
+        let starts: Vec<f64> = p.tracks[1].notes.iter().map(|n| n.start_beat).collect();
+        assert_eq!(starts, vec![0.0, 3.0, 4.0, 7.0, 8.0, 11.0, 12.0, 15.0], "a 4-beat ghost loops four times under 16 beats");
+        assert_eq!(p.tracks[1].notes.last().unwrap().length_beats, 1.0, "cut at the loop end");
+        let ids: std::collections::HashSet<_> = p.tracks[1].notes.iter().map(|n| n.id).collect();
+        assert_eq!(ids.len(), 8, "every repeat has its own id");
+        assert_eq!(p.tracks[0].notes.len(), model.patterns[0].notes.len(), "the edited pattern is untouched");
+        let same = Sequence::from_pattern(&model, &melody, 0.0).unwrap();
+        assert_eq!(same.clone().with_ghost(&model, &Uuid::new_v4()), same, "an unknown ghost changes nothing");
     }
 
     #[test]

@@ -32,6 +32,8 @@ struct PlaybackContext {
     /// The song beat the edited pattern's beat 0 sits on, for the chords it hears and tiers
     /// against (0 = from song bar 1).
     chord_offset_beats: f64,
+    /// Another pattern played along in pattern mode (the ghost the user chose to hear).
+    ghost_pattern_id: Option<Uuid>,
     hear_chords: bool,
     /// The track live input (MIDI / typing keyboard) plays and records into.
     live_track: Option<Uuid>,
@@ -48,6 +50,7 @@ impl Default for PlaybackContext {
             mode: PlayMode::Pattern,
             pattern_id: None,
             chord_offset_beats: 0.0,
+            ghost_pattern_id: None,
             hear_chords: false,
             live_track: None,
             looping: true,
@@ -420,6 +423,7 @@ impl AppState {
             let mut ctx = self.playback.lock().unwrap();
             ctx.pattern_id = None;
             ctx.chord_offset_beats = 0.0;
+            ctx.ghost_pattern_id = None;
         }
         self.send(EngineCommand::Stop);
         self.send(EngineCommand::Seek { beat: 0.0 });
@@ -439,7 +443,7 @@ impl AppState {
         let seq = {
             let doc = self.doc.lock().unwrap();
             let ctx = self.playback.lock().unwrap();
-            build_sequence(doc.model(), ctx.mode, ctx.pattern_id, ctx.chord_offset_beats)
+            build_sequence(doc.model(), ctx.mode, ctx.pattern_id, ctx.chord_offset_beats, ctx.ghost_pattern_id)
         };
         let master = self.doc.lock().unwrap().model().master.clone();
         self.send(EngineCommand::SetSequence(Arc::new(seq)));
@@ -470,12 +474,23 @@ fn autosave_path_for(project: &std::path::Path) -> PathBuf {
 
 /// Song mode (SETUP and SONG in the UI) plays the whole song, empty or not. Pattern mode plays
 /// the context pattern alone against the chords from `chord_offset_beats`; with no pattern (or
-/// one that is gone) it plays nothing, but every track is still there for live input.
-fn build_sequence(model: &ProjectModel, mode: PlayMode, pattern_id: Option<Uuid>, chord_offset_beats: f64) -> Sequence {
+/// one that is gone) it plays nothing, but every track is still there for live input. A ghost
+/// pattern, when given, loops along on its own track (live listening only; exports pass none).
+fn build_sequence(
+    model: &ProjectModel,
+    mode: PlayMode,
+    pattern_id: Option<Uuid>,
+    chord_offset_beats: f64,
+    ghost_pattern_id: Option<Uuid>,
+) -> Sequence {
     match mode {
         PlayMode::Song => Sequence::from_song(model),
         PlayMode::Pattern => pattern_id
             .and_then(|id| Sequence::from_pattern(model, &id, chord_offset_beats))
+            .map(|seq| match ghost_pattern_id.filter(|g| Some(*g) != pattern_id) {
+                Some(ghost) => seq.with_ghost(model, &ghost),
+                None => seq,
+            })
             .unwrap_or_else(|| Sequence::silent(model, model.bar_beats() * 4.0)),
     }
 }
@@ -631,10 +646,17 @@ fn autosave_now(state: State<'_, AppState>) -> Option<String> {
 // ─── Transport ───────────────────────────────────────────────────────────────────────────────
 
 /// What ▶ plays: the song, or one pattern heard against the project chords from song beat
-/// `chord_offset_beats` (default 0, song bar 1). Switching mode or pattern rewinds; moving only
-/// the chord offset does not.
+/// `chord_offset_beats` (default 0, song bar 1), with `ghost_pattern_id` looping along when the
+/// user wants to hear it. Switching mode or pattern rewinds; moving only the chord offset or
+/// changing the ghost does not.
 #[tauri::command]
-fn set_playback_context(state: State<'_, AppState>, mode: PlayMode, pattern_id: Option<Uuid>, chord_offset_beats: Option<f64>) {
+fn set_playback_context(
+    state: State<'_, AppState>,
+    mode: PlayMode,
+    pattern_id: Option<Uuid>,
+    chord_offset_beats: Option<f64>,
+    ghost_pattern_id: Option<Uuid>,
+) {
     let offset = chord_offset_beats.filter(|b| b.is_finite()).unwrap_or(0.0).max(0.0);
     {
         let mut ctx = state.playback.lock().unwrap();
@@ -642,6 +664,7 @@ fn set_playback_context(state: State<'_, AppState>, mode: PlayMode, pattern_id: 
         ctx.mode = mode;
         ctx.pattern_id = pattern_id;
         ctx.chord_offset_beats = offset;
+        ctx.ghost_pattern_id = ghost_pattern_id;
         if changed {
             state.send(EngineCommand::Seek { beat: 0.0 });
         }
@@ -995,7 +1018,7 @@ async fn export_wav(app: AppHandle, state: State<'_, AppState>, request: ExportR
     };
     let song = request.scope != "pattern" && !model.clips.is_empty();
     let mode = if song { PlayMode::Song } else { PlayMode::Pattern };
-    let build = move |m: &ProjectModel| build_sequence(m, mode, pattern_id, offset);
+    let build = move |m: &ProjectModel| build_sequence(m, mode, pattern_id, offset, None);
     let pattern_track = pattern_id.and_then(|id| model.pattern(&id)).map(|p| p.track_id);
     if !song && pattern_track.is_none() {
         state.exporting.store(false, Ordering::SeqCst);

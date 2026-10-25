@@ -169,11 +169,13 @@ function ChordsFrom({ pattern }: { pattern: SongPattern }) {
   );
 }
 
-/** Pick another pattern (any track) to draw faint behind this one. Never heard. */
+/** Pick another pattern (any track) to draw faint behind this one, and hear it along if you like. */
 function GhostPicker({ pattern }: { pattern: SongPattern }) {
   const model = useStore((s) => s.snapshot!.model);
   const ghostPatternId = useStore((s) => s.ghostPatternId);
   const setGhostPattern = useStore((s) => s.setGhostPattern);
+  const hearGhost = useStore((s) => s.hearGhost);
+  const toggleHearGhost = useStore((s) => s.toggleHearGhost);
   const value = ghostPatternId && ghostPatternId !== pattern.id ? ghostPatternId : "";
   const ghost = model.patterns.find((p) => p.id === value);
   const gi = ghost ? model.tracks.findIndex((t) => t.id === ghost.trackId) : -1;
@@ -183,7 +185,7 @@ function GhostPicker({ pattern }: { pattern: SongPattern }) {
   return (
     <div
       className="opt ghostpick"
-      title="ghost: draw another pattern behind this one, faint and never heard, to write against it. a drum pattern shows as its rhythm."
+      title="ghost: draw another pattern behind this one, faint, to write against it, and loop it along while you play. a drum pattern shows as its rhythm."
     >
       <span className="k">ghost</span>
       {gi >= 0 && <span className="sq" style={{ background: trackColor(model.tracks[gi], gi) }} />}
@@ -193,12 +195,23 @@ function GhostPicker({ pattern }: { pattern: SongPattern }) {
           <optgroup key={g.track.id} label={g.track.name}>
             {g.patterns.map((p) => (
               <option key={p.id} value={p.id}>
-                {g.track.name} › {p.name}
+                {p.name}
               </option>
             ))}
           </optgroup>
         ))}
       </select>
+      {ghost && (
+        <button
+          className={`chip bedtoggle${hearGhost ? " on" : ""}`}
+          onClick={toggleHearGhost}
+          aria-pressed={hearGhost}
+          aria-label="hear ghost"
+          title={`play ${ghost.name} along on its own track while you write (pattern mode only, never exported)`}
+        >
+          <span className="box" aria-hidden="true">{hearGhost ? "■" : "□"}</span> hear
+        </button>
+      )}
       {ghost && (
         <button className="ico" onClick={() => setGhostPattern(null)} aria-label="ghost off" title="ghost off">
           ×

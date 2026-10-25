@@ -48,7 +48,8 @@ export interface Bridge {
    * What ▶ plays. In pattern mode `chordOffsetBeats` is the song beat the pattern's bar 1 sits
    * on: the chord bed and tiering use the project chords from there.
    */
-  setPlaybackContext(mode: PlayMode, patternId: string | null, chordOffsetBeats: number): Promise<void>;
+  /** `ghostPatternId`: another pattern looped along in pattern mode, heard while you write. */
+  setPlaybackContext(mode: PlayMode, patternId: string | null, chordOffsetBeats: number, ghostPatternId?: string | null): Promise<void>;
   /** Start playing; with `countInBars` the metronome counts first and the transport starts after. */
   play(countInBars?: number): Promise<void>;
   stop(): Promise<void>;
@@ -148,7 +149,8 @@ async function tauriBridge(): Promise<Bridge> {
     newProject: (starter) => invoke<Snapshot>("new_project", { starter: starter ?? null }),
     openProject: (path) => invoke<Snapshot>("open_project", { path }),
     saveProject: (path) => invoke<Snapshot>("save_project", { path: path ?? null }),
-    setPlaybackContext: (mode, patternId, chordOffsetBeats) => invoke("set_playback_context", { mode, patternId, chordOffsetBeats }),
+    setPlaybackContext: (mode, patternId, chordOffsetBeats, ghostPatternId = null) =>
+      invoke("set_playback_context", { mode, patternId, chordOffsetBeats, ghostPatternId }),
     play: (countInBars) => invoke("transport_play", { countInBars: countInBars ?? null }),
     stop: () => invoke("transport_stop"),
     setMetronome: (on, volume) => invoke("set_metronome", { on, volume: volume ?? null }),
@@ -945,7 +947,7 @@ function mockBridge(): Bridge {
       }
       return snapshot();
     },
-    // The mock plays no chord bed, so the chord offset only matters to the engine.
+    // The mock plays no sound, so the chord offset and the ghost only matter to the engine.
     setPlaybackContext: async (m, pid) => {
       if (m !== mode || pid !== patternId) beat = 0;
       mode = m;

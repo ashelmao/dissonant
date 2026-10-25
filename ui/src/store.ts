@@ -97,8 +97,10 @@ interface State {
   follow: boolean;
   /** Fold: only rows with notes (or chord tones nearby) are shown. */
   fold: boolean;
-  /** Another pattern (any track) whose notes are drawn as ghosts behind the roll, never heard. */
+  /** Another pattern (any track) whose notes are drawn as ghosts behind the roll (heard too while `hearGhost` is on). */
   ghostPatternId: string | null;
+  /** Play the ghost pattern along in pattern mode (it is always drawn). */
+  hearGhost: boolean;
   /** A pattern being dragged from the tree; the song view previews the drop from it. */
   patternDrag: PatternDrag | null;
   /** Registered by the song view while mounted; the tree calls it on release. */
@@ -156,6 +158,7 @@ interface State {
   toggleFollow(): void;
   toggleFold(): void;
   setGhostPattern(id: string | null): void;
+  toggleHearGhost(): void;
   setPatternDrag(drag: PatternDrag | null): void;
   setPatternDropHandler(fn: PatternDropHandler | null): void;
   requestSelection(ids: string[]): void;
@@ -252,8 +255,9 @@ export function reconcileSelection(m: ProjectModel, trackId: string | null, patt
 export const useStore = create<State>((set, get) => {
   const syncPlayback = async () => {
     const b = await getBridge();
-    const { mode, selectedPatternId, chordOffsetBeats } = get();
-    await b.setPlaybackContext(playModeOf(mode), selectedPatternId, chordOffsetBeats);
+    const { mode, selectedPatternId, chordOffsetBeats, ghostPatternId, hearGhost } = get();
+    const ghost = hearGhost && ghostPatternId !== selectedPatternId ? ghostPatternId : null;
+    await b.setPlaybackContext(playModeOf(mode), selectedPatternId, chordOffsetBeats, ghost);
   };
 
   /**
@@ -283,8 +287,9 @@ export const useStore = create<State>((set, get) => {
       ...(keptClips.length !== selectedClipIds.length ? { selectedClipIds: keptClips } : {}),
       ...(ghostPatternId && !m.patterns.some((p) => p.id === ghostPatternId) ? { ghostPatternId: null } : {}),
     });
+    const ghostLost = ghostPatternId !== null && get().ghostPatternId === null;
     moveSelection(next);
-    if (patternLost) void syncPlayback();
+    if (patternLost || ghostLost) void syncPlayback();
     // OS window title: "song.dissonant • — dissonant"
     const title = `${fileNameOf(snapshot.path)}${snapshot.dirty ? " •" : ""} — dissonant`;
     if (title !== lastTitle) {
@@ -388,6 +393,7 @@ export const useStore = create<State>((set, get) => {
     follow: true,
     fold: false,
     ghostPatternId: null,
+    hearGhost: true,
     patternDrag: null,
     patternDropHandler: null,
     selectionRequest: null,
@@ -657,6 +663,11 @@ export const useStore = create<State>((set, get) => {
     },
     setGhostPattern(id) {
       set({ ghostPatternId: id });
+      void syncPlayback();
+    },
+    toggleHearGhost() {
+      set((s) => ({ hearGhost: !s.hearGhost }));
+      void syncPlayback();
     },
     setPatternDrag(drag) {
       set({ patternDrag: drag });

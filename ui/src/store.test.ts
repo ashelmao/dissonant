@@ -49,7 +49,7 @@ describe("fresh projects", () => {
     expect(st().selectedTrackId).toBe(m.tracks[0].id);
     expect(st().selectedPatternId).toBe(m.patterns[0].id);
     expect(st().chordOffsetBeats).toBe(0);
-    expect(lastContext()).toEqual(["song", m.patterns[0].id, 0]);
+    expect(lastContext()).toEqual(["song", m.patterns[0].id, 0, null]);
   });
 
   it("turn the chord bed on", () => {
@@ -119,7 +119,7 @@ describe("openPattern and the playback context", () => {
     await settle();
     expect(st().mode).toBe("pattern");
     expect([st().selectedTrackId, st().selectedPatternId, st().chordOffsetBeats]).toEqual([drums.trackId, drums.id, 64]);
-    expect(lastContext()).toEqual(["pattern", drums.id, 64]);
+    expect(lastContext()).toEqual(["pattern", drums.id, 64, null]);
     expect(S.effectiveKey(st()).rootPitchClass).toBe(9);
     // The chords the roll tiers against start at song beat 64, shifted to 0.
     expect(S.patternChords(st()).map((c) => [c.startBeat, c.name])).toEqual([
@@ -135,7 +135,7 @@ describe("openPattern and the playback context", () => {
     st().openPattern(model().patterns[0].id);
     await settle();
     expect(st().chordOffsetBeats).toBe(0);
-    expect(lastContext()).toEqual(["pattern", model().patterns[0].id, 0]);
+    expect(lastContext()).toEqual(["pattern", model().patterns[0].id, 0, null]);
   });
 
   it("selecting another pattern resets the chord offset", async () => {
@@ -143,6 +143,28 @@ describe("openPattern and the playback context", () => {
     st().selectPattern(model().patterns[1].id);
     await settle();
     expect(st().chordOffsetBeats).toBe(0);
+  });
+
+  it("plays a picked ghost along unless hearing it is off, and never the edited pattern itself", async () => {
+    const [melody, drums] = model().patterns;
+    st().openPattern(melody.id);
+    st().setGhostPattern(drums.id);
+    await settle();
+    expect(lastContext()).toEqual(["pattern", melody.id, 0, drums.id]);
+    st().toggleHearGhost();
+    await settle();
+    expect(st().hearGhost).toBe(false);
+    expect(lastContext()).toEqual(["pattern", melody.id, 0, null]);
+    st().toggleHearGhost();
+    st().selectPattern(drums.id);
+    await settle();
+    expect(lastContext()).toEqual(["pattern", drums.id, 0, null]);
+    // Deleting the ghost pattern drops it from playback too.
+    st().selectPattern(melody.id);
+    await st().dispatch({ type: "deletePattern", id: drums.id });
+    await settle();
+    expect(st().ghostPatternId).toBe(null);
+    expect(lastContext()).toEqual(["pattern", melody.id, 0, null]);
   });
 
   it("SETUP and SONG both play the song", async () => {

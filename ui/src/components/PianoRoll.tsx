@@ -157,7 +157,7 @@ export function PianoRoll() {
 
   const notes = useMemo(() => (pattern && track ? pattern.notes : []), [pattern, track]);
   const beats = pattern?.lengthBeats ?? 16;
-  // Another pattern's notes, drawn faint behind this one and never heard; looped under this
+  // Another pattern's notes, drawn faint behind this one (and heard while hearGhost is on); looped under this
   // pattern the way the song would loop it. A drum ghost is kept apart (rhythm lines, no rows).
   const ghostAll = useMemo(
     () => (ghostPattern && ghostPattern.id !== pattern?.id ? tileGhost(ghostPattern.notes, ghostPattern.lengthBeats, beats) : []),

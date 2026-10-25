@@ -6,7 +6,7 @@ import { BASE_BEAT_W } from "./ChordLane";
 
 /** Step sequencer for a drum track, aligned to the chord lane. Left-click/drag adds hits,
  *  right-click/drag removes. Hits are ordinary notes (pitch = kit note). A ghost pattern shows
- *  as outlined steps (another drum pattern) or an onset row (a melodic one), never heard. */
+ *  as outlined steps (another drum pattern) or an onset row (a melodic one). */
 export function DrumGrid() {
   const pattern = useStore(selectedPattern);
   const track = useStore(selectedTrack);
@@ -75,7 +75,7 @@ export function DrumGrid() {
   return (
     <div className="drumgrid" onPointerUp={commit} onPointerLeave={commit}>
       {ghostPattern && !ghostIsDrum && ghostNotes.length > 0 && (
-        <div className="drumrow ghostrow" title={`${ghostPattern.name}: where its notes start · a ghost, never heard`}>
+        <div className="drumrow ghostrow" title={`${ghostPattern.name}: where its notes start · the ghost`}>
           <span className="dname">ghost</span>
           <div className="drumcells">
             {Array.from({ length: steps }, (_, step) => {
