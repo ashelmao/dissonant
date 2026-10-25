@@ -25,13 +25,17 @@ import {
 } from "../noteEditing";
 import { mixHex, swingWarp, TIER_COLORS, trackColor, uuid, type NoteEvent, type Tier } from "../types";
 import { BASE_BEAT_W, GUTTER } from "./ChordLane";
+import { useMediaQuery, usePixelRatio } from "../uiScale";
 
 // Geometry (from the handoff: 18px rows, 96px beats at 1×, 64px keyboard, 28px ruler)
 const LOW = 24; // C1
 const HIGH = 96; // C7
 const RULER_H = 28;
 const EDGE_PX = 7;
-const VEL_H = 110;
+/** Velocity lane height; shorter when the page is short (a small window or a large ui scale). */
+const VEL_H_TALL = 110;
+const VEL_H_SHORT = 64;
+const SHORT_PAGE = "(max-height: 600px)";
 /** Grid used while ⌥ bypasses snap. */
 const FINE = 1 / 64;
 const BLACK = new Set([1, 3, 6, 8, 10]);
@@ -122,6 +126,8 @@ export function PianoRoll() {
   const swing = useStore((s) => s.snapshot?.model.swing ?? 50);
   const swingGrid = useStore((s) => s.snapshot?.model.swingGrid ?? 0.5);
   const appearance = useStore((s) => s.settings.appearance);
+  const pixelRatio = usePixelRatio();
+  const VEL_H = useMediaQuery(SHORT_PAGE) ? VEL_H_SHORT : VEL_H_TALL;
   const ROW_H = appearance.rowHeight;
   const defaultVelocity = editing.defaultVelocity;
   // Audition only when the setting says so; drags still audition pitch changes. `beats` is the
@@ -223,7 +229,7 @@ export function PianoRoll() {
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
-    const dpr = window.devicePixelRatio || 1;
+    const dpr = pixelRatio;
     const W = GUTTER + gridW;
     const H = RULER_H + gridH;
     if (canvas.width !== Math.round(W * dpr) || canvas.height !== Math.round(H * dpr)) {
@@ -525,13 +531,13 @@ export function PianoRoll() {
       ctx.fillStyle = "#b8b8c0";
       ctx.fillText(why, hx + 6, hy + 20);
     }
-  }, [shown, ghostNotes, chords, key, playhead, showLandscape, highlightRows, noteLength, beatW, beats, gridW, gridH, selection, hover, preview, color, rootPc, bpb, loopRegion, looping, ROW_H, appearance, swing, swingGrid, visiblePitches, rowOf, fold]);
+  }, [shown, ghostNotes, chords, key, playhead, showLandscape, highlightRows, noteLength, beatW, beats, gridW, gridH, selection, hover, preview, color, rootPc, bpb, loopRegion, looping, ROW_H, appearance, swing, swingGrid, visiblePitches, rowOf, fold, pixelRatio]);
 
   // ─── Velocity lane canvas ─────────────────────────────────────────────────────────────────
   useEffect(() => {
     const canvas = velRef.current;
     if (!canvas) return;
-    const dpr = window.devicePixelRatio || 1;
+    const dpr = pixelRatio;
     const W = viewW;
     const H = VEL_H;
     if (canvas.width !== Math.round(W * dpr) || canvas.height !== Math.round(H * dpr)) {
@@ -578,7 +584,7 @@ export function PianoRoll() {
     ctx.fillText("127", GUTTER - 8 - ctx.measureText("127").width, 8);
     ctx.fillText("64", GUTTER - 8 - ctx.measureText("64").width, H / 2);
     ctx.fillText("0", GUTTER - 8 - ctx.measureText("0").width, H - 8);
-  }, [shown, chords, key, playhead, beatW, beats, gridW, selection, scrollLeft, viewW, bpb]);
+  }, [shown, chords, key, playhead, beatW, beats, gridW, selection, scrollLeft, viewW, bpb, pixelRatio, VEL_H]);
 
   // ─── Interaction ──────────────────────────────────────────────────────────────────────────
   const local = (e: React.PointerEvent, el: HTMLElement) => {
@@ -1031,7 +1037,7 @@ export function PianoRoll() {
         <span className="on">velocity</span>
         <span className="sum">{velSummary}</span>
       </div>
-      <div className="vellane">
+      <div className="vellane" style={{ height: VEL_H }}>
         <canvas ref={velRef} onPointerDown={onVelDown} onPointerMove={onVelMove} onPointerUp={endDrag} onPointerCancel={endDrag} onContextMenu={(e) => e.preventDefault()} />
       </div>
     </div>

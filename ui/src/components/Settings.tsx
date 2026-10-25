@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { GRID_OPTIONS, useStore } from "../store";
 import { TIER_PRESETS, TIME_SIGNATURES, type Settings as SettingsT } from "../types";
 import { keys } from "../platform";
+import { UI_SCALE_NATIVE } from "../uiScale";
 
 type Tab = "audio" | "midi" | "editing" | "export" | "appearance";
 const TABS: [Tab, string][] = [
@@ -331,6 +332,7 @@ function AppearanceTab() {
     <>
       <Row label="ui scale">
         <Seg value={a.uiScale} options={[[0.9, "90%"], [1, "100%"], [1.1, "110%"], [1.25, "125%"], [1.5, "150%"]]} onChange={(v) => upd({ uiScale: v })} />
+        {!UI_SCALE_NATIVE && <span className="k" style={{ whiteSpace: "nowrap" }}>browser: use its zoom</span>}
       </Row>
       <Row label="roll row height">
         <Seg value={a.rowHeight} options={[[14, "14"], [18, "18"], [22, "22"]]} onChange={(v) => upd({ rowHeight: v })} />

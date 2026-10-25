@@ -347,6 +347,22 @@ select {
   background: var(--bg-transport);
   border-bottom: 1px solid var(--line-1);
 }
+/* The transport and the editor toolbar are one row each. When they don't fit (a narrow window, or
+   a large ui scale, which narrows the page in CSS pixels) they scroll sideways on a thin bar
+   rather than clipping or wrapping controls out of reach. */
+.transport,
+.toolbar {
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+.transport > *,
+.toolbar > * {
+  flex-shrink: 0;
+}
+.transport::-webkit-scrollbar,
+.toolbar::-webkit-scrollbar {
+  height: 4px;
+}
 .tgroup {
   display: flex;
   flex-direction: column;
@@ -1177,7 +1193,8 @@ select {
 
 /* Bottom panel */
 .bottom {
-  height: 300px;
+  /* Leaves the arrangement room on a short page (a small window or a large ui scale). */
+  height: min(300px, 48vh);
   flex: none;
   background: var(--bg-lane);
   border-top: 2px solid var(--line-1);
@@ -1397,6 +1414,7 @@ select {
   align-items: center;
   gap: 6px;
   margin-right: 6px;
+  white-space: nowrap;
 }
 .toolbar .title .sq {
   width: 8px;
@@ -1517,7 +1535,6 @@ select {
   text-transform: none;
 }
 .vellane {
-  height: 110px;
   flex: none;
   overflow: hidden;
   position: relative;
@@ -1758,6 +1775,9 @@ select {
 .modal {
   width: 380px;
   max-width: calc(100vw - 32px);
+  /* Never taller than the page (a short window or a large ui scale): the body scrolls instead. */
+  max-height: calc(100vh - 32px);
+  overflow-y: auto;
   background: var(--bg-2);
   border: 1px solid var(--line-3);
   border-radius: 3px;
@@ -1830,7 +1850,8 @@ select {
 }
 .settings .sbody {
   display: flex;
-  min-height: 360px;
+  flex: 1 1 auto;
+  min-height: min(360px, calc(100vh - 110px));
 }
 .settings .stabs {
   width: 120px;

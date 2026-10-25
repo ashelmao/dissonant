@@ -1,11 +1,12 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Main window: core APIs plus native open/save dialogs.",
+  "description": "Main window: core APIs, webview zoom (ui scale) plus native open/save dialogs.",
   "windows": ["main"],
   "permissions": [
     "core:default",
     "core:window:allow-set-title",
+    "core:webview:allow-set-webview-zoom",
     "dialog:default"
   ]
 }

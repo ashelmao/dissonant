@@ -2,6 +2,7 @@ import { create } from "zustand";
 import { getBridge } from "./bridge";
 import type { AudioStatus, Command, ExportProgress, ExportRequest, KeyState, MidiStatus, NoteEvent, OutputDevice, PlayMode, RecoveryCandidate, Settings, Snapshot, SongPattern, SoundPreset, TemplateInfo, Track, VibeInfo } from "./types";
 import { beatsPerBar as bpbOf, DEFAULT_SETTINGS, fileNameOf, keyAt, TIER_COLORS } from "./types";
+import { applyUiScale } from "./uiScale";
 
 export interface Toast {
   text: string;
@@ -174,7 +175,7 @@ interface State {
   refreshAudio(): Promise<void>;
 }
 
-/** Push the appearance section into CSS variables, the live tier palette and the page zoom. */
+/** Push the appearance section into CSS variables, the live tier palette and the webview zoom. */
 export function applyAppearance(a: Settings["appearance"]) {
   const root = document.documentElement;
   TIER_COLORS.chordTone = a.tierColors.chordTone;
@@ -189,7 +190,7 @@ export function applyAppearance(a: Settings["appearance"]) {
   root.style.setProperty("--accent-rgb", `${r}, ${g}, ${b}`);
   root.style.setProperty("--accent-bg", `rgba(${r}, ${g}, ${b}, 0.16)`);
   root.style.setProperty("--accent-border", `rgba(${r}, ${g}, ${b}, 0.45)`);
-  (root.style as CSSStyleDeclaration & { zoom?: string }).zoom = String(a.uiScale);
+  void applyUiScale(a.uiScale);
   root.classList.toggle("reduced-motion", a.reducedMotion);
 }
 
