@@ -2,6 +2,7 @@
 //! `Send` on every platform), and the application talks to the engine through a lock-free
 //! ring buffer plus the [`Shared`] atomics.
 
+use crate::drums::DrumBank;
 use crate::engine::{Engine, EngineCommand, Shared};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, SizedSample};
@@ -81,6 +82,8 @@ pub enum DeviceError {
 /// Handle to a running output stream. Dropping it stops audio.
 pub struct AudioDevice {
     producer: Mutex<rtrb::Producer<EngineCommand>>,
+    /// Drums rendered for the last sequence sent, so the next one renders only what changed.
+    drums: Mutex<DrumBank>,
     shared: Arc<Shared>,
     stop: Arc<AtomicBool>,
     /// Set from the stream's error callback (device unplugged, format lost). The application
@@ -177,6 +180,7 @@ impl AudioDevice {
 
         Ok(AudioDevice {
             producer: Mutex::new(producer),
+            drums: Mutex::new(DrumBank::new(opened.sample_rate as f32)),
             shared,
             stop,
             failed,
@@ -196,7 +200,18 @@ impl AudioDevice {
         self.failed.load(Ordering::Relaxed)
     }
 
+    /// Queue a command for the audio thread. A `SetSequence` has its drum kits rendered here,
+    /// on the caller's thread (only pads whose patch changed since the last one), and travels on
+    /// as `SetSequenceWithDrums`, so the audio thread never synthesizes a drum.
     pub fn send(&self, cmd: EngineCommand) -> Result<(), DeviceError> {
+        let cmd = match cmd {
+            EngineCommand::SetSequence(sequence) => {
+                let mut bank = self.drums.lock().unwrap_or_else(|e| e.into_inner());
+                bank.prepare(&sequence, self.sample_rate as f32);
+                EngineCommand::SetSequenceWithDrums { sequence, drums: Arc::new(bank.clone()) }
+            }
+            other => other,
+        };
         let mut p = self.producer.lock().map_err(|_| DeviceError::QueueFull)?;
         p.push(cmd).map_err(|_| DeviceError::QueueFull)
     }

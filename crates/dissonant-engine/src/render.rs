@@ -1,6 +1,7 @@
 //! Offline rendering: run the same [`Engine`] faster than real time into a WAV file.
 //! Deterministic, no device needed — this is what export, stems and tests use.
 
+use crate::drums::DrumBank;
 use crate::engine::{Engine, EngineCommand, Shared};
 use dissonant_core::{MasterSettings, Sequence};
 use std::path::Path;
@@ -59,7 +60,9 @@ pub fn render_to_buffer(sequence: Arc<Sequence>, options: &RenderOptions) -> Res
     engine.handle(EngineCommand::SetHearChords(false));
     let loop_secs = sequence.tempo_map.seconds_at(sequence.length_beats);
     let seconds = loop_secs * loops as f64 + options.tail_seconds;
-    engine.handle(EngineCommand::SetSequence(sequence));
+    // Kits are built exactly as for live playback: from a bank rendered up front.
+    let drums = Arc::new(DrumBank::for_sequence(&sequence, sr));
+    engine.handle(EngineCommand::SetSequenceWithDrums { sequence, drums });
     engine.handle(EngineCommand::Play);
 
     let total_frames = (seconds * sr as f64).ceil() as usize;
@@ -233,6 +236,32 @@ mod tests {
         assert!(!seq.chords.is_empty());
         let buf = render_to_buffer(seq, &RenderOptions { tail_seconds: 0.0, ..Default::default() }).unwrap();
         assert!(buf.iter().all(|s| s.abs() < 1e-6));
+    }
+
+    /// A kit bigger than the old four, on pitches of its own, renders every pad.
+    #[test]
+    fn a_custom_drum_kit_renders_every_pad() {
+        use dissonant_core::DrumPad;
+        let mut model = ProjectModel::starter();
+        let drum = model.tracks.iter().position(|t| t.is_drum).unwrap();
+        let sounds = ["kick", "snare", "clap", "hat", "open-hat", "crash", "tom-hi", "tom-lo", "kick", "snare"];
+        model.tracks[drum].drum_pads =
+            sounds.iter().enumerate().map(|(i, s)| DrumPad { pitch: 70 + i as u8, sound: (*s).into(), choke: 0 }).collect();
+        model.tracks[drum].reverb_send = 0.0;
+        model.master.reverb_wet = 0.0;
+        let pid = model.patterns.iter().find(|p| p.track_id == model.tracks[drum].id).unwrap().id;
+        let pattern = model.patterns.iter_mut().find(|p| p.id == pid).unwrap();
+        pattern.length_beats = 10.0;
+        pattern.notes = (0..10).map(|i| NoteEvent::new(i as f64, 0.25, 70 + i)).collect();
+        let seq = Arc::new(Sequence::from_pattern(&model, &pid, 0.0).unwrap());
+        let opts = RenderOptions { tail_seconds: 0.0, master: model.master.clone(), ..Default::default() };
+        let buf = render_to_buffer(seq, &opts).unwrap();
+        // 120 bpm: one beat = 22050 frames, one hit per beat.
+        for i in 0..10 {
+            let at = i * 22_050;
+            let hit = buf[2 * at..2 * (at + 2_000)].iter().fold(0.0f32, |m, s| m.max(s.abs()));
+            assert!(hit > 0.01, "pad {} silent", 70 + i);
+        }
     }
 
     #[test]
