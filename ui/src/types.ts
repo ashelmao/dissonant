@@ -278,7 +278,8 @@ export type TrackParam = "volume" | "reverbSend" | "tone" | "pan";
 /** What the engine plays: one pattern (looped) or the whole song. */
 export type PlayMode = "pattern" | "song";
 /** What the window shows. SETUP and SONG both play the song. */
-export type ViewMode = "setup" | "pattern" | "song";
+/** `sound` is the sound designer; it plays like song mode. */
+export type ViewMode = "setup" | "pattern" | "song" | "sound";
 export type Tier = "chordTone" | "tension" | "dissonance";
 
 export type Command =
