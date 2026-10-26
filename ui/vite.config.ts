@@ -8,6 +8,8 @@ export default defineConfig({
   server: {
     port: 5173,
     strictPort: true,
+    // The factory sound library lives in the core crate and is imported from there.
+    fs: { allow: [".", "../crates/dissonant-core/assets"] },
   },
   envPrefix: ["VITE_", "TAURI_"],
   build: {

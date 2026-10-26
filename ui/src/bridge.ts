@@ -30,6 +30,7 @@ import type {
   VibeInfo,
 } from "./types";
 import { beatsPerBar, uuid, withDefaults } from "./types";
+import { defaultKit, isFactory, lookupSound, MAX_DRUM_PADS, type Sound } from "./sound";
 import { chordAt, normalize, progression } from "./theory";
 
 export interface Bridge {
@@ -115,6 +116,16 @@ export interface Bridge {
   testTone(): Promise<void>;
   /** The backend opened or dropped a MIDI input on its own. */
   onMidiStatus(cb: (s: MidiStatus) => void): () => void;
+  /** The global user sound library (`sound-library.json` in app data). */
+  librarySounds(): Promise<Sound[]>;
+  /** Insert or replace by id; returns the whole library. */
+  saveLibrarySound(sound: Sound): Promise<Sound[]>;
+  deleteLibrarySound(id: string): Promise<Sound[]>;
+  /** Load a patch into the preview channel (SOUND page); `null` stops and clears it. */
+  previewSound(sound: Sound | null): Promise<void>;
+  previewNote(pitch: number, velocity: number, on: boolean): Promise<void>;
+  /** ~512 recent samples of the preview channel, aligned to a rising zero crossing. */
+  previewScope(): Promise<number[]>;
 }
 
 const isTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
@@ -214,6 +225,12 @@ async function tauriBridge(): Promise<Bridge> {
     setSettings: (settings) => invoke<AudioStatus>("set_settings", { settings }),
     outputDevices: () => invoke<OutputDevice[]>("output_devices"),
     testTone: () => invoke("test_tone"),
+    librarySounds: () => invoke<Sound[]>("library_sounds"),
+    saveLibrarySound: (sound) => invoke<Sound[]>("save_library_sound", { sound }),
+    deleteLibrarySound: (id) => invoke<Sound[]>("delete_library_sound", { id }),
+    previewSound: (sound) => invoke("preview_sound", { sound }),
+    previewNote: (pitch, velocity, on) => invoke("preview_note", { pitch, velocity, on }),
+    previewScope: () => invoke<number[]>("preview_scope"),
     onMidiStatus: (cb) => subscribe<MidiStatus>("midi-status", cb),
   };
 }
@@ -229,6 +246,7 @@ const NO_SUCH_TRACK = "no such track";
 const NO_SUCH_PATTERN = "no such pattern";
 const NO_SUCH_CLIP = "no such clip";
 const NO_SUCH_SECTION = "no such section";
+const NO_SUCH_SOUND = "no such sound";
 const LAST_TRACK = "a project needs at least one track";
 const INVALID_VALUE = "invalid value";
 const PAST_SONG_END = "that is past the end of the song";
@@ -264,6 +282,7 @@ function newTrack(isDrum: boolean, name: string): Track {
     tone: 18000,
     pan: 0,
     color: null,
+    drumPads: defaultKit(),
   };
 }
 
@@ -373,8 +392,8 @@ function bassLine(chords: ChordEvent[], rhythm: [number, number][]): NoteEvent[]
   return notes;
 }
 
-type Sound = [voice: string, tone: number, reverb: number];
-const SOUND: Record<string, Sound> = {
+type VibeSound = [voice: string, tone: number, reverb: number];
+const SOUND: Record<string, VibeSound> = {
   softKeys: ["triangle", 6000, 0.25],
   warmPad: ["pad", 4000, 0.45],
   glassPluck: ["pluck", 12000, 0.3],
@@ -390,9 +409,9 @@ interface MockVibe extends VibeInfo {
   chordBeats: number;
   groove: Groove;
   bass: [number, number][];
-  bassSound: Sound;
+  bassSound: VibeSound;
   leadName: string;
-  leadSound: Sound;
+  leadSound: VibeSound;
 }
 
 const lockedKey = (rootPitchClass: number, scale: ScaleType): KeyState => ({ rootPitchClass, scale, isLocked: true });
@@ -407,7 +426,7 @@ const MOCK_VIBES: MockVibe[] = [
   { id: "club", name: "club loop", blurb: "four-on-the-floor, offbeat bass and a minor loop that keeps going", tempo: 124, key: lockedKey(9, "minor"), swing: 50, swingGrid: 0.5, degrees: [0, 6, 5, 6], chordBeats: 4, groove: "fourOnFloor", bass: [[0.5, 0.4], [1.5, 0.4], [2.5, 0.4], [3.5, 0.4]], bassSound: SOUND.buzzyBass, leadName: "lead", leadSound: SOUND.leadWithBite },
 ];
 
-const withSound = (t: Track, [voice, tone, reverb]: Sound): Track => ({ ...t, voice, tone, reverbSend: reverb });
+const withSound = (t: Track, [voice, tone, reverb]: VibeSound): Track => ({ ...t, voice, tone, reverbSend: reverb });
 
 /**
  * `ProjectModel::from_vibe`: one pattern per track ("keys 1", "bass 1", "drums 1"), the
@@ -553,6 +572,7 @@ function reduce(m: ProjectModel, c: Command): void {
       const gone = new Set(m.patterns.filter((p) => p.trackId === c.id).map((p) => p.id));
       m.patterns = m.patterns.filter((p) => !gone.has(p.id));
       m.clips = m.clips.filter((cl) => !gone.has(cl.patternId));
+      pruneSounds(m);
       break;
     }
     case "renameTrack":
@@ -574,6 +594,32 @@ function reduce(m: ProjectModel, c: Command): void {
     case "setTrackVoice":
       track(c.id).voice = c.voice;
       break;
+    case "setTrackSound": {
+      const t = track(c.id);
+      if (t.isDrum || c.sound.patch.kind !== "synth") fail(INVALID_VALUE);
+      t.voice = c.sound.id;
+      if (!isFactory(c.sound.id)) embedSound(m, c.sound);
+      pruneSounds(m);
+      break;
+    }
+    case "setDrumPads": {
+      const pitches = new Set(c.pads.map((p) => p.pitch));
+      const okKit = c.pads.length >= 1 && c.pads.length <= MAX_DRUM_PADS && pitches.size === c.pads.length && c.pads.every((p) => Number.isInteger(p.pitch) && p.pitch >= 0 && p.pitch <= 127);
+      if (!okKit || c.sounds.some((s) => s.patch.kind !== "drum")) fail(INVALID_VALUE);
+      if (!track(c.id).isDrum) fail(INVALID_VALUE);
+      for (const s of c.sounds) if (!isFactory(s.id)) embedSound(m, s);
+      if (c.pads.some((p) => lookupSound(m.sounds ?? [], p.sound)?.patch.kind !== "drum")) fail(NO_SUCH_SOUND);
+      track(c.id).drumPads = c.pads.map((p) => ({ ...p }));
+      pruneSounds(m);
+      break;
+    }
+    case "upsertSound": {
+      const i = (m.sounds ?? []).findIndex((s) => s.id === c.sound.id);
+      if (i < 0) fail(NO_SUCH_SOUND);
+      if (m.sounds![i].patch.kind !== c.sound.patch.kind) fail(INVALID_VALUE);
+      m.sounds![i] = structuredClone(c.sound);
+      break;
+    }
     case "setTrackParam": {
       if (!allFinite(c.value)) fail(INVALID_VALUE);
       const [lo, hi] = TRACK_PARAM_RANGE[c.param];
@@ -726,6 +772,42 @@ function reduce(m: ProjectModel, c: Command): void {
 
 /** `document::MAX_UNDO`. */
 const MAX_UNDO = 200;
+
+/** Insert or replace an embedded sound by id (mirrors `embed_sound`). */
+function embedSound(m: ProjectModel, sound: Sound) {
+  const sounds = (m.sounds ??= []);
+  const i = sounds.findIndex((s) => s.id === sound.id);
+  if (i >= 0) sounds[i] = structuredClone(sound);
+  else sounds.push(structuredClone(sound));
+}
+
+/** Drop embedded sounds no track uses (mirrors `ProjectModel::prune_sounds`). */
+function pruneSounds(m: ProjectModel) {
+  const used = (s: Sound) => m.tracks.some((t) => (t.isDrum ? t.drumPads.some((p) => p.sound === s.id) : t.voice === s.id));
+  const kept = (m.sounds ?? []).filter(used);
+  if (kept.length) m.sounds = kept;
+  else delete m.sounds;
+}
+
+/** The mock's stand-in for the global sound library. */
+const LIBRARY_KEY = "dissonant.mock.soundLibrary";
+
+function loadLibrary(): Sound[] {
+  try {
+    const raw = localStorage.getItem(LIBRARY_KEY);
+    return raw ? (JSON.parse(raw) as Sound[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+function storeLibrary(lib: Sound[]) {
+  try {
+    localStorage.setItem(LIBRARY_KEY, JSON.stringify(lib));
+  } catch {
+    // Private window / storage blocked: the library just doesn't persist.
+  }
+}
 
 /** The mock's stand-in for the filesystem: one slot, written by save, read by open. */
 const STORAGE_KEY = "dissonant.mock.project";
@@ -1108,6 +1190,22 @@ function mockBridge(): Bridge {
       { name: "Mock interface", isDefault: false, sampleRates: [44100, 48000, 88200, 96000, 192000], defaultSampleRate: 44100 },
     ],
     testTone: async () => blip(69, 100),
+    librarySounds: async () => loadLibrary(),
+    saveLibrarySound: async (sound) => {
+      const lib = loadLibrary().filter((s) => s.id !== sound.id);
+      lib.push(structuredClone(sound));
+      storeLibrary(lib);
+      return lib;
+    },
+    deleteLibrarySound: async (id) => {
+      const lib = loadLibrary().filter((s) => s.id !== id);
+      storeLibrary(lib);
+      return lib;
+    },
+    // The mock has no synth engine: previews are silent and the scope is flat.
+    previewSound: async () => {},
+    previewNote: async () => {},
+    previewScope: async () => new Array(512).fill(0),
     onMidiStatus: () => () => {},
   };
 }

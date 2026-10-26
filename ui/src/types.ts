@@ -1,5 +1,7 @@
 // Mirrors the Rust model in crates/dissonant-core (serde camelCase). Keep in sync.
 
+import type { DrumPad, Sound } from "./sound";
+
 export type ScaleType = "major" | "minor";
 
 export interface KeyState {
@@ -63,6 +65,8 @@ export interface Track {
   pan: number;
   /** `#rrggbb`, or null to use the palette by position. */
   color: string | null;
+  /** A drum track's kit, top to bottom (1–16 pads, unique pitches). Ignored on synth tracks. */
+  drumPads: DrumPad[];
 }
 
 /** A pattern belongs to one track; its clips play on that track's lane. */
@@ -124,6 +128,8 @@ export interface ProjectModel {
   chords: ChordEvent[];
   /** The song's hard end: clips can't start at or run past it. At least one bar. */
   songLengthBeats: number;
+  /** Copies of the non-factory sounds the tracks use. Absent when empty. */
+  sounds?: Sound[];
 }
 
 export interface TempoPoint {
@@ -285,6 +291,12 @@ export type Command =
   | { type: "setTrackSoloed"; id: string; soloed: boolean }
   | { type: "moveTrack"; id: string; up: boolean }
   | { type: "setTrackVoice"; id: string; voice: string }
+  /** Synth tracks only; a non-factory sound is embedded in the project. */
+  | { type: "setTrackSound"; id: string; sound: Sound }
+  /** Drum tracks only: the whole kit, plus the non-factory drum sounds its pads use. */
+  | { type: "setDrumPads"; id: string; pads: DrumPad[]; sounds: Sound[] }
+  /** Replace the project's embedded copy of a sound. */
+  | { type: "upsertSound"; sound: Sound }
   | { type: "setTrackParam"; id: string; param: TrackParam; value: number }
   | { type: "setTrackColor"; id: string; color: string | null }
   | { type: "addPattern"; trackId: string }

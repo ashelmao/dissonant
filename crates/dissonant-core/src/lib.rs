@@ -14,6 +14,7 @@ pub mod document;
 pub mod midi_file;
 pub mod model;
 pub mod sequence;
+pub mod sound;
 pub mod tempo;
 pub mod theory;
 pub mod vibes;
@@ -27,6 +28,9 @@ pub use model::{
     SongPattern, TimeSignature, Track, DEFAULT_SONG_BARS, OLD_SCHEMA_ERROR, SCHEMA_VERSION,
 };
 pub use sequence::{Sequence, SequenceTrack};
+pub use sound::{
+    default_kit, factory_sound, factory_sounds, DrumPad, DrumPatch, ResolvedPad, Sound, SoundPatch, SynthPatch, MAX_DRUM_PADS,
+};
 pub use tempo::{swing_warp, Tempo, TempoMap, TempoPoint};
 pub use theory::harmony::{self, ChordSuggestion, ProgressionStarter};
 pub use theory::highlight::HighlightEngine;

@@ -24,7 +24,14 @@ fn fixture() -> ProjectModel {
     let p0 = m.patterns[0].id;
     let p1 = m.patterns[1].id;
     m.clips = vec![clip_at(p0, 0.0, 16.0), clip_at(p1, 16.0, 8.0)];
+    // The melody plays an embedded user sound, so the sound commands have something to bite on.
+    m.sounds = vec![user_sound(0.3)];
+    m.tracks[0].voice = "u-test".into();
     m
+}
+
+fn user_sound(level: f32) -> Sound {
+    Sound { id: "u-test".into(), name: "test".into(), category: "lead".into(), patch: SoundPatch::Synth(SynthPatch { level, ..SynthPatch::default() }) }
 }
 
 /// A second pattern on the melody track, so the song can switch melodies over the same beat.
@@ -65,6 +72,9 @@ fn every_variant_is_accounted_for(c: Command) -> &'static str {
         Command::SetTrackSoloed { .. } => "SetTrackSoloed",
         Command::MoveTrack { .. } => "MoveTrack",
         Command::SetTrackVoice { .. } => "SetTrackVoice",
+        Command::SetTrackSound { .. } => "SetTrackSound",
+        Command::SetDrumPads { .. } => "SetDrumPads",
+        Command::UpsertSound { .. } => "UpsertSound",
         Command::SetTrackParam { .. } => "SetTrackParam",
         Command::SetTrackColor { .. } => "SetTrackColor",
         Command::AddPattern { .. } => "AddPattern",
@@ -109,6 +119,9 @@ fn one_of_every_variant(m: &ProjectModel) -> Vec<Command> {
         Command::SetTrackSoloed { id: t0, soloed: true },
         Command::MoveTrack { id: t0, up: false },
         Command::SetTrackVoice { id: t0, voice: "pad".into() },
+        Command::SetTrackSound { id: t0, sound: factory_sound("sine").unwrap().clone() },
+        Command::SetDrumPads { id: _t1, pads: default_kit().into_iter().rev().collect(), sounds: vec![] },
+        Command::UpsertSound { sound: user_sound(0.6) },
         Command::SetTrackParam { id: t0, param: TrackParam::Volume, value: 0.5 },
         Command::SetTrackParam { id: t0, param: TrackParam::ReverbSend, value: 0.25 },
         Command::SetTrackParam { id: t0, param: TrackParam::Tone, value: 4_000.0 },

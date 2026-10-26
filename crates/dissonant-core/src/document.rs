@@ -7,6 +7,7 @@
 
 use crate::midi_file::ImportedTrack;
 use crate::model::{tidy_chords, ChordEvent, Clip, KeyState, MasterSettings, NoteEvent, ProjectModel, Section, SongPattern, Track};
+use crate::sound::{is_factory, valid_kit, DrumPad, Sound};
 use crate::tempo::TempoPoint;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -36,6 +37,14 @@ pub enum Command {
     SetTrackSoloed { id: Uuid, soloed: bool },
     MoveTrack { id: Uuid, up: bool },
     SetTrackVoice { id: Uuid, voice: String },
+    /// Point a synth track at a sound. A non-factory sound is embedded in the project (replacing
+    /// any copy with the same id); embedded sounds no track uses any more are dropped.
+    SetTrackSound { id: Uuid, sound: Sound },
+    /// Replace a drum track's whole kit (1–16 pads, unique pitches). `sounds` carries the
+    /// non-factory drum sounds the pads use, to embed. Unused embedded sounds are dropped.
+    SetDrumPads { id: Uuid, pads: Vec<DrumPad>, sounds: Vec<Sound> },
+    /// Replace the project's embedded copy of a sound (after it was re-saved in the library).
+    UpsertSound { sound: Sound },
     SetTrackParam { id: Uuid, param: TrackParam, value: f64 },
     /// `#rrggbb`, or `None` to fall back to the palette.
     SetTrackColor { id: Uuid, color: Option<String> },
@@ -89,6 +98,8 @@ pub enum EditError {
     NoSuchTrack,
     #[error("no such pattern")]
     NoSuchPattern,
+    #[error("no such sound")]
+    NoSuchSound,
     #[error("a project needs at least one track")]
     LastTrack,
     #[error("invalid value")]
@@ -283,6 +294,14 @@ impl Document {
     }
 }
 
+/// Insert or replace an embedded sound by id.
+fn embed_sound(m: &mut ProjectModel, sound: Sound) {
+    match m.sounds.iter_mut().find(|s| s.id == sound.id) {
+        Some(slot) => *slot = sound,
+        None => m.sounds.push(sound),
+    }
+}
+
 impl Command {
     /// A short, lower-case description for the Edit menu ("Undo set tempo").
     pub fn label(&self) -> String {
@@ -299,7 +318,9 @@ impl Command {
             SetTrackSoloed { soloed: true, .. } => "solo track",
             SetTrackSoloed { .. } => "unsolo track",
             MoveTrack { .. } => "reorder tracks",
-            SetTrackVoice { .. } => "change instrument",
+            SetTrackVoice { .. } | SetTrackSound { .. } => "change instrument",
+            SetDrumPads { .. } => "edit drum kit",
+            UpsertSound { .. } => "update sound",
             SetTrackParam { param, .. } => match param {
                 TrackParam::Volume => "change volume",
                 TrackParam::ReverbSend => "change reverb send",
@@ -364,6 +385,7 @@ fn apply_to(m: &mut ProjectModel, command: Command) -> Result<(), EditError> {
             let gone: Vec<Uuid> = m.patterns_of(&id).map(|p| p.id).collect();
             m.patterns.retain(|p| p.track_id != id);
             m.clips.retain(|c| !gone.contains(&c.pattern_id));
+            m.prune_sounds();
         }
         RenameTrack { id, name } => {
             // Matches RenamePattern: a blank name makes the track unidentifiable everywhere.
@@ -382,6 +404,42 @@ fn apply_to(m: &mut ProjectModel, command: Command) -> Result<(), EditError> {
             }
         }
         SetTrackVoice { id, voice } => m.track_mut(&id).ok_or(EditError::NoSuchTrack)?.voice = voice,
+        SetTrackSound { id, sound } => {
+            let sound = sound.sanitized();
+            let t = m.track_mut(&id).ok_or(EditError::NoSuchTrack)?;
+            if t.is_drum || sound.is_drum() {
+                return Err(EditError::InvalidValue);
+            }
+            t.voice = sound.id.clone();
+            if !is_factory(&sound.id) {
+                embed_sound(m, sound);
+            }
+            m.prune_sounds();
+        }
+        SetDrumPads { id, pads, sounds } => {
+            if !valid_kit(&pads) || sounds.iter().any(|s| !s.is_drum()) {
+                return Err(EditError::InvalidValue);
+            }
+            if !m.track(&id).ok_or(EditError::NoSuchTrack)?.is_drum {
+                return Err(EditError::InvalidValue);
+            }
+            for s in sounds.into_iter().filter(|s| !is_factory(&s.id)) {
+                embed_sound(m, s.sanitized());
+            }
+            if pads.iter().any(|p| !m.sound(&p.sound).is_some_and(Sound::is_drum)) {
+                return Err(EditError::NoSuchSound);
+            }
+            m.track_mut(&id).ok_or(EditError::NoSuchTrack)?.drum_pads = pads;
+            m.prune_sounds();
+        }
+        UpsertSound { sound } => {
+            let sound = sound.sanitized();
+            let slot = m.sounds.iter_mut().find(|s| s.id == sound.id).ok_or(EditError::NoSuchSound)?;
+            if slot.is_drum() != sound.is_drum() {
+                return Err(EditError::InvalidValue);
+            }
+            *slot = sound;
+        }
         SetTrackParam { id, param, value } => {
             if !value.is_finite() {
                 return Err(EditError::InvalidValue);

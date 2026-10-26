@@ -170,7 +170,8 @@ pub struct Track {
     #[serde(default = "Uuid::new_v4")]
     pub id: Uuid,
     pub name: String,
-    /// A synth voice preset name (`saw`, `square`, `triangle`, `sine`, `pad`, `pluck`).
+    /// The synth sound id (a factory slug like `saw`, or an embedded `u-<uuid>`). See
+    /// [`ProjectModel::resolve_synth`].
     #[serde(default = "default_voice")]
     pub voice: String,
     #[serde(default)]
@@ -195,6 +196,9 @@ pub struct Track {
     /// Display color (`#rrggbb`). `None` means "pick from the palette by position".
     #[serde(default)]
     pub color: Option<String>,
+    /// A drum track's kit, top to bottom (1–16 pads, unique pitches). Ignored on synth tracks.
+    #[serde(default = "crate::sound::default_kit")]
+    pub drum_pads: Vec<crate::sound::DrumPad>,
 }
 
 impl Track {
@@ -211,6 +215,7 @@ impl Track {
             tone: default_tone(),
             pan: 0.0,
             color: None,
+            drum_pads: crate::sound::default_kit(),
         }
     }
 
@@ -439,6 +444,9 @@ pub struct ProjectModel {
     /// The hard end of the song, at least one bar. Clips never reach past it.
     #[serde(default = "default_song_length")]
     pub song_length_beats: f64,
+    /// Copies of the non-factory sounds the tracks use, so the project plays anywhere.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sounds: Vec<crate::sound::Sound>,
 }
 
 fn default_swing() -> f64 {
@@ -527,6 +535,7 @@ impl ProjectModel {
             tempo_points: vec![],
             chords: vec![],
             song_length_beats: default_song_length(),
+            sounds: vec![],
         }
     }
 

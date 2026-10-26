@@ -5,6 +5,7 @@
 use crate::arrangement::Arrangement;
 use crate::chord_track::ChordTrack;
 use crate::model::{NoteEvent, ProjectModel, Track};
+use crate::sound::{ResolvedPad, SynthPatch};
 use crate::tempo::TempoMap;
 use uuid::Uuid;
 
@@ -20,10 +21,23 @@ pub struct SequenceTrack {
     pub tone: f64,
     pub pan: f64,
     pub notes: Vec<NoteEvent>,
+    /// The synth patch `voice` resolves to (meaningless on drum tracks).
+    pub synth: SynthPatch,
+    /// The drum kit with each pad's sound looked up (empty on synth tracks).
+    pub drum_pads: Vec<ResolvedPad>,
 }
 
 impl SequenceTrack {
-    fn from_track(track: &Track, notes: Vec<NoteEvent>) -> Self {
+    fn from_track(model: &ProjectModel, track: &Track, notes: Vec<NoteEvent>) -> Self {
+        let drum_pads = if track.is_drum {
+            track
+                .drum_pads
+                .iter()
+                .map(|p| ResolvedPad { pitch: p.pitch, choke: p.choke, patch: model.resolve_drum(&p.sound) })
+                .collect()
+        } else {
+            vec![]
+        };
         SequenceTrack {
             id: track.id,
             voice: track.voice.clone(),
@@ -35,6 +49,8 @@ impl SequenceTrack {
             tone: track.tone,
             pan: track.pan,
             notes,
+            synth: model.resolve_synth(&track.voice),
+            drum_pads,
         }
     }
 
@@ -75,7 +91,7 @@ impl Sequence {
         let tracks = model
             .tracks
             .iter()
-            .map(|t| SequenceTrack::from_track(t, if t.id == pattern.track_id { pattern.notes.clone() } else { vec![] }))
+            .map(|t| SequenceTrack::from_track(model, t, if t.id == pattern.track_id { pattern.notes.clone() } else { vec![] }))
             .collect();
         Some(Sequence {
             tracks,
@@ -138,7 +154,7 @@ impl Sequence {
     /// Every track with no notes and no chords, for pattern mode with nothing to edit.
     pub fn silent(model: &ProjectModel, length_beats: f64) -> Self {
         Sequence {
-            tracks: model.tracks.iter().map(|t| SequenceTrack::from_track(t, vec![])).collect(),
+            tracks: model.tracks.iter().map(|t| SequenceTrack::from_track(model, t, vec![])).collect(),
             chords: ChordTrack::default(),
             length_beats: if length_beats.is_finite() { length_beats.max(1.0) } else { 16.0 },
             tempo_bpm: model.tempo,
@@ -157,6 +173,7 @@ impl Sequence {
             .iter()
             .map(|t| {
                 SequenceTrack::from_track(
+                    model,
                     t,
                     Arrangement::flattened_notes(&t.id, &model.patterns, &model.clips),
                 )
