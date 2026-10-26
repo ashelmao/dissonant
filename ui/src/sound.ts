@@ -268,11 +268,22 @@ function fill<T>(base: T, partial: unknown): T {
   return (partial === undefined || partial === null ? base : partial) as T;
 }
 
-/** A complete patch from a possibly partial one (what the factory JSON holds). */
+const DEFAULT_ENVELOPE: Envelope = { attack: 0.008, decay: 0.1, sustain: 0.65, release: 0.14 };
+
+/**
+ * A complete patch from a possibly partial one (what the factory JSON holds), filled the way
+ * serde does: a missing field takes the *patch's* default, but a field that is present and
+ * partial fills its gaps from its own *type's* default. The two differ for the oscillators
+ * (`OscParams::default` is off; the patch turns osc 1 on) and `filterEnv` (`Envelope::default`
+ * sustains; the patch's filter envelope doesn't).
+ */
 export function filledPatch(patch: { kind: "synth" | "drum" } & Loose): SoundPatch {
-  return patch.kind === "drum"
-    ? { kind: "drum", ...fill(DEFAULT_DRUM_PATCH, patch) }
-    : { kind: "synth", ...fill(DEFAULT_SYNTH_PATCH, patch) };
+  if (patch.kind === "drum") return { kind: "drum", ...fill(DEFAULT_DRUM_PATCH, patch) };
+  const base: SynthPatch = { ...DEFAULT_SYNTH_PATCH };
+  if (Array.isArray(patch.osc)) base.osc = [{ ...DEFAULT_OSC }, { ...DEFAULT_OSC }, { ...DEFAULT_OSC }];
+  if (isObj(patch.ampEnv)) base.ampEnv = { ...DEFAULT_ENVELOPE };
+  if (isObj(patch.filterEnv)) base.filterEnv = { ...DEFAULT_ENVELOPE };
+  return { kind: "synth", ...fill(base, patch) };
 }
 
 export function filledSound(s: { id: string; name: string; category?: string; patch: { kind: "synth" | "drum" } & Loose }): Sound {
