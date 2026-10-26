@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { beatsPerBar, selectedPattern, useStore } from "../store";
+import { lookupSound } from "../sound";
 import { trackColor } from "../types";
 import type { SongPattern, Track } from "../types";
 import { keys } from "../platform";
@@ -396,7 +397,7 @@ export function TrackTree() {
                   <span className={`tt-name${t.muted ? " muted" : ""}`}>{t.name}</span>
                 )}
                 <span className="tt-meta">
-                  {t.isDrum ? "drum" : t.voice} · {patterns.length}
+                  {t.isDrum ? "drum" : (lookupSound(model.sounds ?? [], t.voice)?.name ?? t.voice)} · {patterns.length}
                 </span>
                 <span className="tt-acts">
                   <button className="ico" title="move up" tabIndex={-1} disabled={ti === 0} onClick={(e) => (e.stopPropagation(), void moveTrack(t.id, true))}>

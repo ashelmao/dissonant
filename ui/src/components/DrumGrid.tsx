@@ -1,12 +1,15 @@
 import { useMemo, useRef, useState } from "react";
 import { selectedPattern, selectedTrack, selectedTrackIndex, useStore } from "../store";
-import { DRUM_KIT, trackColor, type NoteEvent, uuid } from "../types";
+import { padName } from "../drumKit";
+import { trackColor, type NoteEvent, uuid } from "../types";
 import { tileGhost } from "../noteEditing";
 import { BASE_BEAT_W } from "./ChordLane";
 
-/** Step sequencer for a drum track, aligned to the chord lane. Left-click/drag adds hits,
- *  right-click/drag removes. Hits are ordinary notes (pitch = kit note). A ghost pattern shows
- *  as outlined steps (another drum pattern) or an onset row (a melodic one). */
+/** Step sequencer for a drum track, aligned to the chord lane: one row per kit pad, top to
+ *  bottom. Left-click/drag adds hits, right-click/drag removes; click a row name to hear the pad.
+ *  Hits are ordinary notes (pitch = pad pitch); hits on pitches the kit has no pad for aren't
+ *  drawn. A ghost pattern shows as outlined steps (another drum pattern) or an onset row (a
+ *  melodic one). */
 export function DrumGrid() {
   const pattern = useStore(selectedPattern);
   const track = useStore(selectedTrack);
@@ -20,6 +23,7 @@ export function DrumGrid() {
   const ghostPattern = useStore((s) => s.snapshot?.model.patterns.find((p) => p.id === ghostPatternId) ?? null);
   const ghostTrack = useStore((s) => (ghostPattern ? (s.snapshot?.model.tracks.find((t) => t.id === ghostPattern.trackId) ?? null) : null));
   const ghostIdx = useStore((s) => (ghostTrack ? (s.snapshot?.model.tracks.indexOf(ghostTrack) ?? 0) : 0));
+  const projectSounds = useStore((s) => s.snapshot?.model.sounds);
   const dragMode = useRef<"add" | "remove" | null>(null);
   const [working, setWorking] = useState<NoteEvent[] | null>(null);
 
@@ -73,7 +77,8 @@ export function DrumGrid() {
   };
 
   return (
-    <div className="drumgrid" onPointerUp={commit} onPointerLeave={commit}>
+    // Past eight pads the rows tighten so a full 16-pad kit mostly fits; the grid scrolls past that.
+    <div className={`drumgrid${track.drumPads.length > 8 ? " dense" : ""}`} onPointerUp={commit} onPointerLeave={commit}>
       {ghostPattern && !ghostIsDrum && ghostNotes.length > 0 && (
         <div className="drumrow ghostrow" title={`${ghostPattern.name}: where its notes start · the ghost`}>
           <span className="dname">ghost</span>
@@ -85,9 +90,11 @@ export function DrumGrid() {
           </div>
         </div>
       )}
-      {DRUM_KIT.map((drum) => (
+      {track.drumPads.map((drum) => (
         <div className="drumrow" key={drum.pitch}>
-          <span className="dname">{drum.name}</span>
+          <span className="dname" title={`pitch ${drum.pitch} · click to hear`} onClick={() => audition(drum.pitch)}>
+            {padName(projectSounds ?? [], drum)}
+          </span>
           <div className="drumcells">
             {Array.from({ length: steps }, (_, step) => {
               const on = !!find(notes, drum.pitch, step);

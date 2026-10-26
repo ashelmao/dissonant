@@ -481,12 +481,10 @@ export interface MidiStatus {
   armed: boolean;
 }
 
-export const VOICES = ["saw", "square", "triangle", "sine", "pad", "pluck"] as const;
-
-/** A sound named by character: a voice plus tone (low-pass Hz) and reverb send. */
+/** A sound named by character: a voice (factory synth sound id) plus tone (low-pass Hz) and reverb send. */
 export interface SoundPreset {
   name: string;
-  voice: (typeof VOICES)[number];
+  voice: string;
   tone: number;
   reverbSend: number;
 }
@@ -542,14 +540,6 @@ export function mixHex(hex: string, toward: string, t: number): string {
   const c = a.map((v, i) => Math.round(v + (b[i] - v) * t));
   return `#${c.map((v) => v.toString(16).padStart(2, "0")).join("")}`;
 }
-
-/** Drum kit rows, top to bottom. Mirrors `dissonant_engine::drums::KIT`. */
-export const DRUM_KIT: { name: string; pitch: number }[] = [
-  { name: "hat", pitch: 42 },
-  { name: "clap", pitch: 39 },
-  { name: "snare", pitch: 38 },
-  { name: "kick", pitch: 36 },
-];
 
 export function uuid(): string {
   if (typeof crypto !== "undefined" && "randomUUID" in crypto) return crypto.randomUUID();

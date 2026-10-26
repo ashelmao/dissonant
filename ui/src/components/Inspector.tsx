@@ -2,10 +2,12 @@ import { useState } from "react";
 import { beatsPerBar, dbText, effectiveKey, GRID_OPTIONS, gridLabel, selectedPattern, selectedTrack, selectedTrackIndex, usePatternChords, useStore } from "../store";
 import { chordAt, explainNote, keyName, midiName, noteName, tierMap } from "../theory";
 import { arpeggiateNotes, chopNotes, humanizeNotes, invertNotes, legatoNotes, quantizeNotes, resolveTargets, reverseNotes, scaleNotes, setLength, strumNotes, toggleMute } from "../noteEditing";
-import { DRUM_KIT, keyAt, SOUND_PRESETS, soundPresetOf, TRACK_PALETTE, trackColor, VOICES, type TrackParam } from "../types";
+import { keyAt, SOUND_PRESETS, soundPresetOf, TRACK_PALETTE, trackColor, type TrackParam } from "../types";
+import { padName } from "../drumKit";
 import { useMediaQuery } from "../uiScale";
 import { hz, Knob, lin, log, panText, pct } from "./Knob";
 import { barLabel } from "./Editor";
+import { SoundPicker } from "./SoundPicker";
 
 const VOL = lin(0, 1.5);
 const PAN = lin(-1, 1);
@@ -274,29 +276,25 @@ export function Inspector() {
         <div className="section">
           <div className="head">
             <span className="cap">instrument · {track.name}</span>
-            <span className="mono" style={{ fontSize: 9, color: "var(--text-4b)" }}>{track.isDrum ? "procedural kit" : "poly · 12 voices"}</span>
+            <span className="mono" style={{ fontSize: 9, color: "var(--text-4b)" }}>{track.isDrum ? `${track.drumPads.length} pads` : "waveform synth"}</span>
           </div>
-          <div className="devchip">
-            <span className="led" />
-            <span className="n">{track.isDrum ? "drum kit" : track.voice}</span>
-            <span className="spacer" />
-            <span className="meta">{track.isDrum ? DRUM_KIT.map((d) => d.name).join(" · ") : "waveform synth"}</span>
-          </div>
+          {track.isDrum ? (
+            <div className="devchip" title={`${track.drumPads.map((p) => `${p.pitch} ${padName(model.sounds ?? [], p)}`).join(" · ")}\nedit the kit in SONG → devices`}>
+              <span className="led" />
+              <span className="n">drum kit</span>
+              <span className="meta kitnames">{track.drumPads.map((p) => padName(model.sounds ?? [], p)).join(" · ")}</span>
+            </div>
+          ) : (
+            <div className="row">
+              <SoundPicker kind="synth" value={track.voice} onPick={(sound) => void s.dispatch({ type: "setTrackSound", id: track.id, sound }, false, `sound: ${sound.name}`)} title="pick this track's sound" />
+              <button className="chip tiny" onClick={() => s.setMode("sound")} title="open the SOUND page to shape this sound">edit ↗</button>
+            </div>
+          )}
           {!track.isDrum && (
             <div className="chipsrow" style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)" }} title="sounds by character: each sets the waveform, tone and reverb">
               {SOUND_PRESETS.map((p) => (
                 <button key={p.name} className={`chip${soundPresetOf(track)?.name === p.name ? " on" : ""}`} style={{ textTransform: "none" }} onClick={() => void s.applySoundPreset(track.id, p)}>
                   {p.name}
-                </button>
-              ))}
-            </div>
-          )}
-          {!track.isDrum && <span className="flabel">waveform</span>}
-          {!track.isDrum && (
-            <div className="chipsrow" style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)" }}>
-              {VOICES.map((v) => (
-                <button key={v} className={`chip${track.voice === v ? " on" : ""}`} onClick={() => s.dispatch({ type: "setTrackVoice", id: track.id, voice: v })}>
-                  {v}
                 </button>
               ))}
             </div>

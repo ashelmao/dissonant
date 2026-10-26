@@ -3379,3 +3379,262 @@ button.linkish {
   flex-direction: column;
   gap: 4px;
 }
+
+/* ── sounds in the devices panel and inspector ── */
+/* Sound picker: category row, search, scrolling list. Inline in the synth box, else a popover. */
+.sp {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.sp-cats {
+  flex: none;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px;
+}
+.sp-cats .chip {
+  flex: none;
+}
+/* Your own groups (library, project) read apart from the factory ones by outline, not just hue. */
+.sp-cats .chip.own {
+  border-style: dashed;
+}
+.sp-search {
+  flex: none;
+  width: 100%;
+}
+.sp-list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  background: var(--bg-0);
+  border: 1px solid var(--line-1);
+  border-radius: 2px;
+  padding: 0 2px 2px;
+}
+.sp-head {
+  position: sticky;
+  top: 0;
+  background: var(--bg-0);
+  padding: 5px 6px 2px;
+  font-weight: 600;
+  font-size: 8.5px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--text-5);
+}
+.sp-row {
+  height: 20px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 6px;
+  border-radius: 2px;
+  font-weight: 600;
+  font-size: 11px;
+  color: var(--text-3);
+  cursor: pointer;
+}
+.sp-row.hi {
+  background: #1a1a20;
+  color: var(--text-1);
+}
+.sp-row.on {
+  background: var(--accent-bg);
+  color: var(--accent);
+}
+.sp-row .sp-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sp-row .sp-meta {
+  font-size: 7px;
+}
+.sp-pop {
+  position: fixed;
+  z-index: 60;
+  display: flex;
+  flex-direction: column;
+  padding: 6px;
+  background: var(--bg-2);
+  border: 1px solid var(--line-2);
+  border-radius: 3px;
+}
+.sp-trigger {
+  flex: 1;
+  min-width: 0;
+  height: 22px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 6px;
+  background: var(--bg-0);
+  border: 1px solid var(--line-1);
+  border-radius: 2px;
+  font-size: 11px;
+  letter-spacing: 0;
+  text-transform: none;
+  color: var(--text-1);
+  text-align: left;
+}
+.sp-trigger.open {
+  border-color: var(--accent-border);
+}
+.sp-trigger .sp-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.sp-trigger .sp-caret {
+  font-size: 9px;
+  color: var(--text-4);
+}
+/* Caret-only trigger (a drum pad's sound). */
+.sp-trigger.bare {
+  flex: none;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  justify-content: center;
+  background: transparent;
+  border-color: transparent;
+}
+.sp-trigger.bare:hover,
+.sp-trigger.bare.open {
+  border-color: var(--line-3);
+}
+.device .devname {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 700;
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-1);
+}
+.synthdev,
+.kitdev,
+.synthdev .pad,
+.kitdev .pad {
+  min-height: 0;
+}
+.kitdev .pad {
+  gap: 5px;
+}
+
+/* Drum kit box: one row per pad, top to bottom like the grid. */
+.kitlist {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.kitrow {
+  flex: none;
+  height: 22px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding-right: 2px;
+  border-radius: 2px;
+}
+.kitlist .kitrow:hover {
+  background: #1a1a20;
+}
+.kitrow.kithead {
+  height: 12px;
+  font-weight: 600;
+  font-size: 8.5px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--text-5);
+}
+.kitrow .kpitch {
+  width: 34px;
+  flex: none;
+  text-align: right;
+}
+.kitrow input.kpitch {
+  height: 18px;
+  padding: 0 5px;
+}
+.kitrow .kname {
+  flex: 1;
+  min-width: 0;
+  padding: 0 5px;
+}
+.kitrow button.kname {
+  height: 18px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  text-align: left;
+  background: transparent;
+  border-color: transparent;
+  border-radius: 2px;
+  font-size: 11px;
+  letter-spacing: 0;
+  text-transform: none;
+  color: var(--text-2);
+}
+.kitrow button.kname:hover {
+  background: var(--bg-control);
+}
+.kitrow button.kname:active {
+  color: var(--accent);
+}
+.kitrow .kchoke {
+  width: 40px;
+  flex: none;
+}
+.kitrow select.kchoke {
+  height: 18px;
+  padding: 0 14px 0 6px;
+  background-position: calc(100% - 9px) 7px, calc(100% - 5px) 7px;
+}
+.kitrow .kacts {
+  width: 54px;
+  flex: none;
+  display: flex;
+  justify-content: flex-end;
+}
+.kitrow .kacts .ico:disabled {
+  opacity: 0.25;
+}
+
+/* Drum grid rows follow the kit: tighter past eight pads, a click on the name auditions. */
+.drumrow .dname {
+  overflow: hidden;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.drumrow .dname:hover {
+  color: var(--text-1);
+}
+.drumrow.ghostrow .dname {
+  cursor: default;
+}
+.drumgrid.dense .drumrow:not(.ghostrow) {
+  height: 24px;
+}
+.drumgrid.dense .step {
+  height: 18px;
+}
+.inspector .devchip .kitnames {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: right;
+}
