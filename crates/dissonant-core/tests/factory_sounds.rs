@@ -104,10 +104,10 @@ fn no_unknown_keys() {
     }
 }
 
-/// The UI fills a partial patch by deep-merging it over the whole default patch, while serde
-/// fills each missing nested field from that struct's own default (e.g. a partial `filterEnv`
-/// gets `Envelope::default()`, a partial `osc[0]` is off). The factory JSON must be written so
-/// both read it the same way.
+/// A naive deep-merge over the whole default patch differs from serde, which fills a partial
+/// nested field from that struct's own default (a partial `filterEnv` gets `Envelope::default()`,
+/// a partial `osc[0]` is off). `ui/src/sound.ts` follows serde, but the factory JSON is kept
+/// unambiguous anyway: it reads the same under either rule.
 #[test]
 fn rust_and_ui_fill_partial_patches_the_same() {
     fn merge(base: &Value, partial: &Value) -> Value {
