@@ -2,6 +2,8 @@
 //! allocation and oldest-note stealing. Voice presets mirror the original app's `VoiceKind`.
 
 use crate::dsp::{midi_to_hz, Adsr, AdsrParams, Oscillator, Waveform};
+use dissonant_core::sound::OscWave;
+use dissonant_core::SynthPatch;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct VoicePreset {
@@ -50,6 +52,47 @@ impl VoicePreset {
     pub const ALL: [&'static str; 6] = ["saw", "square", "triangle", "sine", "pad", "pluck"];
 }
 
+// ─── TEMPORARY ADAPTER (drum-engine worktree) ───────────────────────────────────────────────
+// Lets channel/engine code call the new `PolySynth::new(&SynthPatch, ..)` / `set_patch` API while
+// `synth.rs` is rewritten elsewhere. Maps only osc 1's wave, the amp envelope and the level onto
+// the old preset. Replaced wholesale when the real `SynthPatch` synth merges.
+
+impl From<&SynthPatch> for VoicePreset {
+    fn from(p: &SynthPatch) -> Self {
+        VoicePreset {
+            waveform: match p.osc[0].wave {
+                OscWave::Sine => Waveform::Sine,
+                OscWave::Triangle => Waveform::Triangle,
+                OscWave::Saw => Waveform::Saw,
+                OscWave::Square | OscWave::Pulse => Waveform::Square,
+            },
+            env: AdsrParams {
+                attack: p.amp_env.attack,
+                decay: p.amp_env.decay,
+                sustain: p.amp_env.sustain,
+                release: p.amp_env.release,
+            },
+            level: p.level,
+        }
+    }
+}
+
+impl PolySynth {
+    /// Live patch change without cutting voices: the wave switches now, the envelope applies
+    /// to voices that start after this (old `Adsr` params can't be changed in flight).
+    pub fn set_patch(&mut self, patch: &SynthPatch) {
+        let preset = VoicePreset::from(patch);
+        for v in &mut self.voices {
+            v.osc.waveform = preset.waveform;
+            if !v.env.is_active() {
+                v.env = Adsr::new(preset.env, self.sample_rate);
+            }
+        }
+        self.preset = preset;
+    }
+}
+// ─── END TEMPORARY ADAPTER ──────────────────────────────────────────────────────────────────
+
 #[derive(Debug, Clone)]
 struct Voice {
     osc: Oscillator,
@@ -68,7 +111,8 @@ pub struct PolySynth {
 }
 
 impl PolySynth {
-    pub fn new(preset: VoicePreset, sample_rate: f32, polyphony: usize) -> Self {
+    pub fn new(preset: impl Into<VoicePreset>, sample_rate: f32, polyphony: usize) -> Self {
+        let preset = preset.into(); // TEMPORARY ADAPTER: accepts `&SynthPatch` too.
         let voices = (0..polyphony.max(1))
             .map(|_| Voice {
                 osc: Oscillator::new(preset.waveform),

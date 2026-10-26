@@ -1,10 +1,13 @@
 //! A track channel (instrument → tone → reverb → gain/pan) and the master chain
 //! (low-cut → 3-band EQ → high-cut → reverb → gain).
 
-use crate::drums::DrumKit;
+use crate::drums::{DrumBank, DrumKit};
 use crate::dsp::{linear_to_db, pan_gains, Biquad, Reverb, StereoBiquad};
-use crate::synth::{PolySynth, VoicePreset};
-use dissonant_core::{MasterSettings, SequenceTrack};
+use crate::synth::PolySynth;
+use dissonant_core::{MasterSettings, SequenceTrack, SynthPatch};
+
+/// Voices per synth track (and the preview synth).
+pub const SYNTH_POLYPHONY: usize = 12;
 
 #[derive(Debug, Clone)]
 pub enum Instrument {
@@ -13,6 +16,16 @@ pub enum Instrument {
 }
 
 impl Instrument {
+    /// The instrument a track plays. Drum pads come from `drums` when it has them (rendered off
+    /// the audio thread) and are rendered here otherwise.
+    pub fn for_track(track: &SequenceTrack, sample_rate: f32, drums: Option<&DrumBank>) -> Self {
+        if track.is_drum {
+            Instrument::Drums(DrumKit::with_bank(&track.drum_pads, sample_rate, drums))
+        } else {
+            Instrument::Synth(PolySynth::new(&track.synth, sample_rate, SYNTH_POLYPHONY))
+        }
+    }
+
     pub fn note_on(&mut self, pitch: u8, velocity: u8) {
         match self {
             Instrument::Synth(s) => s.note_on(pitch, velocity),
@@ -35,7 +48,7 @@ impl Instrument {
             Instrument::Drums(d) => d.is_silent(),
         }
     }
-    fn render_add(&mut self, out: &mut [f32]) {
+    pub(crate) fn render_add(&mut self, out: &mut [f32]) {
         match self {
             Instrument::Synth(s) => s.render_add(out),
             Instrument::Drums(d) => d.render_add(out),
@@ -46,8 +59,8 @@ impl Instrument {
 #[derive(Debug, Clone)]
 pub struct Channel {
     pub instrument: Instrument,
-    voice: String,
-    is_drum: bool,
+    /// The patch the synth was last given, to skip `set_patch` when nothing changed.
+    synth: SynthPatch,
     tone: Biquad,
     tone_hz: f32,
     reverb: Reverb,
@@ -59,16 +72,10 @@ pub struct Channel {
 }
 
 impl Channel {
-    pub fn new(track: &SequenceTrack, sample_rate: f32) -> Self {
-        let instrument = if track.is_drum {
-            Instrument::Drums(DrumKit::new(sample_rate))
-        } else {
-            Instrument::Synth(PolySynth::new(VoicePreset::named(&track.voice), sample_rate, 12))
-        };
+    pub fn new(track: &SequenceTrack, sample_rate: f32, drums: Option<&DrumBank>) -> Self {
         let mut c = Channel {
-            instrument,
-            voice: track.voice.clone(),
-            is_drum: track.is_drum,
+            instrument: Instrument::for_track(track, sample_rate, drums),
+            synth: track.synth,
             tone: Biquad::identity(),
             tone_hz: 0.0,
             reverb: Reverb::new(sample_rate),
@@ -78,20 +85,26 @@ impl Channel {
             mono: vec![0.0; 8192],
             peak: 0.0,
         };
-        c.apply(track);
+        c.apply(track, drums);
         c
     }
 
-    /// Update params from the track; swaps the instrument if the voice/kind changed.
-    pub fn apply(&mut self, track: &SequenceTrack) {
-        if track.is_drum != self.is_drum || (!track.is_drum && track.voice != self.voice) {
-            self.instrument = if track.is_drum {
-                Instrument::Drums(DrumKit::new(self.sample_rate))
-            } else {
-                Instrument::Synth(PolySynth::new(VoicePreset::named(&track.voice), self.sample_rate, 12))
-            };
-            self.is_drum = track.is_drum;
-            self.voice = track.voice.clone();
+    /// Update params from the track. A changed synth patch is applied live (held notes keep
+    /// sounding); a changed kit re-renders only the pads whose patch changed; switching between
+    /// synth and drums builds a new instrument.
+    pub fn apply(&mut self, track: &SequenceTrack, drums: Option<&DrumBank>) {
+        match (&mut self.instrument, track.is_drum) {
+            (Instrument::Synth(s), false) => {
+                if track.synth != self.synth {
+                    s.set_patch(&track.synth);
+                    self.synth = track.synth;
+                }
+            }
+            (Instrument::Drums(kit), true) => kit.update(&track.drum_pads, drums),
+            _ => {
+                self.instrument = Instrument::for_track(track, self.sample_rate, drums);
+                self.synth = track.synth;
+            }
         }
         let tone_hz = track.tone.clamp(200.0, 20_000.0) as f32;
         if (tone_hz - self.tone_hz).abs() > 0.5 {
