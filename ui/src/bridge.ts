@@ -30,7 +30,7 @@ import type {
   VibeInfo,
 } from "./types";
 import { beatsPerBar, uuid, withDefaults } from "./types";
-import { defaultKit, isFactory, lookupSound, MAX_DRUM_PADS, type Sound } from "./sound";
+import { defaultKit, filledSound, isFactory, lookupSound, MAX_DRUM_PADS, type Sound } from "./sound";
 import { chordAt, normalize, progression } from "./theory";
 
 export interface Bridge {
@@ -564,10 +564,10 @@ function reduce(m: ProjectModel, c: Command): void {
       track(c.id).color = c.color === null ? null : c.color.toLowerCase();
       break;
     case "deleteTrack": {
+      // Like Rust: an unknown id is "no such track" even when only one track is left.
+      track(c.id);
       if (m.tracks.length <= 1) fail(LAST_TRACK);
-      const before = m.tracks.length;
       m.tracks = m.tracks.filter((t) => t.id !== c.id);
-      if (m.tracks.length === before) fail(NO_SUCH_TRACK);
       // Its patterns go with it, and their clips with them.
       const gone = new Set(m.patterns.filter((p) => p.trackId === c.id).map((p) => p.id));
       m.patterns = m.patterns.filter((p) => !gone.has(p.id));
@@ -595,29 +595,35 @@ function reduce(m: ProjectModel, c: Command): void {
       track(c.id).voice = c.voice;
       break;
     case "setTrackSound": {
+      const sound = sanitizedSound(c.sound);
       const t = track(c.id);
-      if (t.isDrum || c.sound.patch.kind !== "synth") fail(INVALID_VALUE);
-      t.voice = c.sound.id;
-      if (!isFactory(c.sound.id)) embedSound(m, c.sound);
+      if (t.isDrum || sound.patch.kind !== "synth") fail(INVALID_VALUE);
+      t.voice = sound.id;
+      if (!isFactory(sound.id)) embedSound(m, sound);
       pruneSounds(m);
       break;
     }
     case "setDrumPads": {
+      const sounds = c.sounds.map(sanitizedSound);
+      // Pitch and choke are `u8` in Rust: anything else fails to decode before `apply_to` runs.
+      const byte = (x: number) => Number.isInteger(x) && x >= 0 && x <= 255;
+      if (!c.pads.every((p) => byte(p.pitch) && byte(p.choke) && typeof p.sound === "string")) fail(INVALID_VALUE);
       const pitches = new Set(c.pads.map((p) => p.pitch));
-      const okKit = c.pads.length >= 1 && c.pads.length <= MAX_DRUM_PADS && pitches.size === c.pads.length && c.pads.every((p) => Number.isInteger(p.pitch) && p.pitch >= 0 && p.pitch <= 127);
-      if (!okKit || c.sounds.some((s) => s.patch.kind !== "drum")) fail(INVALID_VALUE);
+      const okKit = c.pads.length >= 1 && c.pads.length <= MAX_DRUM_PADS && pitches.size === c.pads.length && c.pads.every((p) => p.pitch <= 127);
+      if (!okKit || sounds.some((s) => s.patch.kind !== "drum")) fail(INVALID_VALUE);
       if (!track(c.id).isDrum) fail(INVALID_VALUE);
-      for (const s of c.sounds) if (!isFactory(s.id)) embedSound(m, s);
+      for (const s of sounds) if (!isFactory(s.id)) embedSound(m, s);
       if (c.pads.some((p) => lookupSound(m.sounds ?? [], p.sound)?.patch.kind !== "drum")) fail(NO_SUCH_SOUND);
-      track(c.id).drumPads = c.pads.map((p) => ({ ...p }));
+      track(c.id).drumPads = c.pads.map((p) => ({ pitch: p.pitch, sound: p.sound, choke: p.choke }));
       pruneSounds(m);
       break;
     }
     case "upsertSound": {
-      const i = (m.sounds ?? []).findIndex((s) => s.id === c.sound.id);
+      const sound = sanitizedSound(c.sound);
+      const i = (m.sounds ?? []).findIndex((s) => s.id === sound.id);
       if (i < 0) fail(NO_SUCH_SOUND);
-      if (m.sounds![i].patch.kind !== c.sound.patch.kind) fail(INVALID_VALUE);
-      m.sounds![i] = structuredClone(c.sound);
+      if (m.sounds![i].patch.kind !== sound.patch.kind) fail(INVALID_VALUE);
+      m.sounds![i] = sound;
       break;
     }
     case "setTrackParam": {
@@ -789,16 +795,138 @@ function pruneSounds(m: ProjectModel) {
   else delete m.sounds;
 }
 
-/** The mock's stand-in for the global sound library. */
+// ─── Sound sanitizing (mirrors `Sound::sanitized` in crates/dissonant-core/src/sound.rs) ────
+
+/** `[path, lo, hi, integer]`; `*` walks every element of a fixed-length array. */
+type Range = [path: string, lo: number, hi: number, integer?: true];
+const ENVELOPE: Range[] = [["attack", 0, 10], ["decay", 0.001, 10], ["sustain", 0, 1], ["release", 0.001, 10]];
+const under = (prefix: string, ranges: Range[]): Range[] => ranges.map(([p, ...r]) => [prefix + "." + p, ...r]);
+const SYNTH_RANGES: Range[] = [
+  ["osc.*.octave", -3, 3, true],
+  ["osc.*.semi", -12, 12, true],
+  ["osc.*.fine", -100, 100],
+  ["osc.*.level", 0, 1],
+  ["osc.*.pulseWidth", 0.05, 0.95],
+  ["osc.*.unison", 1, 8, true],
+  ["osc.*.detune", 0, 100],
+  ["noiseLevel", 0, 1],
+  ["noiseColor", 0, 1],
+  ["fmAmount", 0, 1],
+  ["ringMod", 0, 1],
+  ["filter.cutoff", 20, 20000],
+  ["filter.resonance", 0, 1],
+  ["filter.drive", 0, 1],
+  ["filter.keyTrack", 0, 1],
+  ["filter.envAmount", -8, 8],
+  ["filter.velocity", 0, 1],
+  ...under("ampEnv", ENVELOPE),
+  ...under("filterEnv", ENVELOPE),
+  ["pitchEnvAmount", -48, 48],
+  ["pitchEnvDecay", 0.001, 2],
+  ["lfo.*.rate", 0.01, 30],
+  ["lfo.*.depth", 0, 1],
+  ["glide", 0, 2],
+  ["velocity", 0, 1],
+  ["drive", 0, 1],
+  ["crush", 0, 1],
+  ["chorus.mix", 0, 1],
+  ["chorus.rate", 0.05, 5],
+  ["chorus.depth", 0, 1],
+  ["delay.mix", 0, 1],
+  ["delay.time", 0.01, 1.5],
+  ["delay.feedback", 0, 0.95],
+  ["level", 0, 1],
+];
+const DRUM_RANGES: Range[] = [
+  ["length", 0.02, 3],
+  ["tune", -24, 24],
+  ["body.level", 0, 1],
+  ["body.startHz", 20, 4000],
+  ["body.endHz", 20, 4000],
+  ["body.pitchDecay", 0.001, 2],
+  ["body.decay", 0.001, 3],
+  ["body.overtoneLevel", 0, 1],
+  ["body.overtoneRatio", 0.5, 8],
+  ["noise.level", 0, 1],
+  ["noise.cutoff", 20, 20000],
+  ["noise.resonance", 0, 1],
+  ["noise.attack", 0, 0.1],
+  ["noise.decay", 0.001, 3],
+  ["noise.bursts", 1, 8, true],
+  ["noise.burstSpacing", 0.002, 0.05],
+  ["metal.level", 0, 1],
+  ["metal.baseHz", 100, 1000],
+  ["metal.decay", 0.001, 3],
+  ["metal.cutoff", 200, 20000],
+  ["click.level", 0, 1],
+  ["click.decay", 0.0005, 0.02],
+  ["click.toneHz", 500, 12000],
+  ["drive", 0, 1],
+  ["crush", 0, 1],
+  ["lowCut", 20, 2000],
+  ["highCut", 200, 20000],
+  ["velocity", 0, 1],
+  ["level", 0, 1],
+];
+
+function clampPath(node: unknown, keys: string[], lo: number, hi: number, integer: boolean): void {
+  const [k, ...rest] = keys;
+  if (k === "*") {
+    for (const item of node as unknown[]) clampPath(item, rest, lo, hi, integer);
+    return;
+  }
+  const obj = node as Record<string, unknown>;
+  if (rest.length) return clampPath(obj[k], rest, lo, hi, integer);
+  const v = obj[k];
+  // Serde refuses a non-number (or a fraction for an integer field) before the edit runs.
+  if (typeof v !== "number" || (integer && !Number.isInteger(v))) fail(INVALID_VALUE);
+  obj[k] = Number.isFinite(v) ? clamp(v, lo, hi) : lo;
+}
+
+/**
+ * What Rust makes of a sound arriving over IPC: missing fields take their defaults (serde
+ * `default`), unknown ones are dropped, then `Sound::sanitized` clamps every parameter and
+ * names a blank sound "untitled". Always a fresh object.
+ */
+export function sanitizedSound(sound: Sound): Sound {
+  const s = filledSound(structuredClone(sound) as unknown as Parameters<typeof filledSound>[0]);
+  const ranges = s.patch.kind === "drum" ? DRUM_RANGES : SYNTH_RANGES;
+  for (const [path, lo, hi, integer] of ranges) clampPath(s.patch, path.split("."), lo, hi, integer === true);
+  if (!s.name.trim()) s.name = "untitled";
+  return s;
+}
+
+// ─── Mock sound library ─────────────────────────────────────────────────────────────────────
+
+/** The mock's stand-in for the global sound library (`src-tauri/src/library.rs`). */
 const LIBRARY_KEY = "dissonant.mock.soundLibrary";
 
+/** `library::check_id`: the same refusals, word for word. */
+function libraryIdError(id: string): string | null {
+  if (isFactory(id)) return `"${id}" is a factory sound; save a copy under a new id`;
+  if (!id.startsWith("u-")) return `a library sound id must start with "u-" (got "${id}")`;
+  return null;
+}
+
+/** Tolerant like `library::load`: unreadable storage is an empty library, bad entries drop. */
 function loadLibrary(): Sound[] {
+  let raw: unknown;
   try {
-    const raw = localStorage.getItem(LIBRARY_KEY);
-    return raw ? (JSON.parse(raw) as Sound[]) : [];
+    raw = JSON.parse(localStorage.getItem(LIBRARY_KEY) ?? "[]");
   } catch {
     return [];
   }
+  if (!Array.isArray(raw)) return [];
+  const lib: Sound[] = [];
+  for (const item of raw) {
+    try {
+      const s = sanitizedSound(item as Sound);
+      if (libraryIdError(s.id) === null && !lib.some((k) => k.id === s.id)) lib.push(s);
+    } catch {
+      // Not a sound this build can read: dropped, like a bad entry in the file.
+    }
+  }
+  return lib;
 }
 
 function storeLibrary(lib: Sound[]) {
@@ -1191,16 +1319,23 @@ function mockBridge(): Bridge {
     ],
     testTone: async () => blip(69, 100),
     librarySounds: async () => loadLibrary(),
+    // `library::save` / `library::delete`: factory and non-`u-` ids are refused, the sound is
+    // sanitized and replaces its id in place; deleting an unknown id changes nothing.
     saveLibrarySound: async (sound) => {
-      const lib = loadLibrary().filter((s) => s.id !== sound.id);
-      lib.push(structuredClone(sound));
+      const refusal = libraryIdError(sound.id);
+      if (refusal) fail(refusal);
+      const clean = sanitizedSound(sound);
+      const lib = loadLibrary();
+      const i = lib.findIndex((s) => s.id === clean.id);
+      if (i >= 0) lib[i] = clean;
+      else lib.push(clean);
       storeLibrary(lib);
-      return lib;
+      return clone(lib);
     },
     deleteLibrarySound: async (id) => {
       const lib = loadLibrary().filter((s) => s.id !== id);
       storeLibrary(lib);
-      return lib;
+      return clone(lib);
     },
     // The mock has no synth engine: previews are silent and the scope is flat.
     previewSound: async () => {},

@@ -116,6 +116,56 @@ fn loading_tidies_chords_song_length_and_clips() {
 }
 
 #[test]
+fn embedded_sounds_and_custom_drum_pads_round_trip() {
+    let mut model = ProjectModel::starter();
+    let synth = model.tracks.iter().position(|t| !t.is_drum).unwrap();
+    let drums = model.tracks.iter().position(|t| t.is_drum).unwrap();
+    let lead = SynthPatch { level: 0.5, mono: true, glide: 0.25, ..SynthPatch::default() };
+    let boom = DrumPatch { tune: -2.0, length: 0.8, ..DrumPatch::default() };
+    model.sounds = vec![
+        Sound { id: "u-lead".into(), name: "lead".into(), category: "lead".into(), patch: SoundPatch::Synth(lead) },
+        Sound { id: "u-boom".into(), name: "boom".into(), category: "kick".into(), patch: SoundPatch::Drum(boom) },
+    ];
+    model.tracks[synth].voice = "u-lead".into();
+    model.tracks[drums].drum_pads = vec![
+        DrumPad { pitch: 36, sound: "u-boom".into(), choke: 0 },
+        DrumPad { pitch: 42, sound: "hat".into(), choke: 1 },
+        DrumPad { pitch: 46, sound: "open-hat".into(), choke: 1 },
+    ];
+
+    let json = model.to_json().unwrap();
+    assert!(json.contains("\"drumPads\"") && json.contains("\"sounds\""));
+    let decoded = ProjectModel::from_json(&json).unwrap();
+    assert_eq!(decoded, model);
+    // And the copy in the file is what plays, on a machine whose library has never seen it.
+    assert_eq!(decoded.resolve_synth("u-lead"), lead);
+    assert_eq!(decoded.resolve_drum("u-boom"), boom);
+}
+
+#[test]
+fn a_file_from_before_sounds_opens_with_the_default_kit() {
+    let json = r#"{
+      "schemaVersion": 6,
+      "tracks": [
+        { "id": "11111111-1111-1111-1111-111111111111", "name": "lead", "voice": "pluck" },
+        { "id": "22222222-2222-2222-2222-222222222222", "name": "drums", "isDrum": true }
+      ]
+    }"#;
+    let m = ProjectModel::from_json(json).unwrap();
+    assert!(m.sounds.is_empty());
+    assert_eq!(m.tracks[1].drum_pads, default_kit(), "a drum track without drumPads gets the default kit");
+    for (pitch, sound) in [(36, "kick"), (38, "snare"), (39, "clap"), (42, "hat")] {
+        assert!(m.tracks[1].drum_pads.iter().any(|p| p.pitch == pitch && p.sound == sound), "old groove pitch {pitch} lost its {sound}");
+    }
+    // The old voice name is a factory id, so it still plays the same patch.
+    match &factory_sound("pluck").unwrap().patch {
+        SoundPatch::Synth(p) => assert_eq!(m.resolve_synth(&m.tracks[0].voice), *p),
+        _ => panic!("factory pluck is not a synth"),
+    }
+    assert!(!m.to_json().unwrap().contains("\"sounds\""), "re-saving added an empty sounds list");
+}
+
+#[test]
 fn json_uses_camel_case_keys() {
     let json = ProjectModel::starter().to_json().unwrap();
     for key in ["schemaVersion", "trackId", "lengthBeats", "songLengthBeats", "chords", "notes"] {
