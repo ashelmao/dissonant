@@ -34,3 +34,6 @@ ui/node_modules
 *.db
 .beads-credential-key
 .beads/proxieddb/
+
+# Beads / Dolt files (added by bd init)
+*.gate.lock*
