@@ -668,6 +668,15 @@ impl ProjectModel {
             self.tracks = fresh.tracks;
             self.patterns = fresh.patterns;
         }
+        // A hand-edited kit the commands would refuse (empty, too big, repeated pitches) falls
+        // back to the default kit rather than playing half-broken.
+        for t in &mut self.tracks {
+            if !crate::sound::valid_kit(&t.drum_pads) {
+                t.drum_pads = crate::sound::default_kit();
+            }
+        }
+        self.sounds = std::mem::take(&mut self.sounds).into_iter().map(crate::sound::Sound::sanitized).collect();
+        self.prune_sounds();
         let track_ids: Vec<Uuid> = self.tracks.iter().map(|t| t.id).collect();
         // A pattern of a track that no longer exists is invisible and never played, but would
         // survive every save; drop it instead of growing the file forever.

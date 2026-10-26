@@ -593,6 +593,7 @@ function reduce(m: ProjectModel, c: Command): void {
     }
     case "setTrackVoice":
       track(c.id).voice = c.voice;
+      pruneSounds(m);
       break;
     case "setTrackSound": {
       const sound = sanitizedSound(c.sound);

@@ -1299,3 +1299,23 @@ fn returning_to_the_saved_state_reports_no_unsaved_changes() {
     d.commit_gesture();
     assert!(!d.is_dirty(), "a round-trip slider drag reported unsaved changes");
 }
+
+#[test]
+fn a_factory_voice_prunes_the_user_sound_it_replaces() {
+    let mut d = doc();
+    let t0 = d.model().tracks[0].id;
+    d.apply(Command::SetTrackVoice { id: t0, voice: "pad".into() }, false).unwrap();
+    assert!(d.model().sounds.is_empty(), "u-test outlived the track that used it");
+}
+
+#[test]
+fn loading_repairs_a_broken_kit_and_unclamped_sounds() {
+    let mut m = fixture();
+    m.tracks[1].drum_pads = vec![pad(36, "kick", 0), pad(36, "snare", 0)];
+    m.sounds[0] = user_sound(9.0);
+    m.sounds.push(drum_sound("u-orphan"));
+    let m = m.normalized();
+    assert_eq!(m.tracks[1].drum_pads, default_kit());
+    assert_eq!(m.resolve_synth("u-test").level, 1.0);
+    assert_eq!(embedded(&m), ["u-test"], "an unused sound survived loading");
+}

@@ -403,7 +403,10 @@ fn apply_to(m: &mut ProjectModel, command: Command) -> Result<(), EditError> {
                 m.tracks.swap(i, j);
             }
         }
-        SetTrackVoice { id, voice } => m.track_mut(&id).ok_or(EditError::NoSuchTrack)?.voice = voice,
+        SetTrackVoice { id, voice } => {
+            m.track_mut(&id).ok_or(EditError::NoSuchTrack)?.voice = voice;
+            m.prune_sounds();
+        }
         SetTrackSound { id, sound } => {
             let sound = sound.sanitized();
             let t = m.track_mut(&id).ok_or(EditError::NoSuchTrack)?;
