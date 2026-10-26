@@ -650,6 +650,153 @@ fn deleting_a_track_purges_its_patterns_and_their_clips() {
     assert_eq!(d.model(), &before);
 }
 
+// ---------------------------------------------------------------- sounds and drum kits
+
+fn drum_sound(id: &str) -> Sound {
+    Sound { id: id.into(), name: id.into(), category: "kick".into(), patch: SoundPatch::Drum(DrumPatch::default()) }
+}
+
+fn pad(pitch: u8, sound: &str, choke: u8) -> DrumPad {
+    DrumPad { pitch, sound: sound.into(), choke }
+}
+
+fn embedded(m: &ProjectModel) -> Vec<&str> {
+    m.sounds.iter().map(|s| s.id.as_str()).collect()
+}
+
+/// `command` is refused with exactly `error`, and the document is left as it was.
+fn refused(d: &mut Document, command: Command, error: EditError) {
+    let before = d.model().clone();
+    let could_undo = d.can_undo();
+    assert_eq!(d.apply(command.clone(), false), Err(error), "{command:?}");
+    assert_eq!(d.model(), &before, "{command:?} mutated the model despite being refused");
+    assert_eq!(d.can_undo(), could_undo, "{command:?} pushed an undo entry despite being refused");
+}
+
+#[test]
+fn set_track_sound_embeds_a_user_sound_and_a_factory_sound_prunes_it() {
+    let mut d = doc();
+    let (t0, t1, ..) = ids(d.model());
+    let start = d.model().clone();
+
+    // A new user sound replaces the old one on the track; the old one, now unused, is dropped.
+    // The embedded copy is sanitized like everything else that enters the model.
+    let other = Sound { id: "u-other".into(), name: "  ".into(), ..user_sound(9.0) };
+    d.apply(Command::SetTrackSound { id: t0, sound: other.clone() }, false).unwrap();
+    assert_eq!(d.model().tracks[0].voice, "u-other");
+    assert_eq!(embedded(d.model()), ["u-other"], "the unused u-test was not pruned");
+    assert_eq!(d.model().sounds[0].name, "untitled");
+    assert_eq!(d.model().resolve_synth("u-other").level, 1.0, "the embedded copy was stored unclamped");
+
+    // Sending the same id again replaces the copy in place.
+    let quieter = Sound { patch: SoundPatch::Synth(SynthPatch { level: 0.5, ..SynthPatch::default() }), ..other };
+    d.apply(Command::SetTrackSound { id: t0, sound: quieter }, false).unwrap();
+    assert_eq!(embedded(d.model()), ["u-other"]);
+    assert_eq!(d.model().resolve_synth("u-other").level, 0.5);
+
+    // Back to a factory sound: nothing is embedded, and the file carries no `sounds` key.
+    d.apply(Command::SetTrackSound { id: t0, sound: factory_sound("saw").unwrap().clone() }, false).unwrap();
+    assert_eq!(d.model().tracks[0].voice, "saw");
+    assert!(d.model().sounds.is_empty(), "a factory sound was embedded or a user sound kept");
+    assert!(!d.model().to_json().unwrap().contains("\"sounds\""), "an empty sounds list was written");
+
+    // Wrong kind either way round, and an unknown track, change nothing.
+    refused(&mut d, Command::SetTrackSound { id: t1, sound: user_sound(0.5) }, EditError::InvalidValue);
+    refused(&mut d, Command::SetTrackSound { id: t0, sound: drum_sound("u-boom") }, EditError::InvalidValue);
+    refused(&mut d, Command::SetTrackSound { id: Uuid::new_v4(), sound: user_sound(0.5) }, EditError::NoSuchTrack);
+
+    // Each change was one undo step, and undo brings the embedded sounds back.
+    for _ in 0..3 {
+        assert!(d.undo());
+    }
+    assert_eq!(d.model(), &start);
+}
+
+#[test]
+fn set_drum_pads_refuses_a_bad_kit_and_changes_nothing() {
+    let mut d = doc();
+    let (t0, t1, ..) = ids(d.model());
+    let seventeen: Vec<DrumPad> = (0..=MAX_DRUM_PADS as u8).map(|i| pad(30 + i, "kick", 0)).collect();
+    assert_eq!(seventeen.len(), 17);
+    let kit = |pads: Vec<DrumPad>| Command::SetDrumPads { id: t1, pads, sounds: vec![] };
+    for (command, error) in [
+        (kit(vec![]), EditError::InvalidValue),
+        (kit(seventeen.clone()), EditError::InvalidValue),
+        (kit(vec![pad(36, "kick", 0), pad(36, "snare", 0)]), EditError::InvalidValue),
+        (kit(vec![pad(128, "kick", 0)]), EditError::InvalidValue),
+        // A synth sound carried along to embed, a pad on a factory synth sound, and a pad on the
+        // project's embedded synth sound.
+        (Command::SetDrumPads { id: t1, pads: vec![pad(36, "u-test", 0)], sounds: vec![user_sound(0.5)] }, EditError::InvalidValue),
+        (kit(vec![pad(36, "saw", 0)]), EditError::NoSuchSound),
+        (kit(vec![pad(36, "u-test", 0)]), EditError::NoSuchSound),
+        // A kit on a synth track, and on no track at all.
+        (Command::SetDrumPads { id: t0, pads: default_kit(), sounds: vec![] }, EditError::InvalidValue),
+        (Command::SetDrumPads { id: Uuid::new_v4(), pads: default_kit(), sounds: vec![] }, EditError::NoSuchTrack),
+    ] {
+        refused(&mut d, command, error);
+    }
+    assert_eq!(d.model().tracks[1].drum_pads, default_kit());
+    assert!(!d.can_undo());
+
+    // Sixteen is the limit, not one past it.
+    d.apply(kit(seventeen[..MAX_DRUM_PADS].to_vec()), false).unwrap();
+    assert_eq!(d.model().tracks[1].drum_pads.len(), MAX_DRUM_PADS);
+}
+
+#[test]
+fn a_pad_on_an_unknown_sound_is_refused_and_embeds_nothing() {
+    let mut d = doc();
+    let (_, t1, ..) = ids(d.model());
+    // The carried sound would be embedded on the way, but the refusal throws the whole edit away.
+    refused(
+        &mut d,
+        Command::SetDrumPads { id: t1, pads: vec![pad(36, "u-boom", 0), pad(38, "u-missing", 0)], sounds: vec![drum_sound("u-boom")] },
+        EditError::NoSuchSound,
+    );
+    assert_eq!(embedded(d.model()), ["u-test"]);
+}
+
+#[test]
+fn drum_pads_embed_their_user_sounds_and_deleting_a_track_prunes_its_sounds() {
+    let mut d = doc();
+    let (t0, t1, ..) = ids(d.model());
+    let pads = vec![pad(36, "u-boom", 0), pad(42, "hat", 1), pad(46, "open-hat", 1)];
+    let sounds = vec![drum_sound("u-boom"), drum_sound("u-unused"), factory_sound("hat").unwrap().clone()];
+    d.apply(Command::SetDrumPads { id: t1, pads: pads.clone(), sounds }, false).unwrap();
+    assert_eq!(d.model().tracks[1].drum_pads, pads);
+    // Only the user sound a pad uses is embedded: not the unused one, not the factory one.
+    assert_eq!(embedded(d.model()), ["u-test", "u-boom"]);
+    assert_eq!(d.model().resolve_drum("u-boom"), DrumPatch::default());
+
+    // Deleting a track drops the sounds only it used.
+    d.apply(Command::DeleteTrack { id: t1 }, false).unwrap();
+    assert_eq!(embedded(d.model()), ["u-test"]);
+    assert!(d.undo());
+    d.apply(Command::DeleteTrack { id: t0 }, false).unwrap();
+    assert_eq!(embedded(d.model()), ["u-boom"]);
+    assert!(d.undo());
+
+    // A sound another track still plays survives.
+    d.apply(Command::AddTrack { is_drum: false }, false).unwrap();
+    let t2 = d.model().tracks[2].id;
+    d.apply(Command::SetTrackVoice { id: t2, voice: "u-test".into() }, false).unwrap();
+    d.apply(Command::DeleteTrack { id: t0 }, false).unwrap();
+    assert_eq!(embedded(d.model()), ["u-test", "u-boom"]);
+}
+
+#[test]
+fn upsert_sound_only_replaces_a_copy_the_project_embeds() {
+    let mut d = doc();
+    refused(&mut d, Command::UpsertSound { sound: Sound { id: "u-nope".into(), ..user_sound(0.5) } }, EditError::NoSuchSound);
+    refused(&mut d, Command::UpsertSound { sound: factory_sound("saw").unwrap().clone() }, EditError::NoSuchSound);
+    // The embedded u-test is a synth; a drum patch under its id is the wrong kind.
+    refused(&mut d, Command::UpsertSound { sound: drum_sound("u-test") }, EditError::InvalidValue);
+
+    d.apply(Command::UpsertSound { sound: user_sound(0.6) }, false).unwrap();
+    assert_eq!(embedded(d.model()), ["u-test"]);
+    assert_eq!(d.model().resolve_synth("u-test").level, 0.6);
+}
+
 #[test]
 fn deleting_a_pattern_purges_every_clip_of_it_from_the_song() {
     let mut d = doc();

@@ -3,11 +3,58 @@
 //! field-name drift fails here instead of silently rejecting edits at runtime.
 
 use dissonant_core::document::{Command, TrackParam};
+use dissonant_core::DrumPad;
 use serde_json::json;
 use uuid::Uuid;
 
 fn parse(v: serde_json::Value) -> Command {
     serde_json::from_value(v.clone()).unwrap_or_else(|e| panic!("UI payload rejected: {v} — {e}"))
+}
+
+/// A complete synth `Sound` as `ui/src/sound.ts` builds it, every field off its default (and
+/// exactly representable as f32), so a renamed or missing field shows up in the round trip.
+fn synth_sound_json() -> serde_json::Value {
+    let osc = |on: bool, wave: &str, octave: i32| {
+        json!({"on": on, "wave": wave, "octave": octave, "semi": 7, "fine": -12.5, "level": 0.625, "pulseWidth": 0.25,
+               "unison": 3, "detune": 22.5, "randomPhase": true})
+    };
+    let lfo = |wave: &str, target: &str| json!({"wave": wave, "rate": 2.5, "depth": 0.375, "target": target, "retrigger": true});
+    json!({
+        "id": "u-11111111-2222-4333-8444-555555555555", "name": "glass lead", "category": "lead",
+        "patch": {
+            "kind": "synth",
+            "osc": [osc(true, "pulse", -1), osc(true, "square", 1), osc(false, "triangle", 2)],
+            "noiseLevel": 0.125, "noiseColor": 0.75, "fmAmount": 0.25, "ringMod": 0.5, "sync": true,
+            "filter": {"mode": "lowpass24", "cutoff": 2400.0, "resonance": 0.625, "drive": 0.25, "keyTrack": 0.5,
+                       "envAmount": -2.5, "velocity": 0.75},
+            "ampEnv": {"attack": 0.015625, "decay": 0.25, "sustain": 0.5, "release": 0.75},
+            "filterEnv": {"attack": 0.0078125, "decay": 0.5, "sustain": 0.25, "release": 1.5},
+            "pitchEnvAmount": 12.0, "pitchEnvDecay": 0.125,
+            "lfo": [lfo("sampleHold", "cutoff"), lfo("triangle", "pulseWidth")],
+            "mono": true, "glide": 0.0625, "velocity": 0.5, "drive": 0.375, "crush": 0.125,
+            "chorus": {"mix": 0.25, "rate": 1.5, "depth": 0.75},
+            "delay": {"mix": 0.125, "time": 0.375, "feedback": 0.5},
+            "level": 0.3125,
+        },
+    })
+}
+
+/// A complete drum `Sound`, like [`synth_sound_json`].
+fn drum_sound_json() -> serde_json::Value {
+    json!({
+        "id": "u-66666666-7777-4888-8999-aaaaaaaaaaaa", "name": "boom", "category": "kick",
+        "patch": {
+            "kind": "drum",
+            "length": 0.75, "tune": -3.5,
+            "body": {"level": 0.875, "wave": "triangle", "startHz": 320.0, "endHz": 45.0, "pitchDecay": 0.0625, "decay": 0.25,
+                     "overtoneLevel": 0.125, "overtoneRatio": 2.5},
+            "noise": {"level": 0.25, "mode": "bandpass", "cutoff": 3200.0, "resonance": 0.375, "attack": 0.00390625,
+                      "decay": 0.125, "bursts": 3, "burstSpacing": 0.0078125},
+            "metal": {"level": 0.0625, "baseHz": 410.0, "decay": 0.03125, "cutoff": 7500.0},
+            "click": {"level": 0.5, "decay": 0.001953125, "toneHz": 4500.0},
+            "drive": 0.25, "crush": 0.0625, "lowCut": 40.0, "highCut": 12000.0, "velocity": 0.875, "level": 0.625,
+        },
+    })
 }
 
 #[test]
@@ -42,6 +89,38 @@ fn every_command_variant_round_trips_from_the_ui_payload() {
         parse(json!({"type": "setTrackVoice", "id": id, "voice": "pluck"})),
         Command::SetTrackVoice { id, voice: "pluck".into() }
     );
+    // The SOUND page and the Devices panel. A sound must come back out exactly as it went in:
+    // every field the UI sets reaches the patch, none is silently left at its default.
+    match parse(json!({"type": "setTrackSound", "id": id, "sound": synth_sound_json()})) {
+        Command::SetTrackSound { id: t, sound } => {
+            assert_eq!(t, id);
+            assert_eq!(serde_json::to_value(&sound).unwrap(), synth_sound_json());
+        }
+        other => panic!("expected SetTrackSound, got {other:?}"),
+    }
+    match parse(json!({
+        "type": "setDrumPads",
+        "id": id,
+        "pads": [{"pitch": 36, "sound": drum_sound_json()["id"], "choke": 0}, {"pitch": 42, "sound": "hat", "choke": 1}],
+        "sounds": [drum_sound_json()],
+    })) {
+        Command::SetDrumPads { id: t, pads, sounds } => {
+            assert_eq!(t, id);
+            assert_eq!(
+                pads,
+                vec![
+                    DrumPad { pitch: 36, sound: "u-66666666-7777-4888-8999-aaaaaaaaaaaa".into(), choke: 0 },
+                    DrumPad { pitch: 42, sound: "hat".into(), choke: 1 },
+                ]
+            );
+            assert_eq!(serde_json::to_value(&sounds).unwrap(), json!([drum_sound_json()]));
+        }
+        other => panic!("expected SetDrumPads, got {other:?}"),
+    }
+    match parse(json!({"type": "upsertSound", "sound": drum_sound_json()})) {
+        Command::UpsertSound { sound } => assert_eq!(serde_json::to_value(&sound).unwrap(), drum_sound_json()),
+        other => panic!("expected UpsertSound, got {other:?}"),
+    }
     assert_eq!(
         parse(json!({"type": "setTrackParam", "id": id, "param": "reverbSend", "value": 0.3})),
         Command::SetTrackParam { id, param: TrackParam::ReverbSend, value: 0.3 }

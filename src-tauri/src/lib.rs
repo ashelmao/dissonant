@@ -2,6 +2,7 @@
 //! and streams the playhead back as events. All model edits go through `apply`, which keeps
 //! undo/redo in one place and re-feeds the engine a fresh [`Sequence`] after every change.
 
+pub mod library;
 pub mod settings;
 
 use dissonant_core::{midi_file, Command, Document, MasterSettings, MidiScope, NoteEvent, ProjectModel, Sequence};
@@ -1186,6 +1187,31 @@ fn new_from_template(state: State<'_, AppState>, name: String) -> Result<Snapsho
     Ok(state.snapshot())
 }
 
+// ─── Sound library ───────────────────────────────────────────────────────────────────────────
+
+impl AppState {
+    fn library_path(&self) -> Option<PathBuf> {
+        self.data_dir().map(|d| d.join(library::FILE_NAME))
+    }
+}
+
+/// The global user sound library (`sound-library.json` in app data), shared by every project.
+#[tauri::command]
+fn library_sounds(state: State<'_, AppState>) -> Vec<dissonant_core::Sound> {
+    state.library_path().map(|p| library::load(&p)).unwrap_or_default()
+}
+
+/// Insert or replace a user sound by id; returns the whole library.
+#[tauri::command]
+fn save_library_sound(state: State<'_, AppState>, sound: dissonant_core::Sound) -> Result<Vec<dissonant_core::Sound>, String> {
+    library::save(&state.library_path().ok_or("no app data dir")?, sound)
+}
+
+#[tauri::command]
+fn delete_library_sound(state: State<'_, AppState>, id: String) -> Result<Vec<dissonant_core::Sound>, String> {
+    library::delete(&state.library_path().ok_or("no app data dir")?, &id)
+}
+
 /// The built-in vibe templates, for the new-project screen.
 #[tauri::command]
 fn list_vibes() -> Vec<dissonant_core::VibeInfo> {
@@ -1483,6 +1509,9 @@ pub fn run() {
             save_template,
             delete_template,
             new_from_template,
+            library_sounds,
+            save_library_sound,
+            delete_library_sound,
             list_vibes,
             new_from_vibe,
         ])
