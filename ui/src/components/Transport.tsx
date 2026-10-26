@@ -58,6 +58,7 @@ export function Transport() {
           <div className={s.mode === "setup" ? "on" : ""} onClick={() => s.setMode("setup")} title="setup: chords, sections, tempo, song length">setup</div>
           <div className={s.mode === "pattern" ? "on" : ""} onClick={() => s.setMode("pattern")} title="pattern: the piano roll (Tab toggles with song)">pat</div>
           <div className={s.mode === "song" ? "on" : ""} onClick={() => s.setMode("song")} title="song: the arrangement (Tab toggles with pattern)">song</div>
+          <div className={s.mode === "sound" ? "on" : ""} onClick={() => s.setMode("sound")} title="sound: design synth and drum sounds, saved for every project">sound</div>
         </div>
       </div>
       <div className="tdiv" />

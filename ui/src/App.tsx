@@ -5,6 +5,7 @@ import { StatusBar } from "./components/StatusBar";
 import { TrackTree } from "./components/TrackTree";
 import { Arrangement } from "./components/Arrangement";
 import { Setup } from "./components/Setup";
+import { SoundPage } from "./components/sound/SoundPage";
 import { BottomPanel } from "./components/BottomPanel";
 import { Inspector } from "./components/Inspector";
 import { Editor } from "./components/Editor";
@@ -50,6 +51,9 @@ export default function App() {
         return;
       }
       const k = e.key.toLowerCase();
+      // SOUND plays the draft from the keyboard and keeps its own undo for it.
+      const soundPage = s.mode === "sound";
+      if (soundPage && mod && (k === "z" || k === "y")) return;
       if (e.code === "Space") {
         e.preventDefault();
         s.togglePlay();
@@ -85,6 +89,8 @@ export default function App() {
         // Pattern ⇄ song; from SETUP it goes to the pattern editor.
         e.preventDefault();
         s.setMode(s.mode === "pattern" ? "song" : "pattern");
+      } else if (soundPage) {
+        // Letters are notes here.
       } else if (!mod && s.liveKeyboard === "off" && k === "l") {
         s.toggleLooping();
       } else if (!mod && s.liveKeyboard === "off" && k === "r") {
@@ -114,6 +120,8 @@ export default function App() {
       <div className="content">
         {mode === "setup" ? (
           <Setup />
+        ) : mode === "sound" ? (
+          <SoundPage />
         ) : mode === "song" ? (
           <>
             <TrackTree />

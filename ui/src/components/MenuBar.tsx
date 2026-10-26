@@ -111,6 +111,7 @@ export function MenuBar() {
       { label: `${s.mode === "setup" ? "✓ " : ""}Setup (chords, sections, tempo)`, action: () => s.setMode("setup") },
       { label: `${s.mode === "pattern" ? "✓ " : ""}Pattern (piano roll)`, sc: s.mode === "song" ? "Tab" : undefined, action: () => s.setMode("pattern") },
       { label: `${s.mode === "song" ? "✓ " : ""}Song (arrangement)`, sc: s.mode === "pattern" ? "Tab" : undefined, action: () => s.setMode("song") },
+      { label: `${s.mode === "sound" ? "✓ " : ""}Sound (design sounds)`, action: () => s.setMode("sound") },
       { sep: true },
       { label: `${s.highlightRows ? "✓ " : ""}Highlight rows by tier`, action: () => s.toggleHighlight() },
       { label: `${s.showLandscape ? "✓ " : ""}Harmonic map`, action: () => s.toggleLandscape() },
