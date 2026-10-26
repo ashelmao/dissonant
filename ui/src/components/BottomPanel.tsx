@@ -1,7 +1,12 @@
+import { useEffect, useRef, useState } from "react";
 import { dbText, selectedPattern, selectedTrack, selectedTrackIndex, useStore } from "../store";
-import { DRUM_KIT, trackColor, VOICES, type MasterSettings, type Track, type TrackParam } from "../types";
+import { addPad, kitSounds, movePad, padName, pitchProblem, removePad, replacePad } from "../drumKit";
+import { lookupSound, MAX_DRUM_PADS, type DrumPad, type Sound } from "../sound";
+import { midiName } from "../theory";
+import { trackColor, type MasterSettings, type Track, type TrackParam } from "../types";
 import { eqDb, hz, Knob, lin, log, panText, pct } from "./Knob";
 import { VMeter } from "./Meter";
+import { SoundPicker, useSoundName } from "./SoundPicker";
 
 const VOL = lin(0, 1.5);
 const PAN = lin(-1, 1);
@@ -19,6 +24,7 @@ export function BottomPanel() {
   const pattern = useStore(selectedPattern);
 
   const noteCount = track && pattern ? (pattern.notes.length) : 0;
+  const soundName = useSoundName(track?.voice ?? "");
 
   return (
     <div className="bottom">
@@ -33,7 +39,7 @@ export function BottomPanel() {
               {String(index + 1).padStart(2, "0")} {track.name}
             </span>
             <span className="mono" style={{ fontSize: 9.5, color: "var(--text-5)", marginLeft: 10 }}>
-              {track.isDrum ? "drum kit" : `synth · ${track.voice}`} · {noteCount} notes in {pattern?.name ?? "—"}
+              {track.isDrum ? `drum kit · ${track.drumPads.length} pads` : `synth · ${soundName}`} · {noteCount} notes in {pattern?.name ?? "—"}
             </span>
           </>
         )}
@@ -57,39 +63,7 @@ function Devices() {
 
   return (
     <div className="devices">
-      <div className="device" style={{ width: 250 }}>
-        <div className="title">
-          <span className="led" />
-          <span>{track.isDrum ? "drum kit" : "waveform synth"}</span>
-          <span className="meta">{track.isDrum ? `${DRUM_KIT.length} voices` : "6 voices"}</span>
-        </div>
-        <div className="pad">
-          {track.isDrum ? (
-            <div className="list">
-              {DRUM_KIT.map((d) => (
-                <div key={d.pitch} className="lrow" style={{ cursor: "default" }}>
-                  <span className="num">{d.pitch}</span>
-                  <span className="name">{d.name}</span>
-                  <span className="meta">procedural</span>
-                </div>
-              ))}
-              <div className="help" style={{ padding: "6px 0 0" }}>per-pad tuning and samples are on the roadmap</div>
-            </div>
-          ) : (
-            <>
-              <span className="flabel">waveform · envelope</span>
-              <div className="chipsrow" style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)" }}>
-                {VOICES.map((v) => (
-                  <button key={v} className={`chip${track.voice === v ? " on" : ""}`} onClick={() => dispatch({ type: "setTrackVoice", id: track.id, voice: v })}>
-                    {v}
-                  </button>
-                ))}
-              </div>
-              <div className="help" style={{ padding: "4px 0 0" }}>polyblep oscillator · 12 voices · velocity → level</div>
-            </>
-          )}
-        </div>
-      </div>
+      {track.isDrum ? <DrumKitDevice track={track} /> : <SynthDevice track={track} />}
 
       <div className="device" style={{ width: 240 }}>
         <div className="title">
@@ -132,6 +106,160 @@ function Devices() {
         </div>
       </div>
     </div>
+  );
+}
+
+const CHOKES = [0, 1, 2, 3, 4];
+
+/** The synth track's instrument: its sound, picked from the factory, the library or the project. */
+function SynthDevice({ track }: { track: Track }) {
+  const dispatch = useStore((s) => s.dispatch);
+  const setMode = useStore((s) => s.setMode);
+  const sound = useStore((s) => lookupSound(s.snapshot?.model.sounds ?? [], track.voice));
+  const pick = (s: Sound) => void dispatch({ type: "setTrackSound", id: track.id, sound: s }, false, `sound: ${s.name}`);
+  return (
+    <div className="device synthdev" style={{ width: 270 }}>
+      <div className="title">
+        <span className="led" />
+        <span>waveform synth</span>
+        <span className="meta">{sound?.category || "sound"}</span>
+      </div>
+      <div className="pad">
+        <div className="row">
+          <span className="devname">{sound?.name ?? track.voice}</span>
+          <span className="spacer" />
+          <button className="chip tiny" onClick={() => setMode("sound")} title="open the SOUND page to shape this sound">edit ↗</button>
+        </div>
+        <SoundPicker inline kind="synth" value={track.voice} onPick={pick} />
+      </div>
+    </div>
+  );
+}
+
+/**
+ * The drum track's kit, top to bottom as the grid shows it: per pad its pitch, sound and choke
+ * group. Every edit sends the whole kit (plus the user sounds it uses) as one `setDrumPads`.
+ */
+function DrumKitDevice({ track }: { track: Track }) {
+  const dispatch = useStore((s) => s.dispatch);
+  const setMode = useStore((s) => s.setMode);
+  const audition = useStore((s) => s.audition);
+  const showToast = useStore((s) => s.showToast);
+  const library = useStore((s) => s.library);
+  const projectSounds = useStore((s) => s.snapshot?.model.sounds) ?? [];
+  const pads = track.drumPads;
+
+  const setKit = (next: DrumPad[] | null, label: string, refusal?: string, extra: Sound[] = []) => {
+    if (!next) {
+      if (refusal) showToast(refusal, true);
+      return;
+    }
+    // A just-picked library sound the project doesn't hold yet travels with the command.
+    void dispatch({ type: "setDrumPads", id: track.id, pads: next, sounds: kitSounds(next, [...extra, ...library], projectSounds) }, false, label);
+  };
+
+  return (
+    <div className="device kitdev" style={{ width: 380 }}>
+      <div className="title">
+        <span className="led" />
+        <span>drum kit</span>
+        <span className="meta">{pads.length} / {MAX_DRUM_PADS} pads</span>
+      </div>
+      <div className="pad">
+        <div className="kitrow kithead">
+          <span className="kpitch">pitch</span>
+          <span className="kname">sound · click to hear</span>
+          <span className="kchoke" title="pads in the same choke group cut each other off (open / closed hat)">choke</span>
+          <span className="kacts" />
+        </div>
+        <div className="kitlist">
+          {pads.map((p, i) => {
+            const name = padName(projectSounds, p);
+            return (
+              <div className="kitrow" key={p.pitch}>
+                <PitchField pads={pads} index={i} onCommit={(pitch) => setKit(replacePad(pads, i, { pitch }), "pad pitch")} onRefuse={(why) => showToast(why, true)} />
+                <button className="kname" onClick={() => audition(p.pitch)} title={`${name} · ${midiName(p.pitch)} · click to hear`}>
+                  {name}
+                </button>
+                <SoundPicker kind="drum" value={p.sound} onPick={(s) => setKit(replacePad(pads, i, { sound: s.id }), `pad sound: ${s.name}`, undefined, [s])} title="change this pad's sound">
+                  <span className="sp-caret">▾</span>
+                </SoundPicker>
+                <select className="kchoke" value={p.choke} onChange={(e) => setKit(replacePad(pads, i, { choke: Number(e.target.value) }), "pad choke")} title="choke group: pads sharing one cut each other off">
+                  {(CHOKES.includes(p.choke) ? CHOKES : [...CHOKES, p.choke]).map((c) => (
+                    <option key={c} value={c}>
+                      {c === 0 ? "—" : c}
+                    </option>
+                  ))}
+                </select>
+                <span className="kacts">
+                  <button className="ico" title="move up" disabled={i === 0} onClick={() => setKit(movePad(pads, i, -1), "move pad")}>↑</button>
+                  <button className="ico" title="move down" disabled={i === pads.length - 1} onClick={() => setKit(movePad(pads, i, 1), "move pad")}>↓</button>
+                  <button
+                    className="ico"
+                    title={pads.length <= 1 ? "a kit keeps at least one pad" : "remove pad (its hits stay in the patterns, unheard)"}
+                    disabled={pads.length <= 1}
+                    onClick={() => setKit(removePad(pads, i), "remove pad", "a kit keeps at least one pad")}
+                  >
+                    ×
+                  </button>
+                </span>
+              </div>
+            );
+          })}
+        </div>
+        <div className="row">
+          <button className="chip tiny" disabled={pads.length >= MAX_DRUM_PADS} onClick={() => setKit(addPad(pads), "add pad", `a kit holds up to ${MAX_DRUM_PADS} pads`)} title="a new pad on top, on the next free General MIDI drum pitch">
+            + add pad
+          </button>
+          <span className="spacer" />
+          <button className="chip tiny" onClick={() => setMode("sound")} title="open the SOUND page to design drum sounds">edit sounds ↗</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/** A pad's MIDI pitch: type and press Enter (or leave the field); ↑ ↓ step to the next free pitch. */
+function PitchField({ pads, index, onCommit, onRefuse }: { pads: DrumPad[]; index: number; onCommit: (pitch: number) => void; onRefuse: (why: string) => void }) {
+  const pitch = pads[index].pitch;
+  const [draft, setDraft] = useState(String(pitch));
+  const cancelled = useRef(false);
+  useEffect(() => setDraft(String(pitch)), [pitch]);
+  const commit = () => {
+    const v = Number(draft.trim());
+    if (cancelled.current || draft.trim() === "" || v === pitch) {
+      cancelled.current = false;
+      return setDraft(String(pitch));
+    }
+    const why = pitchProblem(pads, index, v);
+    if (why) {
+      onRefuse(why);
+      setDraft(String(pitch));
+    } else onCommit(v);
+  };
+  const step = (d: number) => {
+    for (let v = pitch + d; v >= 0 && v <= 127; v += d) if (!pitchProblem(pads, index, v)) return onCommit(v);
+  };
+  return (
+    <input
+      type="text"
+      className="kpitch"
+      inputMode="numeric"
+      value={draft}
+      title={`${midiName(pitch)} · MIDI pitch 0–127, one pad per pitch · ↑ ↓ step to the next free one`}
+      onChange={(e) => setDraft(e.target.value)}
+      onBlur={commit}
+      onKeyDown={(e) => {
+        if (e.key === "Enter") e.currentTarget.blur();
+        else if (e.key === "Escape") {
+          cancelled.current = true;
+          e.currentTarget.blur();
+        } else if (e.key === "ArrowUp" || e.key === "ArrowDown") {
+          e.preventDefault();
+          step(e.key === "ArrowUp" ? 1 : -1);
+        }
+      }}
+    />
   );
 }
 

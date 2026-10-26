@@ -1,6 +1,7 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { beatsPerBar, dbText, useStore } from "../store";
-import { DRUM_KIT, trackColor, type Clip, type NoteEvent, type SongPattern, type Track } from "../types";
+import type { DrumPad } from "../sound";
+import { trackColor, type Clip, type NoteEvent, type SongPattern, type Track } from "../types";
 import { VMeter } from "./Meter";
 import { ChordLane, GUTTER } from "./ChordLane";
 import { keys } from "../platform";
@@ -678,17 +679,19 @@ function ClipView({
         {pattern.name}
         {repeats !== 1 && <span style={{ opacity: 0.7, marginLeft: 4 }}>×{+repeats.toFixed(2)}</span>}
       </div>
-      <ClipPreview notes={notes} isDrum={track.isDrum} pattern={pattern} clip={clip} w={w} h={CLIP_H - 12} color={color} />
+      <ClipPreview notes={notes} kit={track.isDrum ? track.drumPads : null} pattern={pattern} clip={clip} w={w} h={CLIP_H - 12} color={color} />
       {!ghost && <div className="edge" />}
     </div>
   );
 }
 
-function ClipPreview({ notes, isDrum, pattern, clip, w, h, color }: { notes: NoteEvent[]; isDrum: boolean; pattern: SongPattern; clip: Clip; w: number; h: number; color: string }) {
+/** A clip's notes in miniature: melodic notes by pitch, drum hits by kit row (`kit`, top to bottom). */
+function ClipPreview({ notes, kit, pattern, clip, w, h, color }: { notes: NoteEvent[]; kit: DrumPad[] | null; pattern: SongPattern; clip: Clip; w: number; h: number; color: string }) {
   if (notes.length === 0) return <svg width={w} height={h} />;
   const ppb = w / clip.lengthBeats;
   let lo = 36;
   let hi = 84;
+  const isDrum = kit !== null;
   if (!isDrum) {
     lo = Math.min(...notes.map((n) => n.pitch));
     hi = Math.max(...notes.map((n) => n.pitch));
@@ -698,15 +701,17 @@ function ClipPreview({ notes, isDrum, pattern, clip, w, h, color }: { notes: Not
       hi = mid + 6;
     }
   }
-  const rows = isDrum ? DRUM_KIT.length : hi - lo;
+  const rows = isDrum ? kit.length : hi - lo;
+  const rowOf = new Map(kit?.map((k, i) => [k.pitch, i]));
   let d = "";
   // Draw every repetition of the pattern inside the clip, from the offset.
   for (let base = -(clip.offsetBeats % pattern.lengthBeats); base < clip.lengthBeats; base += pattern.lengthBeats) {
     for (const n of notes) {
       const start = base + n.startBeat;
       if (start < 0 || start >= clip.lengthBeats) continue;
-      if (isDrum && !DRUM_KIT.some((k) => k.pitch === n.pitch)) continue;
-      const p = isDrum ? 1 - DRUM_KIT.findIndex((k) => k.pitch === n.pitch) / Math.max(1, rows - 1) : (n.pitch - lo) / Math.max(1, rows);
+      const row = rowOf.get(n.pitch);
+      if (isDrum && row === undefined) continue;
+      const p = isDrum ? 1 - row! / Math.max(1, rows - 1) : (n.pitch - lo) / Math.max(1, rows);
       const x = start * ppb;
       const y = 2 + (1 - p) * (h - 6);
       const ww = Math.max(1, Math.min(n.lengthBeats, clip.lengthBeats - start) * ppb - 1);
