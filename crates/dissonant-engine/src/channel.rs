@@ -3,7 +3,7 @@
 
 use crate::drums::DrumKit;
 use crate::dsp::{linear_to_db, pan_gains, Biquad, Reverb, StereoBiquad};
-use crate::synth::{PolySynth, VoicePreset};
+use crate::synth::PolySynth;
 use dissonant_core::{MasterSettings, SequenceTrack};
 
 #[derive(Debug, Clone)]
@@ -63,7 +63,7 @@ impl Channel {
         let instrument = if track.is_drum {
             Instrument::Drums(DrumKit::new(sample_rate))
         } else {
-            Instrument::Synth(PolySynth::new(VoicePreset::named(&track.voice), sample_rate, 12))
+            Instrument::Synth(PolySynth::new(&track.synth, sample_rate, 12))
         };
         let mut c = Channel {
             instrument,
@@ -88,7 +88,7 @@ impl Channel {
             self.instrument = if track.is_drum {
                 Instrument::Drums(DrumKit::new(self.sample_rate))
             } else {
-                Instrument::Synth(PolySynth::new(VoicePreset::named(&track.voice), self.sample_rate, 12))
+                Instrument::Synth(PolySynth::new(&track.synth, self.sample_rate, 12))
             };
             self.is_drum = track.is_drum;
             self.voice = track.voice.clone();

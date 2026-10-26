@@ -1,7 +1,7 @@
 //! The block processor: transport + sample-accurate event scheduling + mixing.
 
 use crate::channel::{Channel, Master};
-use crate::synth::{PolySynth, VoicePreset};
+use crate::synth::PolySynth;
 use dissonant_core::{swing_warp, MasterSettings, Sequence, Tempo};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -9,6 +9,14 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 pub const MAX_TRACKS: usize = 64;
+
+/// The chord bed plays the factory `pad` sound.
+fn pad_patch() -> dissonant_core::SynthPatch {
+    match dissonant_core::factory_sound("pad").map(|s| &s.patch) {
+        Some(dissonant_core::SoundPatch::Synth(p)) => *p,
+        _ => dissonant_core::SynthPatch::default(),
+    }
+}
 
 /// Audition hold bounds. The floor keeps very fine grids audible; the ceiling stops a stray
 /// value from leaving a voice ringing.
@@ -202,7 +210,7 @@ impl Engine {
             sequence: Arc::new(Sequence::default()),
             channels: Vec::new(),
             channel_ids: Vec::new(),
-            chord_bed: PolySynth::new(VoicePreset::named("pad"), sample_rate, 8),
+            chord_bed: PolySynth::new(&pad_patch(), sample_rate, 8),
             hear_chords: false,
             master: Master::new(sample_rate, master),
             playing: false,
