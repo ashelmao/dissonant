@@ -254,48 +254,84 @@ fn starter_shaped_fits_any_length_and_meter() {
 #[test]
 fn every_vibe_builds_a_playable_project() {
     let infos = vibes();
-    assert_eq!(infos.len(), 5);
-    for info in &infos {
-        let m = ProjectModel::from_vibe(&info.id, DEFAULT_SONG_BARS).unwrap_or_else(|| panic!("{} builds", info.id));
-        assert_eq!(m.tempo, info.tempo, "{}", info.id);
-        assert_eq!(m.key, info.key, "{}: key locked as advertised", info.id);
+    assert_eq!(infos.len(), 7);
+    for (info, spec) in infos.iter().zip(vibe_specs()) {
+        let id = &info.id;
+        let m = ProjectModel::from_vibe(id, DEFAULT_SONG_BARS).unwrap_or_else(|| panic!("{id} builds"));
+        assert_eq!(m.tempo, info.tempo, "{id}");
+        assert_eq!(m.key, info.key, "{id}: key locked as advertised");
         assert!(m.key.is_locked);
         assert_eq!(m.song_length_beats, 128.0);
-        assert_eq!(m.patterns.len(), 3, "{}: one pattern per track", info.id);
+        assert_eq!(m.tracks.len(), spec.tracks.len(), "{id}");
+        assert_eq!(m.patterns.len(), m.tracks.len(), "{id}: one pattern per track");
         for (p, t) in m.patterns.iter().zip(&m.tracks) {
             assert_eq!(p.track_id, t.id);
             assert_eq!(p.name, format!("{} 1", t.name));
             assert_eq!(p.length_beats, 16.0);
             for n in &p.notes {
-                assert!(n.start_beat >= 0.0 && n.end_beat() <= 16.0 + 1e-9, "{}: {n:?} past the end", info.id);
+                assert!(n.start_beat >= 0.0 && n.end_beat() <= 16.0 + 1e-9, "{id}: {n:?} past the end");
             }
         }
-        assert_eq!(m.clips.len(), 3, "{}: every pattern is in the song", info.id);
+        assert_eq!(m.clips.len(), m.patterns.len(), "{id}: every pattern is in the song");
         assert!(m.clips.iter().all(|c| c.start_beat == 0.0 && c.length_beats == 128.0));
-        assert!((m.chords.last().unwrap().end_beat() - 128.0).abs() < 1e-9, "{}: the progression fills the song", info.id);
-        assert!(m.patterns[0].notes.is_empty(), "{}: the lead is left for the player", info.id);
-        // Every bass note is the root of the chord it sits on, low.
+        assert!((m.chords.last().unwrap().end_beat() - 128.0).abs() < 1e-9, "{id}: the progression fills the song");
+        assert!(matches!(spec.tracks[0].role, VibeRole::Lead) && !m.tracks[0].is_drum, "{id}: the lead comes first");
+        assert!(m.patterns[0].notes.is_empty(), "{id}: the lead is left for the player");
+
         let chords = ChordTrack::new(m.chords.clone());
-        let bass = &m.patterns[1].notes;
-        assert!(!bass.is_empty());
-        for n in bass {
-            let chord = chords.chord_at(n.start_beat).unwrap();
-            assert_eq!(n.pitch.rem_euclid(12), chord.pitch_classes[0].rem_euclid(12), "{}: bass plays roots", info.id);
-            assert!((32..=43).contains(&n.pitch), "{}: bass pitch {} out of range", info.id, n.pitch);
-        }
-        // A kick on every downbeat, whatever the groove.
-        let kicks: Vec<f64> = m.patterns[2].notes.iter().filter(|n| n.pitch == 36).map(|n| n.start_beat).collect();
-        for bar in 0..4 {
-            assert!(kicks.contains(&(bar as f64 * 4.0)), "{}: kick on bar {bar}", info.id);
+        for ((t, p), vt) in m.tracks.iter().zip(&m.patterns).zip(&spec.tracks) {
+            let name = &t.name;
+            if t.is_drum {
+                assert!(sound::valid_kit(&t.drum_pads), "{id}/{name}: kit");
+                for pad in &t.drum_pads {
+                    assert!(factory_sound(&pad.sound).is_some_and(Sound::is_drum), "{id}/{name}: {} is not a factory drum", pad.sound);
+                }
+                for n in &p.notes {
+                    assert!(t.drum_pads.iter().any(|pad| pad.pitch as i32 == n.pitch), "{id}/{name}: no pad for pitch {}", n.pitch);
+                }
+                assert!(p.notes.iter().any(|n| n.pitch == 36 && n.start_beat == 0.0), "{id}: a kick on the one");
+            } else {
+                assert!(factory_sound(&t.voice).is_some_and(|s| !s.is_drum()), "{id}/{name}: {} is not a factory synth", t.voice);
+            }
+            match &vt.role {
+                VibeRole::Lead => assert!(p.notes.is_empty()),
+                // The first hit of every bar is the chord root, low; the rest sit near it.
+                VibeRole::Bass { rhythm } => {
+                    assert!(!p.notes.is_empty(), "{id}: bass plays");
+                    assert_eq!(rhythm[0].get(2).copied().unwrap_or(0.0), 0.0, "{id}: the bar starts on the root");
+                    for n in &p.notes {
+                        assert!((32..=55).contains(&n.pitch), "{id}: bass pitch {} out of range", n.pitch);
+                        if n.start_beat.fract() == 0.0 && (n.start_beat / 4.0).fract() == 0.0 {
+                            let chord = chords.chord_at(n.start_beat).unwrap();
+                            assert_eq!(n.pitch.rem_euclid(12), chord.pitch_classes[0].rem_euclid(12), "{id}: bass on the root");
+                        }
+                    }
+                }
+                // Chord parts play only chord tones.
+                VibeRole::Chords { .. } => {
+                    assert!(!p.notes.is_empty(), "{id}: chords play");
+                    for n in &p.notes {
+                        let chord = chords.chord_at(n.start_beat).unwrap();
+                        assert!(chord.pitch_classes.iter().any(|pc| pc.rem_euclid(12) == n.pitch.rem_euclid(12)), "{id}: {} not in the chord", n.pitch);
+                    }
+                }
+                // Every lane repeats evenly inside the 16-beat pattern.
+                VibeRole::Drums { lanes, .. } => {
+                    for lane in lanes {
+                        let period = lane.cells().len() as f64 * lane.step;
+                        assert!(period > 0.0 && (16.0 / period).fract() == 0.0, "{id}: lane {} lasts {period} beats", lane.pitch);
+                    }
+                }
+            }
         }
     }
     assert!(ProjectModel::from_vibe("polka", DEFAULT_SONG_BARS).is_none());
-    assert_eq!(ProjectModel::from_vibe("lofi", 8).unwrap().song_length_beats, 32.0);
+    assert_eq!(ProjectModel::from_vibe("jungle", 8).unwrap().song_length_beats, 32.0);
 }
 
-/// The browser mock (ui/src/bridge.ts) mirrors the vibes; `bridge.test.ts` asserts these same
-/// values, so a change on either side fails a test. Chords are the first pass of the
-/// progression (one pattern length); the rest of the song repeats it.
+/// The browser mock (ui/src/bridge.ts) builds vibes from the same `assets/vibes.json`;
+/// `bridge.test.ts` asserts these same values, so the two builders can't drift apart. Chords
+/// are the first pass of the progression (one pattern length); the rest of the song repeats it.
 #[test]
 fn vibe_values_shared_with_the_ui() {
     let described: Vec<String> = vibes()
@@ -305,31 +341,31 @@ fn vibe_values_shared_with_the_ui() {
             let names: Vec<&str> = m.tracks.iter().map(|t| t.name.as_str()).collect();
             let chords: Vec<&str> =
                 m.chords.iter().filter(|c| c.start_beat < 16.0).map(|c| c.name.as_deref().unwrap_or("")).collect();
-            let count = |track: usize, pitch: Option<i32>| {
-                m.patterns_of(&m.tracks[track].id).flat_map(|p| &p.notes).filter(|n| pitch.is_none_or(|x| n.pitch == x)).count()
-            };
+            let counts: Vec<String> = m.patterns.iter().map(|p| p.notes.len().to_string()).collect();
+            let pitch_sum: i32 = m.patterns.iter().flat_map(|p| &p.notes).map(|n| n.pitch).sum();
             format!(
-                "{}|{}|{}|{}|{}|{}|kick {}|bass {}|{}",
+                "{}|{}|{}|{}|{}|{}|{}|{}",
                 info.id,
                 info.tempo,
                 m.swing,
                 names.join(","),
                 chords.join(" "),
                 m.tracks[0].voice,
-                count(2, Some(36)),
-                count(1, None),
-                count(2, None),
+                counts.join(","),
+                pitch_sum,
             )
         })
         .collect();
     assert_eq!(
         described,
         [
-            "lofi|80|60|keys,bass,drums|Gm C F Dm|triangle|kick 12|bass 12|52",
-            "postpunk|148|50|lead,bass,drums|Em C G D|square|kick 12|bass 32|52",
-            "ambient|70|50|pad,bass,drums|D G|pad|kick 4|bass 4|8",
-            "songwriter|96|50|melody,bass,drums|G D Em C|pluck|kick 8|bass 8|48",
-            "club|124|50|lead,bass,drums|Am G F G|square|kick 16|bass 16|40",
+            "jungle|172|50|bells,reese,pad,amen|Fm C# A#m Cm|fm-bell|0,12,12,67|4194",
+            "dubstep|140|50|lead,wobble,pad,drums|Dm A# C Am|screamer-lead|0,24,12,62|4195",
+            "blownout|138|54|voice,bass,stabs,machine|Em F#dim Em D|robot|0,24,36,90|7149",
+            "rage|160|50|synth,808,chords,drums|C#m A B A|rage-lead|0,16,12,72|4273",
+            "jersey|140|50|melody,sub,keys,drums|Am F C G|bright-pluck|0,20,36,81|6657",
+            "hyperpop|160|50|lead,808,synths,drums|A B C#m E|chip-lead|0,16,60,108|9080",
+            "pluggnb|150|50|flute,808,keys,drums|F# Fm A#m G#|whistle-lead|0,8,24,59|4319",
         ]
     );
 }

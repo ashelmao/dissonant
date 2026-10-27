@@ -1,13 +1,18 @@
-//! Ready-to-play projects for a first session: drum grooves, generated bass lines, and the
-//! "vibe" templates the new-project screen offers (lo-fi, post-punk, ambient, …).
+//! Ready-to-play projects for a first session: drum grooves, and the "vibe" templates the
+//! new-project screen offers (amen jungle, dubstep, rage, jersey club, …).
 //!
-//! A vibe sets tempo, swing, key, a progression, a drum groove and a bass line, and leaves one
-//! track empty for the player's own melody. Everything is ordinary model data afterwards.
+//! A vibe sets tempo, swing, key and a progression, then builds its tracks from
+//! `assets/vibes.json` (the UI's browser mock reads the same file): a lead left empty for the
+//! player's own melody, a bass line on the chord roots, an optional chord part, and a drum
+//! pattern on its own kit. Every sound is a factory sound. Everything is ordinary model data
+//! afterwards.
 
 use crate::chord_track::ChordTrack;
 use crate::model::{tile_chords, KeyState, NoteEvent, ProjectModel, ScaleType, SongPattern, Track};
 use crate::theory::harmony;
+use crate::sound::DrumPad;
 use serde::{Deserialize, Serialize};
+use std::sync::OnceLock;
 
 const KICK: i32 = 36;
 const SNARE: i32 = 38;
@@ -107,27 +112,167 @@ impl Groove {
     }
 }
 
-/// A bass line that plays the root of the chord under each hit, in the G♯1–G2 range, on a
-/// per-bar rhythm of `(offset, length)` pairs. Hits in a chord gap are skipped.
-pub fn bass_line(chords: &ChordTrack, length: f64, bar: f64, rhythm: &[(f64, f64)]) -> Vec<NoteEvent> {
+/// One hit of a bass or chord part, repeated every bar: `[offset, length]`, plus an optional
+/// interval in semitones above the root for a bass hit (`[1.5, 0.5, 12]` is an octave pop).
+pub type PartHit = Vec<f64>;
+
+/// A bass line on the root of the chord under each hit, in the G♯1–G2 range (plus the hit's
+/// interval), on a per-bar rhythm. Hits in a chord gap are skipped.
+pub fn bass_line(chords: &ChordTrack, length: f64, bar: f64, rhythm: &[PartHit]) -> Vec<NoteEvent> {
+    per_bar(length, bar, rhythm, |i, start, len| {
+        let chord = chords.chord_at(start)?;
+        let pc = crate::theory::normalize(*chord.pitch_classes.first()?);
+        let interval = rhythm[i].get(2).copied().unwrap_or(0.0) as i32;
+        let pitch = 36 + pc - if pc >= 8 { 12 } else { 0 } + interval;
+        Some(vec![NoteEvent::new(start, len, pitch).with_velocity(if i == 0 { 105 } else { 92 })])
+    })
+}
+
+/// The chord under each hit, voiced close from its root upward: the root on the lowest pitch
+/// at or above `low`, every later chord tone stacked just above the one before.
+pub fn chord_part(chords: &ChordTrack, length: f64, bar: f64, low: i32, rhythm: &[PartHit]) -> Vec<NoteEvent> {
+    per_bar(length, bar, rhythm, |i, start, len| {
+        let chord = chords.chord_at(start)?;
+        let mut pitches: Vec<i32> = Vec::with_capacity(chord.pitch_classes.len());
+        for &pc in &chord.pitch_classes {
+            let below = pitches.last().map_or(low - 1, |&p| p);
+            pitches.push(below + 1 + (pc - below - 1).rem_euclid(12));
+        }
+        let velocity = if i == 0 { 92 } else { 80 };
+        Some(pitches.into_iter().map(|p| NoteEvent::new(start, len, p).with_velocity(velocity)).collect())
+    })
+}
+
+/// Run `hit(index, start, length)` for every rhythm hit of every bar inside `length`, clipping
+/// each note at the end.
+fn per_bar(length: f64, bar: f64, rhythm: &[PartHit], hit: impl Fn(usize, f64, f64) -> Option<Vec<NoteEvent>>) -> Vec<NoteEvent> {
     let mut notes = Vec::new();
     let mut bar_start = 0.0;
     while bar_start < length - 1e-9 {
-        for (i, &(offset, len)) in rhythm.iter().enumerate() {
+        for (i, h) in rhythm.iter().enumerate() {
+            let (Some(&offset), Some(&len)) = (h.first(), h.get(1)) else { continue };
             let start = bar_start + offset;
-            if start >= length - 1e-9 {
-                continue;
+            if start < length - 1e-9 {
+                notes.extend(hit(i, start, len.min(length - start)).unwrap_or_default());
             }
-            let Some(chord) = chords.chord_at(start) else { continue };
-            let Some(&root) = chord.pitch_classes.first() else { continue };
-            let pc = crate::theory::normalize(root);
-            let pitch = 36 + pc - if pc >= 8 { 12 } else { 0 };
-            let velocity = if i == 0 { 105 } else { 92 };
-            notes.push(NoteEvent::new(start, len.min(length - start), pitch).with_velocity(velocity));
         }
         bar_start += bar;
     }
     notes
+}
+
+/// One drum row of a vibe: a step string, one character per `step` beats (`X` accent, `x` hit,
+/// `o` ghost, anything else a rest; spaces are only for reading), repeated to fill the pattern.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DrumLane {
+    pub pitch: i32,
+    #[serde(default = "sixteenth")]
+    pub step: f64,
+    pub steps: String,
+}
+
+fn sixteenth() -> f64 {
+    0.25
+}
+
+impl DrumLane {
+    /// The lane's step characters, without the spaces.
+    pub fn cells(&self) -> Vec<char> {
+        self.steps.chars().filter(|c| !c.is_whitespace()).collect()
+    }
+
+    /// The hits in `length` beats.
+    pub fn hits(&self, length: f64) -> Vec<NoteEvent> {
+        let cells = self.cells();
+        let period = cells.len() as f64 * self.step;
+        let mut hits = Vec::new();
+        if period <= 0.0 {
+            return hits;
+        }
+        let mut at = 0.0;
+        while at < length - 1e-9 {
+            for (i, c) in cells.iter().enumerate() {
+                let velocity = match c {
+                    'X' => 120,
+                    'x' => 96,
+                    'o' => 64,
+                    _ => continue,
+                };
+                let start = at + i as f64 * self.step;
+                if start < length - 1e-9 {
+                    hits.push(NoteEvent::new(start, self.step.min(length - start), self.pitch).with_velocity(velocity));
+                }
+            }
+            at += period;
+        }
+        hits
+    }
+}
+
+/// What a vibe track plays.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "role", rename_all = "camelCase")]
+pub enum VibeRole {
+    /// Left empty for the player.
+    Lead,
+    Bass { rhythm: Vec<PartHit> },
+    Chords { low: i32, rhythm: Vec<PartHit> },
+    /// `kit` rows are `[pitch, sound, choke]`, top to bottom.
+    Drums { kit: Vec<(u8, String, u8)>, lanes: Vec<DrumLane> },
+}
+
+fn full_tone() -> f64 {
+    18_000.0
+}
+fn unity() -> f64 {
+    1.0
+}
+
+/// One track of a vibe and its bus settings.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VibeTrack {
+    pub name: String,
+    /// A factory synth id; drum tracks take their sounds from the kit instead.
+    #[serde(default)]
+    pub sound: Option<String>,
+    #[serde(default = "full_tone")]
+    pub tone: f64,
+    #[serde(default)]
+    pub reverb: f64,
+    #[serde(default = "unity")]
+    pub volume: f64,
+    #[serde(default)]
+    pub pan: f64,
+    #[serde(flatten)]
+    pub role: VibeRole,
+}
+
+/// A vibe as `assets/vibes.json` writes it.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VibeSpec {
+    pub id: String,
+    pub name: String,
+    pub blurb: String,
+    pub tempo: f64,
+    pub swing: f64,
+    pub swing_grid: f64,
+    pub root: i32,
+    pub scale: ScaleType,
+    pub degrees: Vec<i32>,
+    pub chord_beats: f64,
+    pub tracks: Vec<VibeTrack>,
+}
+
+const VIBES_JSON: &str = include_str!("../assets/vibes.json");
+
+/// Every vibe spec, in file order. Panics at first use if the bundled JSON is malformed (a test
+/// covers it).
+pub fn vibe_specs() -> &'static [VibeSpec] {
+    static SPECS: OnceLock<Vec<VibeSpec>> = OnceLock::new();
+    SPECS.get_or_init(|| serde_json::from_str(VIBES_JSON).expect("vibes.json is valid"))
 }
 
 /// What the new-project screen shows for a vibe.
@@ -141,156 +286,27 @@ pub struct VibeInfo {
     pub key: KeyState,
 }
 
-/// Voice, tone and reverb. The values match `SOUND_PRESETS` in `ui/src/types.ts`.
-#[derive(Clone, Copy)]
-struct Sound {
-    voice: &'static str,
-    tone: f64,
-    reverb: f64,
-}
-
-const SOFT_KEYS: Sound = Sound { voice: "triangle", tone: 6000.0, reverb: 0.25 };
-const WARM_PAD: Sound = Sound { voice: "pad", tone: 4000.0, reverb: 0.45 };
-const GLASS_PLUCK: Sound = Sound { voice: "pluck", tone: 12000.0, reverb: 0.3 };
-const BUZZY_BASS: Sound = Sound { voice: "saw", tone: 1200.0, reverb: 0.0 };
-const ROUND_BASS: Sound = Sound { voice: "sine", tone: 2000.0, reverb: 0.0 };
-const LEAD_WITH_BITE: Sound = Sound { voice: "square", tone: 9000.0, reverb: 0.15 };
-
-struct VibeSpec {
-    id: &'static str,
-    name: &'static str,
-    blurb: &'static str,
-    tempo: f64,
-    swing: f64,
-    swing_grid: f64,
-    root: i32,
-    scale: ScaleType,
-    degrees: &'static [i32],
-    chord_beats: f64,
-    groove: Groove,
-    bass_rhythm: &'static [(f64, f64)],
-    bass: Sound,
-    lead_name: &'static str,
-    lead: Sound,
-}
-
-const EIGHTHS: [(f64, f64); 8] = [(0.0, 0.45), (0.5, 0.45), (1.0, 0.45), (1.5, 0.45), (2.0, 0.45), (2.5, 0.45), (3.0, 0.45), (3.5, 0.45)];
-
-const VIBES: [VibeSpec; 5] = [
-    VibeSpec {
-        id: "lofi",
-        name: "lo-fi bedroom",
-        blurb: "dusty, swung and slow: jazzy chords, lazy drums, room for a melody",
-        tempo: 80.0,
-        swing: 60.0,
-        swing_grid: 0.25,
-        root: 5,
-        scale: ScaleType::Major,
-        degrees: &[1, 4, 0, 5],
-        chord_beats: 4.0,
-        groove: Groove::BoomBap,
-        bass_rhythm: &[(0.0, 1.25), (1.5, 1.5), (3.5, 0.5)],
-        bass: ROUND_BASS,
-        lead_name: "keys",
-        lead: SOFT_KEYS,
-    },
-    VibeSpec {
-        id: "postpunk",
-        name: "post-punk",
-        blurb: "fast, tense and driving: 8th-note bass, motorik drums, minor chords",
-        tempo: 148.0,
-        swing: 50.0,
-        swing_grid: 0.5,
-        root: 4,
-        scale: ScaleType::Minor,
-        degrees: &[0, 5, 2, 6],
-        chord_beats: 4.0,
-        groove: Groove::Motorik,
-        bass_rhythm: &EIGHTHS,
-        bass: BUZZY_BASS,
-        lead_name: "lead",
-        lead: LEAD_WITH_BITE,
-    },
-    VibeSpec {
-        id: "ambient",
-        name: "ambient texture",
-        blurb: "a slow two-chord drift: barely a beat, long notes, lots of space",
-        tempo: 70.0,
-        swing: 50.0,
-        swing_grid: 0.5,
-        root: 2,
-        scale: ScaleType::Major,
-        degrees: &[0, 3],
-        chord_beats: 8.0,
-        groove: Groove::Sparse,
-        bass_rhythm: &[(0.0, 4.0)],
-        bass: ROUND_BASS,
-        lead_name: "pad",
-        lead: WARM_PAD,
-    },
-    VibeSpec {
-        id: "songwriter",
-        name: "songwriter demo",
-        blurb: "four friendly chords and a plain beat to sing or play over",
-        tempo: 96.0,
-        swing: 50.0,
-        swing_grid: 0.5,
-        root: 7,
-        scale: ScaleType::Major,
-        degrees: &[0, 4, 5, 3],
-        chord_beats: 4.0,
-        groove: Groove::Backbeat,
-        bass_rhythm: &[(0.0, 2.0), (2.0, 2.0)],
-        bass: ROUND_BASS,
-        lead_name: "melody",
-        lead: GLASS_PLUCK,
-    },
-    VibeSpec {
-        id: "club",
-        name: "club loop",
-        blurb: "four-on-the-floor, offbeat bass and a minor loop that keeps going",
-        tempo: 124.0,
-        swing: 50.0,
-        swing_grid: 0.5,
-        root: 9,
-        scale: ScaleType::Minor,
-        degrees: &[0, 6, 5, 6],
-        chord_beats: 4.0,
-        groove: Groove::FourOnFloor,
-        bass_rhythm: &[(0.5, 0.4), (1.5, 0.4), (2.5, 0.4), (3.5, 0.4)],
-        bass: BUZZY_BASS,
-        lead_name: "lead",
-        lead: LEAD_WITH_BITE,
-    },
-];
-
 /// Every vibe, in the order the new-project screen lists them.
 pub fn vibes() -> Vec<VibeInfo> {
-    VIBES
+    vibe_specs()
         .iter()
         .map(|v| VibeInfo {
-            id: v.id.into(),
-            name: v.name.into(),
-            blurb: v.blurb.into(),
+            id: v.id.clone(),
+            name: v.name.clone(),
+            blurb: v.blurb.clone(),
             tempo: v.tempo,
             key: KeyState::locked(v.root, v.scale),
         })
         .collect()
 }
 
-fn apply_sound(track: &mut Track, sound: Sound) {
-    track.voice = sound.voice.into();
-    track.tone = sound.tone;
-    track.reverb_send = sound.reverb;
-}
-
 impl ProjectModel {
-    /// A new project from a vibe: the key locked, an empty lead track (selected first, for the
-    /// player's own melody), a bass line and a groove, each in its own 4-bar 4/4 pattern placed
-    /// from beat 0 to the end of a `song_bars`-bar song, with the progression tiled across it.
-    /// `None` for an unknown id.
+    /// A new project from a vibe: the key locked, then the vibe's tracks in order (the empty
+    /// lead first, so it is selected), each with one 4-bar 4/4 pattern placed from beat 0 to
+    /// the end of a `song_bars`-bar song, with the progression tiled across it. `None` for an
+    /// unknown id.
     pub fn from_vibe(id: &str, song_bars: u32) -> Option<Self> {
-        let v = VIBES.iter().find(|v| v.id == id)?;
+        let v = vibe_specs().iter().find(|v| v.id == id)?;
         let (length, bar) = (16.0, 4.0);
         let mut model = ProjectModel::empty();
         model.tempo = v.tempo;
@@ -298,28 +314,40 @@ impl ProjectModel {
         model.swing_grid = v.swing_grid;
         model.key = KeyState::locked(v.root, v.scale);
         model.song_length_beats = song_bars.max(1) as f64 * bar;
-        let progression = harmony::progression(v.degrees, v.root, v.scale, length, v.chord_beats);
+        let progression = harmony::progression(&v.degrees, v.root, v.scale, length, v.chord_beats);
         let chords = ChordTrack::new(progression.clone());
         model.chords = tile_chords(&progression, length, model.song_length_beats);
 
-        model.tracks[0].name = v.lead_name.into();
-        apply_sound(&mut model.tracks[0], v.lead);
-        model.patterns[0].name = format!("{} 1", v.lead_name);
-        model.patterns[0].length_beats = length;
-        let mut bass = Track::new("bass");
-        apply_sound(&mut bass, v.bass);
-        let drums = Track::drums("drums");
-
-        let mut bass_pattern = SongPattern::new(bass.id, "bass 1");
-        bass_pattern.length_beats = length;
-        bass_pattern.notes = bass_line(&chords, length, bar, v.bass_rhythm);
-        let mut groove = SongPattern::new(drums.id, "drums 1");
-        groove.length_beats = length;
-        groove.notes = v.groove.hits(length, bar);
-        model.tracks.push(bass);
-        model.tracks.push(drums);
-        model.patterns.push(bass_pattern);
-        model.patterns.push(groove);
+        model.tracks.clear();
+        model.patterns.clear();
+        for t in &v.tracks {
+            let mut track = match t.role {
+                VibeRole::Drums { .. } => Track::drums(t.name.as_str()),
+                _ => Track::new(t.name.as_str()),
+            };
+            if let Some(sound) = &t.sound {
+                track.voice = sound.clone();
+            }
+            track.tone = t.tone;
+            track.reverb_send = t.reverb;
+            track.volume = t.volume;
+            track.pan = t.pan;
+            let mut pattern = SongPattern::new(track.id, format!("{} 1", t.name));
+            pattern.length_beats = length;
+            pattern.notes = match &t.role {
+                VibeRole::Lead => vec![],
+                VibeRole::Bass { rhythm } => bass_line(&chords, length, bar, rhythm),
+                VibeRole::Chords { low, rhythm } => chord_part(&chords, length, bar, *low, rhythm),
+                VibeRole::Drums { kit, lanes } => {
+                    track.drum_pads = kit.iter().map(|(pitch, sound, choke)| DrumPad { pitch: *pitch, sound: sound.clone(), choke: *choke }).collect();
+                    let mut hits: Vec<NoteEvent> = lanes.iter().flat_map(|l| l.hits(length)).collect();
+                    hits.sort_by(|a, b| a.start_beat.total_cmp(&b.start_beat).then(a.pitch.cmp(&b.pitch)));
+                    hits
+                }
+            };
+            model.tracks.push(track);
+            model.patterns.push(pattern);
+        }
         model.place_every_pattern_across_the_song();
         Some(model)
     }

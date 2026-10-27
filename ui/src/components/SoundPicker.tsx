@@ -1,7 +1,9 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
+import { getBridge } from "../bridge";
 import { soundChoices, useStore } from "../store";
 import { lookupSound, type Sound } from "../sound";
+import { DRUM_PITCH } from "./sound/AuditionKeys";
 
 interface Group {
   key: string;
@@ -36,9 +38,33 @@ export function useSoundName(id: string): string {
 }
 
 /**
+ * Hear a sound before picking it, on the engine's preview channel (a drum on any pitch, a synth
+ * on middle C). Releasing the channel lets the last hit ring out.
+ */
+function usePreview() {
+  const timer = useRef(0);
+  useEffect(
+    () => () => {
+      window.clearTimeout(timer.current);
+      void getBridge().then((b) => b.previewSound(null));
+    },
+    [],
+  );
+  return useCallback((s: Sound) => {
+    window.clearTimeout(timer.current);
+    void getBridge().then(async (b) => {
+      await b.previewSound(s);
+      await b.previewNote(DRUM_PITCH, 100, true);
+    });
+    timer.current = window.setTimeout(() => void getBridge().then((b) => b.previewNote(DRUM_PITCH, 0, false)), 400);
+  }, []);
+}
+
+/**
  * Browse and pick a sound of one kind: a category row, a search field and a scrolling list.
  * `inline` fills its container (the devices box); otherwise a trigger opens it as a popover.
  * The picked Sound is handed over whole, so the caller can embed a user sound in the project.
+ * With `preview`, each row has a ▶ to hear it, and stepping through with ↑ ↓ plays each one.
  */
 export function SoundPicker({
   kind,
@@ -47,23 +73,37 @@ export function SoundPicker({
   inline = false,
   children,
   title,
+  triggerClass,
+  preview = false,
+  disabled = false,
 }: {
   kind: "synth" | "drum";
+  /** The current sound, marked in the list; empty when picking a new one. */
   value: string;
   onPick: (sound: Sound) => void;
   inline?: boolean;
   /** Trigger contents for the popover form; defaults to the current sound's name and a caret. */
   children?: ReactNode;
   title?: string;
+  /** Replaces the trigger's own look (e.g. a chip button). */
+  triggerClass?: string;
+  preview?: boolean;
+  disabled?: boolean;
 }) {
   const name = useSoundName(value);
   const [open, setOpen] = useState(false);
   const trigger = useRef<HTMLButtonElement>(null);
 
-  if (inline) return <SoundBrowser kind={kind} value={value} onPick={onPick} />;
+  if (inline) return <SoundBrowser kind={kind} value={value} onPick={onPick} preview={preview} />;
   return (
     <>
-      <button ref={trigger} className={`sp-trigger${open ? " open" : ""}${children ? " bare" : ""}`} title={title ?? "pick a sound"} onClick={() => setOpen((o) => !o)}>
+      <button
+        ref={trigger}
+        className={`${triggerClass ?? `sp-trigger${children ? " bare" : ""}`}${open ? " open" : ""}`}
+        title={title ?? "pick a sound"}
+        disabled={disabled}
+        onClick={() => setOpen((o) => !o)}
+      >
         {children ?? (
           <>
             <span className="sp-name">{name}</span>
@@ -77,6 +117,7 @@ export function SoundPicker({
             kind={kind}
             value={value}
             autoFocus
+            preview={preview}
             onClose={() => setOpen(false)}
             onPick={(s) => {
               setOpen(false);
@@ -132,8 +173,23 @@ function Popover({ anchor, onClose, children }: { anchor: HTMLElement; onClose: 
   );
 }
 
-function SoundBrowser({ kind, value, onPick, autoFocus = false, onClose }: { kind: "synth" | "drum"; value: string; onPick: (sound: Sound) => void; autoFocus?: boolean; onClose?: () => void }) {
+function SoundBrowser({
+  kind,
+  value,
+  onPick,
+  autoFocus = false,
+  preview = false,
+  onClose,
+}: {
+  kind: "synth" | "drum";
+  value: string;
+  onPick: (sound: Sound) => void;
+  autoFocus?: boolean;
+  preview?: boolean;
+  onClose?: () => void;
+}) {
   const groups = useSoundGroups(kind);
+  const play = usePreview();
   const [cat, setCat] = useState<string>("all");
   const [query, setQuery] = useState("");
   const [hi, setHi] = useState(-1);
@@ -161,7 +217,9 @@ function SoundBrowser({ kind, value, onPick, autoFocus = false, onClose }: { kin
     } else if (e.key === "ArrowDown" || e.key === "ArrowUp") {
       e.preventDefault();
       const d = e.key === "ArrowDown" ? 1 : -1;
-      setHi((h) => Math.max(0, Math.min(flat.length - 1, (h < 0 ? flat.findIndex((s) => s.id === value) : h) + d)));
+      const next = Math.max(0, Math.min(flat.length - 1, (hi < 0 ? flat.findIndex((s) => s.id === value) : hi) + d));
+      setHi(next);
+      if (preview && flat[next] && next !== hi) play(flat[next]);
     } else if (e.key === "Enter") {
       const s = flat[hi >= 0 ? hi : 0];
       if (s) onPick(s);
@@ -196,6 +254,19 @@ function SoundBrowser({ kind, value, onPick, autoFocus = false, onClose }: { kin
               const i = n++;
               return (
                 <div key={s.id} className={`sp-row${s.id === value ? " on" : ""}${i === hi ? " hi" : ""}`} onClick={() => onPick(s)} onPointerEnter={() => setHi(i)}>
+                  {preview && (
+                    <button
+                      className="sp-play"
+                      title={`hear ${s.name}`}
+                      aria-label={`hear ${s.name}`}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        play(s);
+                      }}
+                    >
+                      ▶
+                    </button>
+                  )}
                   <span className="sp-name">{s.name}</span>
                   {s.id === value && <span className="sp-meta">●</span>}
                 </div>

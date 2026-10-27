@@ -3,7 +3,8 @@ import "./sound.css";
 import { getBridge } from "../../bridge";
 import { pitchForKey } from "../../liveKeyboard";
 import { selectedTrack, useStore } from "../../store";
-import { FACTORY_SOUNDS, factorySound, filledPatch, isFactory, userSoundId, type DrumPad, type Sound } from "../../sound";
+import { addPad } from "../../drumKit";
+import { FACTORY_SOUNDS, factorySound, filledPatch, isFactory, MAX_DRUM_PADS, userSoundId, type DrumPad, type Sound } from "../../sound";
 import { historyOf, record, redo, seal, throttle, undo, type History } from "../../soundDesign";
 import { midiName } from "../../theory";
 import { keys } from "../../platform";
@@ -33,6 +34,8 @@ let kept: Session | null = null;
 const bodyOf = (s: Sound): Body => ({ name: s.name, category: s.category, patch: s.patch });
 const sessionFor = (s: Sound, origin: SoundSource): Session => ({ id: s.id, history: historyOf(bodyOf(s)), origin, saved: JSON.stringify(bodyOf(s)) });
 const VELOCITIES = [40, 70, 100, 127];
+/** The "use on" pad choice that adds the sound to the kit instead of replacing a pad. */
+const NEW_PAD = -1;
 
 /** Start on the selected track's sound (its first pad for a drum track). */
 function initialSession(): Session {
@@ -213,8 +216,11 @@ export function SoundPage() {
   const targets = model.tracks.filter((t) => t.isDrum === (kind === "drum"));
   const [targetId, setTargetId] = useState<string | null>(null);
   const target = targets.find((t) => t.id === targetId) ?? targets.find((t) => t.id === selected?.id) ?? targets[0] ?? null;
+  /** The pad the sound replaces, or NEW_PAD to add it to the kit. */
   const [padPitch, setPadPitch] = useState<number | null>(null);
   const pads = target?.isDrum ? target.drumPads : [];
+  const kitFull = pads.length >= MAX_DRUM_PADS;
+  const newPad = padPitch === NEW_PAD && !kitFull;
   const pad = pads.find((p) => p.pitch === padPitch) ?? pads.find((p) => p.sound === sess.id) ?? pads[0] ?? null;
   const padName = (p: DrumPad) => {
     const s = (model.sounds ?? []).find((x) => x.id === p.sound) ?? library.find((x) => x.id === p.sound) ?? factorySound(p.sound);
@@ -233,14 +239,18 @@ export function SoundPage() {
     }
     const st = useStore.getState();
     const track = st.snapshot?.model.tracks.find((t) => t.id === target.id);
-    if (!track || !pad) return;
-    const next = track.drumPads.map((p) => (p.pitch === pad.pitch ? { ...p, sound: s.id } : p));
+    if (!track || (!pad && !newPad)) return;
     // Every non-factory sound the kit now points at travels with the command.
     const pool = [s, ...st.library, ...(st.snapshot?.model.sounds ?? [])];
+    const next = newPad ? addPad(track.drumPads, s, (id) => pool.find((x) => x.id === id) ?? factorySound(id)) : track.drumPads.map((p) => (p.pitch === pad!.pitch ? { ...p, sound: s.id } : p));
+    if (!next) return showToast(`a kit holds up to ${MAX_DRUM_PADS} pads`, true);
     const ids = [...new Set(next.map((p) => p.sound).filter((id) => !isFactory(id)))];
     const sounds = ids.map((id) => pool.find((x) => x.id === id)).filter((x): x is Sound => !!x);
-    await dispatch({ type: "setDrumPads", id: track.id, pads: next, sounds }, false, `pad sound: ${s.name}`);
-    showToast(`“${s.name}” is on pad ${midiName(pad.pitch)} of ${track.name}`);
+    await dispatch({ type: "setDrumPads", id: track.id, pads: next, sounds }, false, newPad ? `add pad: ${s.name}` : `pad sound: ${s.name}`);
+    const pitch = newPad ? next[0].pitch : pad!.pitch;
+    // The new pad is now the one this sound is on; another "use" replaces it, not adds again.
+    if (newPad) setPadPitch(pitch);
+    showToast(newPad ? `“${s.name}” is on a new pad (${midiName(pitch)}) of ${track.name}` : `“${s.name}” is on pad ${midiName(pitch)} of ${track.name}`);
   };
 
   // ─── Randomize / mutate ───────────────────────────────────────────────────────────────────
@@ -337,16 +347,19 @@ export function SoundPage() {
                 ))}
               </select>
               {kind === "drum" && pad && (
-                <select value={pad.pitch} onChange={(e) => setPadPitch(Number(e.target.value))} aria-label="pad to replace" title="the pad this sound replaces">
+                <select value={newPad ? NEW_PAD : pad.pitch} onChange={(e) => setPadPitch(Number(e.target.value))} aria-label="pad to replace" title="the pad this sound replaces, or a new pad for it">
                   {pads.map((p) => (
                     <option key={p.pitch} value={p.pitch}>
                       {padName(p)}
                     </option>
                   ))}
+                  <option value={NEW_PAD} disabled={kitFull}>
+                    {kitFull ? `kit full (${MAX_DRUM_PADS} pads)` : "+ new pad"}
+                  </option>
                 </select>
               )}
               <button className="solid" onClick={() => void useOnTrack()} disabled={!target} title={dirty || (!factory && !inLibrary && sess.origin !== "project") ? "saves the sound first, then puts it on the track" : "put this sound on the track"}>
-                {kind === "drum" ? "use on pad" : `use on ${target?.name ?? "track"}`}
+                {kind === "drum" ? (newPad ? "add to kit" : "use on pad") : `use on ${target?.name ?? "track"}`}
               </button>
             </>
           )}

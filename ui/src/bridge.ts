@@ -32,6 +32,7 @@ import type {
 import { beatsPerBar, uuid, withDefaults } from "./types";
 import { defaultKit, filledSound, isFactory, lookupSound, MAX_DRUM_PADS, type Sound } from "./sound";
 import { chordAt, normalize, progression } from "./theory";
+import vibesJson from "../../crates/dissonant-core/assets/vibes.json";
 
 export interface Bridge {
   readonly isTauri: boolean;
@@ -377,79 +378,123 @@ function grooveHits(groove: Groove): NoteEvent[] {
   return hits.sort((a, b) => a.startBeat - b.startBeat || a.pitch - b.pitch);
 }
 
-/** `vibes::bass_line` over 16 beats of 4/4: the chord root under each hit, G♯1–G2. */
-function bassLine(chords: ChordEvent[], rhythm: [number, number][]): NoteEvent[] {
+/** One hit of a bass or chord part, every bar: `[offset, length, interval?]`. */
+type PartHit = number[];
+/** `vibes::DrumLane`: a step string, one character per `step` beats (X accent, x hit, o ghost). */
+interface DrumLane {
+  pitch: number;
+  step?: number;
+  steps: string;
+}
+/** `vibes::VibeTrack`. */
+type VibeTrackSpec = { name: string; sound?: string; tone?: number; reverb?: number; volume?: number; pan?: number } & (
+  | { role: "lead" }
+  | { role: "bass"; rhythm: PartHit[] }
+  | { role: "chords"; low: number; rhythm: PartHit[] }
+  | { role: "drums"; kit: [number, string, number][]; lanes: DrumLane[] }
+);
+/** `vibes::VibeSpec`. */
+interface VibeSpec {
+  id: string;
+  name: string;
+  blurb: string;
+  tempo: number;
+  swing: number;
+  swingGrid: number;
+  root: number;
+  scale: ScaleType;
+  degrees: number[];
+  chordBeats: number;
+  tracks: VibeTrackSpec[];
+}
+
+/** The same `assets/vibes.json` `ProjectModel::from_vibe` builds from. */
+const VIBE_SPECS = vibesJson as unknown as VibeSpec[];
+
+const lockedKey = (rootPitchClass: number, scale: ScaleType): KeyState => ({ rootPitchClass, scale, isLocked: true });
+const mod12 = (x: number) => ((x % 12) + 12) % 12;
+
+/** `vibes::per_bar` over 16 beats of 4/4: every rhythm hit of every bar, clipped at the end. */
+function perBar(rhythm: PartHit[], hit: (i: number, start: number, len: number) => NoteEvent[]): NoteEvent[] {
   const notes: NoteEvent[] = [];
   for (let bar = 0; bar < 16; bar += 4) {
     rhythm.forEach(([offset, len], i) => {
       const start = bar + offset;
-      const chord = chordAt(chords, start);
-      if (!chord || !chord.pitchClasses.length) return;
-      const pc = normalize(chord.pitchClasses[0]);
-      notes.push({ id: uuid(), startBeat: start, lengthBeats: Math.min(len, 16 - start), pitch: 36 + pc - (pc >= 8 ? 12 : 0), velocity: i === 0 ? 105 : 92 });
+      if (start < 16 - 1e-9) notes.push(...hit(i, start, Math.min(len, 16 - start)));
     });
   }
   return notes;
 }
 
-type VibeSound = [voice: string, tone: number, reverb: number];
-const SOUND: Record<string, VibeSound> = {
-  softKeys: ["triangle", 6000, 0.25],
-  warmPad: ["pad", 4000, 0.45],
-  glassPluck: ["pluck", 12000, 0.3],
-  buzzyBass: ["saw", 1200, 0],
-  roundBass: ["sine", 2000, 0],
-  leadWithBite: ["square", 9000, 0.15],
-};
-
-interface MockVibe extends VibeInfo {
-  swing: number;
-  swingGrid: number;
-  degrees: number[];
-  chordBeats: number;
-  groove: Groove;
-  bass: [number, number][];
-  bassSound: VibeSound;
-  leadName: string;
-  leadSound: VibeSound;
+/** `vibes::bass_line`: the chord root under each hit, G♯1–G2, plus the hit's interval. */
+function bassLine(chords: ChordEvent[], rhythm: PartHit[]): NoteEvent[] {
+  return perBar(rhythm, (i, start, len) => {
+    const chord = chordAt(chords, start);
+    if (!chord || !chord.pitchClasses.length) return [];
+    const pc = normalize(chord.pitchClasses[0]);
+    const pitch = 36 + pc - (pc >= 8 ? 12 : 0) + (rhythm[i][2] ?? 0);
+    return [{ id: uuid(), startBeat: start, lengthBeats: len, pitch, velocity: i === 0 ? 105 : 92 }];
+  });
 }
 
-const lockedKey = (rootPitchClass: number, scale: ScaleType): KeyState => ({ rootPitchClass, scale, isLocked: true });
-const EIGHTH_BASS: [number, number][] = Array.from({ length: 8 }, (_, i) => [i * 0.5, 0.45]);
+/** `vibes::chord_part`: the chord voiced close from its root, the root at or above `low`. */
+function chordPart(chords: ChordEvent[], low: number, rhythm: PartHit[]): NoteEvent[] {
+  return perBar(rhythm, (i, start, len) => {
+    const chord = chordAt(chords, start);
+    if (!chord) return [];
+    let below = low - 1;
+    return chord.pitchClasses.map((pc) => {
+      below = below + 1 + mod12(pc - below - 1);
+      return { id: uuid(), startBeat: start, lengthBeats: len, pitch: below, velocity: i === 0 ? 92 : 80 };
+    });
+  });
+}
 
-/** `VIBES` in vibes.rs. `bridge.test.ts` pins the same values `vibe_values_shared_with_the_ui` does. */
-const MOCK_VIBES: MockVibe[] = [
-  { id: "lofi", name: "lo-fi bedroom", blurb: "dusty, swung and slow: jazzy chords, lazy drums, room for a melody", tempo: 80, key: lockedKey(5, "major"), swing: 60, swingGrid: 0.25, degrees: [1, 4, 0, 5], chordBeats: 4, groove: "boomBap", bass: [[0, 1.25], [1.5, 1.5], [3.5, 0.5]], bassSound: SOUND.roundBass, leadName: "keys", leadSound: SOUND.softKeys },
-  { id: "postpunk", name: "post-punk", blurb: "fast, tense and driving: 8th-note bass, motorik drums, minor chords", tempo: 148, key: lockedKey(4, "minor"), swing: 50, swingGrid: 0.5, degrees: [0, 5, 2, 6], chordBeats: 4, groove: "motorik", bass: EIGHTH_BASS, bassSound: SOUND.buzzyBass, leadName: "lead", leadSound: SOUND.leadWithBite },
-  { id: "ambient", name: "ambient texture", blurb: "a slow two-chord drift: barely a beat, long notes, lots of space", tempo: 70, key: lockedKey(2, "major"), swing: 50, swingGrid: 0.5, degrees: [0, 3], chordBeats: 8, groove: "sparse", bass: [[0, 4]], bassSound: SOUND.roundBass, leadName: "pad", leadSound: SOUND.warmPad },
-  { id: "songwriter", name: "songwriter demo", blurb: "four friendly chords and a plain beat to sing or play over", tempo: 96, key: lockedKey(7, "major"), swing: 50, swingGrid: 0.5, degrees: [0, 4, 5, 3], chordBeats: 4, groove: "backbeat", bass: [[0, 2], [2, 2]], bassSound: SOUND.roundBass, leadName: "melody", leadSound: SOUND.glassPluck },
-  { id: "club", name: "club loop", blurb: "four-on-the-floor, offbeat bass and a minor loop that keeps going", tempo: 124, key: lockedKey(9, "minor"), swing: 50, swingGrid: 0.5, degrees: [0, 6, 5, 6], chordBeats: 4, groove: "fourOnFloor", bass: [[0.5, 0.4], [1.5, 0.4], [2.5, 0.4], [3.5, 0.4]], bassSound: SOUND.buzzyBass, leadName: "lead", leadSound: SOUND.leadWithBite },
-];
-
-const withSound = (t: Track, [voice, tone, reverb]: VibeSound): Track => ({ ...t, voice, tone, reverbSend: reverb });
+/** `DrumLane::hits(16.0)`. */
+function laneHits(lane: DrumLane): NoteEvent[] {
+  const cells = [...lane.steps].filter((c) => !/\s/.test(c));
+  const step = lane.step ?? 0.25;
+  const period = cells.length * step;
+  const velocities: Record<string, number> = { X: 120, x: 96, o: 64 };
+  const hits: NoteEvent[] = [];
+  if (period <= 0) return hits;
+  for (let at = 0; at < 16 - 1e-9; at += period) {
+    cells.forEach((c, i) => {
+      const start = at + i * step;
+      if (velocities[c] && start < 16 - 1e-9) hits.push({ id: uuid(), startBeat: start, lengthBeats: Math.min(step, 16 - start), pitch: lane.pitch, velocity: velocities[c] });
+    });
+  }
+  return hits;
+}
 
 /**
- * `ProjectModel::from_vibe`: one pattern per track ("keys 1", "bass 1", "drums 1"), the
- * progression tiled across the whole song, one clip per track from 0 to the song end.
+ * `ProjectModel::from_vibe`: the vibe's tracks in order (the empty lead first), one pattern
+ * each ("bells 1", "reese 1", …), the progression tiled across the whole song, one clip per
+ * track from 0 to the song end.
  */
 function vibeModel(id: string, songBars = defaultSongBars()): ProjectModel | null {
-  const v = MOCK_VIBES.find((x) => x.id === id);
+  const v = VIBE_SPECS.find((x) => x.id === id);
   if (!v) return null;
   const m = emptyModel(songBars);
   m.tempo = v.tempo;
   m.swing = v.swing;
   m.swingGrid = v.swingGrid;
-  m.key = { ...v.key };
-  m.chords = progression(v.degrees, v.key.rootPitchClass!, v.key.scale, m.songLengthBeats, v.chordBeats);
-  const lead = withSound({ ...m.tracks[0], name: v.leadName }, v.leadSound);
-  const bass = withSound(newTrack(false, "bass"), v.bassSound);
-  const drums = newTrack(true, "drums");
-  m.tracks = [lead, bass, drums];
-  m.patterns = [
-    newPattern(lead.id, `${lead.name} 1`),
-    { ...newPattern(bass.id, "bass 1"), notes: bassLine(m.chords, v.bass) },
-    { ...newPattern(drums.id, "drums 1"), notes: grooveHits(v.groove) },
-  ];
+  m.key = lockedKey(v.root, v.scale);
+  m.chords = progression(v.degrees, v.root, v.scale, m.songLengthBeats, v.chordBeats);
+  m.tracks = [];
+  m.patterns = [];
+  for (const t of v.tracks) {
+    const track: Track = { ...newTrack(t.role === "drums", t.name), voice: t.sound ?? "saw", tone: t.tone ?? 18000, reverbSend: t.reverb ?? 0, volume: t.volume ?? 1, pan: t.pan ?? 0 };
+    let notes: NoteEvent[] = [];
+    if (t.role === "bass") notes = bassLine(m.chords, t.rhythm);
+    else if (t.role === "chords") notes = chordPart(m.chords, t.low, t.rhythm);
+    else if (t.role === "drums") {
+      track.drumPads = t.kit.map(([pitch, sound, choke]) => ({ pitch, sound, choke }));
+      notes = t.lanes.flatMap(laneHits).sort((a, b) => a.startBeat - b.startBeat || a.pitch - b.pitch);
+    }
+    m.tracks.push(track);
+    m.patterns.push({ ...newPattern(track.id, `${t.name} 1`), notes });
+  }
   m.clips = m.patterns.map((p) => songClip(p.id, m.songLengthBeats));
   return m;
 }
@@ -1209,7 +1254,7 @@ function mockBridge(): Bridge {
       delete all[name];
       localStorage.setItem(TEMPLATES_KEY, JSON.stringify(all));
     },
-    listVibes: async () => MOCK_VIBES.map(({ id, name, blurb, tempo, key }) => ({ id, name, blurb, tempo, key: { ...key } })),
+    listVibes: async () => VIBE_SPECS.map(({ id, name, blurb, tempo, root, scale }) => ({ id, name, blurb, tempo, key: lockedKey(root, scale) })),
     newFromVibe: async (id) => {
       replace(vibeModel(id) ?? fail(`no vibe called ${id}`), null);
       return snapshot();

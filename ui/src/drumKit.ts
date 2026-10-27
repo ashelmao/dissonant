@@ -1,38 +1,10 @@
 // Pure edits on a drum track's kit (`Track.drumPads`, top to bottom). Every edit returns a new
 // list; the caller dispatches it whole with `setDrumPads`, so the core always sees a full kit.
 
-import { FACTORY_SOUNDS, isFactory, lookupSound, MAX_DRUM_PADS, type DrumPad, type Sound } from "./sound";
+import { factorySound, isFactory, lookupSound, MAX_DRUM_PADS, type DrumPad, type Sound } from "./sound";
 
 /** Free pitches tried first when adding a pad: the General MIDI kit, most common first. */
 const GM_ORDER = [36, 38, 42, 46, 39, 49, 45, 50, 37, 40, 41, 43, 44, 47, 48, 51, 52, 53, 54, 55, 56, 57, 59, 35];
-
-/** Factory sound ids that fit a GM pitch, best first (only ones that exist are used). */
-const GM_SOUNDS: Record<number, string[]> = {
-  35: ["kick"],
-  36: ["kick"],
-  37: ["rim", "clap"],
-  38: ["snare"],
-  39: ["clap"],
-  40: ["snare"],
-  41: ["tom-lo"],
-  42: ["hat"],
-  43: ["tom-lo"],
-  44: ["hat"],
-  45: ["tom-lo"],
-  46: ["open-hat"],
-  47: ["tom-mid", "tom-lo"],
-  48: ["tom-mid", "tom-hi"],
-  49: ["crash"],
-  50: ["tom-hi"],
-  51: ["ride", "crash"],
-  52: ["china", "crash"],
-  53: ["ride-bell", "ride", "crash"],
-  54: ["tambourine", "hat"],
-  55: ["splash", "crash"],
-  56: ["cowbell"],
-  57: ["crash"],
-  59: ["ride", "crash"],
-};
 
 /** The first unused pitch (GM kit order, then up from 36, then down), or null when 0–127 is full. */
 export function nextFreePitch(pads: DrumPad[]): number | null {
@@ -43,19 +15,64 @@ export function nextFreePitch(pads: DrumPad[]): number | null {
   return null;
 }
 
-/** A sensible factory drum sound for a pitch: its GM instrument when the factory has one. */
-export function defaultSoundFor(pitch: number, factory: Sound[] = FACTORY_SOUNDS): string {
-  const drums = factory.filter((s) => s.patch.kind === "drum");
-  const hit = (GM_SOUNDS[pitch] ?? []).find((id) => drums.some((s) => s.id === id));
-  return hit ?? drums.find((s) => s.id === "kick")?.id ?? drums[0]?.id ?? "kick";
+/** GM pitches for a kind of drum, best first; matched against a sound's id, name and category. */
+const GM_ROLES: [RegExp, number[]][] = [
+  [/open/, [46]],
+  [/pedal/, [44, 42]],
+  [/hat|\bhh\b/, [42, 44]],
+  [/kick|\bbd\b/, [36, 35]],
+  [/rim|stick/, [37]],
+  [/snare|\bsd\b/, [38, 40]],
+  [/clap|snap/, [39]],
+  [/cowbell/, [56]],
+  [/bell/, [53]],
+  [/ride/, [51, 59]],
+  [/china/, [52]],
+  [/splash/, [55]],
+  [/crash|cym/, [49, 57]],
+  [/floor/, [41, 43]],
+  [/tom.*(hi|high)/, [50, 48]],
+  [/tom.*mid/, [47, 48]],
+  [/tom/, [45, 43, 41, 47]],
+  [/tambourine/, [54]],
+  [/bongo/, [60, 61]],
+  [/conga.*(lo|low)/, [64]],
+  [/conga/, [62, 63]],
+  [/clave/, [75]],
+  [/block/, [76, 77]],
+  [/shaker|maraca/, [70]],
+];
+
+/** The GM pitches a sound would sit on in a standard kit, best first; empty when it's no GM drum. */
+export function gmPitchesFor(sound: Pick<Sound, "id" | "name" | "category">): number[] {
+  const text = `${sound.id} ${sound.name} ${sound.category}`.toLowerCase();
+  return GM_ROLES.find(([re]) => re.test(text))?.[1] ?? [];
 }
 
-/** A new pad on top of the kit (the kick conventionally sits at the bottom), or null when full. */
-export function addPad(pads: DrumPad[], factory: Sound[] = FACTORY_SOUNDS): DrumPad[] | null {
+const isHat = (s: Pick<Sound, "id" | "name" | "category"> | undefined) => !!s && /hat|\bhh\b/.test(`${s.id} ${s.name} ${s.category}`.toLowerCase());
+
+/**
+ * `sound` as a new pad on top of the kit (the kick conventionally sits at the bottom), on the
+ * GM pitch that fits it when free, else the next free one; null when the kit is full. A hat
+ * joins the kit's other hats in one choke group, so the open hat stops when the closed one plays.
+ * `lookup` names the sounds already on the kit (to find its hats).
+ */
+export function addPad(pads: DrumPad[], sound: Sound, lookup: (id: string) => Sound | undefined = factorySound): DrumPad[] | null {
   if (pads.length >= MAX_DRUM_PADS) return null;
-  const pitch = nextFreePitch(pads);
+  const used = new Set(pads.map((p) => p.pitch));
+  const pitch = gmPitchesFor(sound).find((p) => !used.has(p)) ?? nextFreePitch(pads);
   if (pitch === null) return null;
-  return [{ pitch, sound: defaultSoundFor(pitch, factory), choke: 0 }, ...pads];
+  let choke = 0;
+  let rest = pads;
+  if (isHat(sound)) {
+    const hats = pads.filter((p) => isHat(lookup(p.sound)));
+    if (hats.length) {
+      const groups = new Set(pads.map((p) => p.choke));
+      choke = hats.find((p) => p.choke > 0)?.choke ?? Array.from({ length: 64 }, (_, i) => i + 1).find((g) => !groups.has(g)) ?? 1;
+      rest = pads.map((p) => (p.choke === 0 && hats.includes(p) ? { ...p, choke } : p));
+    }
+  }
+  return [{ pitch, sound: sound.id, choke }, ...rest];
 }
 
 /** Without pad `index`; a kit never drops below one pad (returns null then). */

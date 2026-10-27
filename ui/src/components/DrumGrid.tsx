@@ -4,9 +4,11 @@ import { padName } from "../drumKit";
 import { trackColor, type NoteEvent, uuid } from "../types";
 import { tileGhost } from "../noteEditing";
 import { BASE_BEAT_W } from "./ChordLane";
+import { AddPadPicker, SwapPadPicker } from "./AddPadPicker";
 
 /** Step sequencer for a drum track, aligned to the chord lane: one row per kit pad, top to
- *  bottom. Left-click/drag adds hits, right-click/drag removes; click a row name to hear the pad.
+ *  bottom. Left-click/drag adds hits, right-click/drag removes; click a row name to hear the pad,
+ *  ▾ beside it to swap its sound (the hits stay); "+ add sound" under the rows grows the kit.
  *  Hits are ordinary notes (pitch = pad pitch); hits on pitches the kit has no pad for aren't
  *  drawn. A ghost pattern shows as outlined steps (another drum pattern) or an onset row (a
  *  melodic one). */
@@ -92,8 +94,13 @@ export function DrumGrid() {
       )}
       {track.drumPads.map((drum) => (
         <div className="drumrow" key={drum.pitch}>
-          <span className="dname" title={`pitch ${drum.pitch} · click to hear`} onClick={() => audition(drum.pitch)}>
-            {padName(projectSounds ?? [], drum)}
+          <span className="dname">
+            <span className="dlabel" title={`pitch ${drum.pitch} · click to hear`} onClick={() => audition(drum.pitch)}>
+              {padName(projectSounds ?? [], drum)}
+            </span>
+            <SwapPadPicker track={track} pitch={drum.pitch} className="dswap">
+              ▾
+            </SwapPadPicker>
           </span>
           <div className="drumcells">
             {Array.from({ length: steps }, (_, step) => {
@@ -117,6 +124,11 @@ export function DrumGrid() {
           </div>
         </div>
       ))}
+      <div className="drumrow addrow">
+        <AddPadPicker track={track} className="dname dadd">
+          + add sound
+        </AddPadPicker>
+      </div>
       {notes.length === 0 && <div className="help emptyline">no hits yet: click a step to add one. kick on 1 and 3, snare on 2 and 4 is a fine place to start.</div>}
       <div className="help">left-click / drag: add hits · right-click / drag: remove · step {stepBeats === 0.5 ? "1/8" : stepBeats === 0.25 ? "1/16" : "1/32"} follows snap</div>
     </div>

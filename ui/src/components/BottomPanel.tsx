@@ -1,11 +1,12 @@
 import { useEffect, useRef, useState } from "react";
 import { dbText, selectedPattern, selectedTrack, selectedTrackIndex, useStore } from "../store";
-import { addPad, kitSounds, movePad, padName, pitchProblem, removePad, replacePad } from "../drumKit";
+import { kitSounds, movePad, padName, pitchProblem, removePad, replacePad } from "../drumKit";
 import { lookupSound, MAX_DRUM_PADS, type DrumPad, type Sound } from "../sound";
 import { midiName } from "../theory";
 import { trackColor, type MasterSettings, type Track, type TrackParam } from "../types";
 import { eqDb, hz, Knob, lin, log, panText, pct } from "./Knob";
 import { VMeter } from "./Meter";
+import { AddPadPicker } from "./AddPadPicker";
 import { SoundPicker, useSoundName } from "./SoundPicker";
 
 const VOL = lin(0, 1.5);
@@ -181,7 +182,7 @@ function DrumKitDevice({ track }: { track: Track }) {
                 <button className="kname" onClick={() => audition(p.pitch)} title={`${name} · ${midiName(p.pitch)} · click to hear`}>
                   {name}
                 </button>
-                <SoundPicker kind="drum" value={p.sound} onPick={(s) => setKit(replacePad(pads, i, { sound: s.id }), `pad sound: ${s.name}`, undefined, [s])} title="change this pad's sound">
+                <SoundPicker kind="drum" value={p.sound} preview onPick={(s) => setKit(replacePad(pads, i, { sound: s.id }), `pad sound: ${s.name}`, undefined, [s])} title="change this pad's sound">
                   <span className="sp-caret">▾</span>
                 </SoundPicker>
                 <select className="kchoke" value={p.choke} onChange={(e) => setKit(replacePad(pads, i, { choke: Number(e.target.value) }), "pad choke")} title="choke group: pads sharing one cut each other off">
@@ -208,9 +209,9 @@ function DrumKitDevice({ track }: { track: Track }) {
           })}
         </div>
         <div className="row">
-          <button className="chip tiny" disabled={pads.length >= MAX_DRUM_PADS} onClick={() => setKit(addPad(pads), "add pad", `a kit holds up to ${MAX_DRUM_PADS} pads`)} title="a new pad on top, on the next free General MIDI drum pitch">
-            + add pad
-          </button>
+          <AddPadPicker track={track} className="chip tiny">
+            + add sound
+          </AddPadPicker>
           <span className="spacer" />
           <button className="chip tiny" onClick={() => setMode("sound")} title="open the SOUND page to design drum sounds">edit sounds ↗</button>
         </div>

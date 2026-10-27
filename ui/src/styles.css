@@ -3624,6 +3624,77 @@ button.linkish {
 .drumrow.ghostrow .dname {
   cursor: default;
 }
+/* A pad row's name hears the pad; the ▾ beside it swaps the pad's sound. */
+.drumrow .dname .dlabel {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  text-align: right;
+}
+.drumrow .dname .dswap {
+  flex: none;
+  width: 12px;
+  height: 18px;
+  margin-left: 2px;
+  margin-right: -4px;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 2px;
+  font-size: 8px;
+  color: var(--text-5);
+  cursor: pointer;
+}
+.drumrow .dname:hover .dswap {
+  color: var(--text-3);
+}
+.drumrow .dname .dswap:hover,
+.drumrow .dname .dswap.open {
+  color: var(--accent);
+  border-color: var(--line-3);
+}
+/* Under the pads: "+ add sound" opens the drum picker. */
+.drumrow.addrow {
+  height: 24px;
+  border-bottom: none;
+}
+.drumrow .dname.dadd {
+  border: none;
+  border-right: 1px solid var(--line-1);
+  border-radius: 0;
+  letter-spacing: 0;
+  text-transform: none;
+  color: var(--text-4);
+}
+.drumrow .dname.dadd:hover,
+.drumrow .dname.dadd.open {
+  color: var(--accent);
+}
+.drumrow .dname.dadd:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+/* ▶ hears a sound in the picker before it's picked. */
+.sp-row .sp-play {
+  flex: none;
+  width: 14px;
+  height: 14px;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: none;
+  font-size: 7px;
+  color: var(--text-4);
+}
+.sp-row .sp-play:hover {
+  color: var(--accent);
+}
 .drumgrid.dense .drumrow:not(.ghostrow) {
   height: 24px;
 }

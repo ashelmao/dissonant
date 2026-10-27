@@ -911,17 +911,19 @@ describe("vibes (ProjectModel::from_vibe)", () => {
       expect(m.clips.map((c) => [c.patternId, c.startBeat, c.lengthBeats])).toEqual(m.patterns.map((p) => [p.id, 0, m.songLengthBeats]));
       // The progression is tiled across the whole song; the first 16 beats name one pass.
       expect(m.chords.at(-1)!.startBeat + m.chords.at(-1)!.lengthBeats).toBe(m.songLengthBeats);
-      const count = (track: number, pitch?: number) => m.patterns[track].notes.filter((n) => pitch === undefined || n.pitch === pitch).length;
+      const pitchSum = m.patterns.flatMap((p) => p.notes).reduce((sum, n) => sum + n.pitch, 0);
       described.push(
-        `${info.id}|${info.tempo}|${m.swing}|${m.tracks.map((t) => t.name).join(",")}|${m.chords.filter((c) => c.startBeat < 16).map((c) => c.name).join(" ")}|${m.tracks[0].voice}|kick ${count(2, 36)}|bass ${count(1)}|${count(2)}`,
+        `${info.id}|${info.tempo}|${m.swing}|${m.tracks.map((t) => t.name).join(",")}|${m.chords.filter((c) => c.startBeat < 16).map((c) => c.name).join(" ")}|${m.tracks[0].voice}|${m.patterns.map((p) => p.notes.length).join(",")}|${pitchSum}`,
       );
     }
     expect(described).toEqual([
-      "lofi|80|60|keys,bass,drums|Gm C F Dm|triangle|kick 12|bass 12|52",
-      "postpunk|148|50|lead,bass,drums|Em C G D|square|kick 12|bass 32|52",
-      "ambient|70|50|pad,bass,drums|D G|pad|kick 4|bass 4|8",
-      "songwriter|96|50|melody,bass,drums|G D Em C|pluck|kick 8|bass 8|48",
-      "club|124|50|lead,bass,drums|Am G F G|square|kick 16|bass 16|40",
+      "jungle|172|50|bells,reese,pad,amen|Fm C# A#m Cm|fm-bell|0,12,12,67|4194",
+      "dubstep|140|50|lead,wobble,pad,drums|Dm A# C Am|screamer-lead|0,24,12,62|4195",
+      "blownout|138|54|voice,bass,stabs,machine|Em F#dim Em D|robot|0,24,36,90|7149",
+      "rage|160|50|synth,808,chords,drums|C#m A B A|rage-lead|0,16,12,72|4273",
+      "jersey|140|50|melody,sub,keys,drums|Am F C G|bright-pluck|0,20,36,81|6657",
+      "hyperpop|160|50|lead,808,synths,drums|A B C#m E|chip-lead|0,16,60,108|9080",
+      "pluggnb|150|50|flute,808,keys,drums|F# Fm A#m G#|whistle-lead|0,8,24,59|4319",
     ]);
   });
 

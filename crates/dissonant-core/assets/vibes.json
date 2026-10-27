@@ -1,0 +1,134 @@
+[
+  {
+    "id": "jungle", "name": "amen jungle", "blurb": "rolling amen breaks at 172, a reese underneath and dark minor chords",
+    "tempo": 172, "swing": 50, "swingGrid": 0.25, "root": 5, "scale": "minor", "degrees": [0, 5, 3, 4], "chordBeats": 4,
+    "tracks": [
+      { "role": "lead", "name": "bells", "sound": "fm-bell", "reverb": 0.3, "volume": 0.8 },
+      { "role": "bass", "name": "reese", "sound": "reese-bass", "volume": 1.5, "rhythm": [[0, 2.5], [2.75, 0.5, 12], [3.5, 0.5]] },
+      { "role": "chords", "name": "pad", "sound": "dark-pad", "reverb": 0.35, "volume": 0.9, "low": 53, "rhythm": [[0, 4]] },
+      { "role": "drums", "name": "amen", "volume": 0.55,
+        "kit": [[49, "crash", 0], [51, "amen-ride", 0], [46, "open-hat", 1], [42, "hat", 1], [40, "amen-ghost", 0], [38, "amen-snare", 0], [36, "amen-kick", 0]],
+        "lanes": [
+          { "pitch": 51, "steps": "x.o.x.o.x.o.x.o." },
+          { "pitch": 36, "steps": "X.X.......Xx.... X.X.......Xx.... X.X.......X..... ..XX......X....." },
+          { "pitch": 38, "steps": "....X.......X... ....X.......X... ....X.......x... .o..X..o......o." },
+          { "pitch": 40, "steps": ".......o.o.....o .......o.o.....o .......o.o....o. .........o......" },
+          { "pitch": 49, "steps": "................ ................ ................ ..........X....." }
+        ] }
+    ]
+  },
+  {
+    "id": "dubstep", "name": "dubstep", "blurb": "140 half-time: a kick on one, a huge snare on three, a wobble bass that talks",
+    "tempo": 140, "swing": 50, "swingGrid": 0.25, "root": 2, "scale": "minor", "degrees": [0, 5, 6, 4], "chordBeats": 4,
+    "tracks": [
+      { "role": "lead", "name": "lead", "sound": "screamer-lead", "reverb": 0.15, "volume": 0.7 },
+      { "role": "bass", "name": "wobble", "sound": "wobble-bass", "volume": 1.5, "rhythm": [[0, 0.75], [1, 0.5], [1.5, 0.25, 12], [2.5, 0.75], [3.25, 0.25, 12], [3.5, 0.5]] },
+      { "role": "chords", "name": "pad", "sound": "dark-pad", "reverb": 0.4, "volume": 0.8, "low": 50, "rhythm": [[0, 4]] },
+      { "role": "drums", "name": "drums", "volume": 0.5,
+        "kit": [[49, "crash-big", 0], [46, "open-hat-909", 1], [42, "hat-909", 1], [39, "clap-big", 0], [38, "snare-fat", 0], [41, "tom-floor", 0], [36, "kick-909", 0]],
+        "lanes": [
+          { "pitch": 36, "steps": "X.........x..... X.........x..... X.........x..... X.....x...x.x..." },
+          { "pitch": 38, "steps": "........X......." },
+          { "pitch": 39, "steps": "........X......." },
+          { "pitch": 42, "steps": "x.x.x.x.x.xox.x." },
+          { "pitch": 46, "steps": "..............x." },
+          { "pitch": 41, "steps": "................ ................ ................ ............x.xx" },
+          { "pitch": 49, "steps": "X............... ................ ................ ................" }
+        ] }
+    ]
+  },
+  {
+    "id": "blownout", "name": "blown out", "blurb": "crushed, stiff and slightly wrong: blown-out bass, a cheap drum machine, a flat two that rubs on purpose",
+    "tempo": 138, "swing": 54, "swingGrid": 0.25, "root": 4, "scale": "minor", "degrees": [0, 1, 0, 6], "chordBeats": 4,
+    "tracks": [
+      { "role": "lead", "name": "voice", "sound": "robot", "reverb": 0.1, "volume": 0.8 },
+      { "role": "bass", "name": "bass", "sound": "blown-bass", "volume": 1.3, "rhythm": [[0, 0.5], [0.75, 0.25], [1.5, 0.5, 1], [2, 0.75], [3, 0.25, 12], [3.5, 0.25, 1]] },
+      { "role": "chords", "name": "stabs", "sound": "crushed-saw", "reverb": 0.1, "volume": 1.0, "low": 55, "rhythm": [[0.5, 0.25], [2.25, 0.25], [3.75, 0.25]] },
+      { "role": "drums", "name": "machine", "volume": 0.5,
+        "kit": [[57, "glitch", 0], [56, "zap", 0], [46, "open-hat-808", 1], [42, "hat-lofi", 1], [39, "clap-tight", 0], [38, "snare-lofi", 0], [36, "kick-distorted", 0]],
+        "lanes": [
+          { "pitch": 36, "steps": "X..x..X...X..x.. X..x..X...X..x.. X..x..X...X..x.. X.X.X.X..x..X..." },
+          { "pitch": 39, "steps": "....X.......X..." },
+          { "pitch": 38, "steps": ".......o......o." },
+          { "pitch": 42, "steps": "Xo.Xo.Xo.Xo.Xo.X" },
+          { "pitch": 46, "steps": "................ ......x......... ................ ..........x....." },
+          { "pitch": 57, "steps": "...........x.... ...x............ ..............x. ......x.x......." },
+          { "pitch": 56, "steps": "................ ................ ................ ............x.x." }
+        ] }
+    ]
+  },
+  {
+    "id": "rage", "name": "rage", "blurb": "160 and loud: distorted 808s, rattling hats and a huge detuned synth on top",
+    "tempo": 160, "swing": 50, "swingGrid": 0.25, "root": 1, "scale": "minor", "degrees": [0, 5, 6, 5], "chordBeats": 4,
+    "tracks": [
+      { "role": "lead", "name": "synth", "sound": "rage-lead", "reverb": 0.2, "volume": 0.7 },
+      { "role": "bass", "name": "808", "sound": "bass-808", "volume": 0.85, "rhythm": [[0, 1.5], [1.75, 0.25], [2.5, 1], [3.5, 0.5, 12]] },
+      { "role": "chords", "name": "chords", "sound": "supersaw", "reverb": 0.3, "volume": 0.8, "low": 56, "rhythm": [[0, 4]] },
+      { "role": "drums", "name": "drums", "volume": 0.5,
+        "kit": [[49, "crash", 0], [46, "open-hat-808", 1], [42, "hat-808", 1], [39, "clap-808", 0], [38, "snare-909", 0], [36, "kick-808", 0]],
+        "lanes": [
+          { "pitch": 36, "steps": "X......X..X..... X..X......X...x." },
+          { "pitch": 39, "steps": "........X......." },
+          { "pitch": 38, "steps": "........X......." },
+          { "pitch": 42, "step": 0.125, "steps": "x...o...x...o...x...o...x...o... x...o...x...o...x.x.x.xxxxxxx.x." },
+          { "pitch": 46, "steps": "......x........." }
+        ] }
+    ]
+  },
+  {
+    "id": "jersey", "name": "jersey club", "blurb": "140 and bouncing: the five-kick jersey pattern, bed squeaks and a sub that follows the kicks",
+    "tempo": 140, "swing": 50, "swingGrid": 0.25, "root": 9, "scale": "minor", "degrees": [0, 5, 2, 6], "chordBeats": 4,
+    "tracks": [
+      { "role": "lead", "name": "melody", "sound": "bright-pluck", "reverb": 0.25, "volume": 0.7 },
+      { "role": "bass", "name": "sub", "sound": "sub-bass", "volume": 0.8, "rhythm": [[0, 0.5], [0.75, 0.5], [1.5, 0.75], [2.5, 0.5], [3, 0.75]] },
+      { "role": "chords", "name": "keys", "sound": "electric-piano", "reverb": 0.25, "volume": 0.6, "low": 57, "rhythm": [[0, 0.75], [1.5, 0.5], [3, 0.75]] },
+      { "role": "drums", "name": "drums", "volume": 0.55,
+        "kit": [[49, "crash", 0], [60, "bed-squeak", 0], [46, "open-hat-909", 1], [42, "hat-909", 1], [39, "clap-909", 0], [38, "snare-tight", 0], [36, "kick-tight", 0]],
+        "lanes": [
+          { "pitch": 36, "steps": "X..X..X...X.X... X..X..X...X.X... X..X..X...X.X... X..X..X.X.X.X.X." },
+          { "pitch": 39, "steps": "....X.......X..." },
+          { "pitch": 38, "steps": "................ ................ ................ ............x.xX" },
+          { "pitch": 60, "steps": "..x...x...x...x. ..x...x...x.x.x. ..x...x...x...x. ..x...x...x....." },
+          { "pitch": 42, "steps": "o.o.o.o.o.o.o.o." }
+        ] }
+    ]
+  },
+  {
+    "id": "hyperpop", "name": "hyperpop", "blurb": "fast, bright and overloaded: 160 trap drums, glossy supersaw stabs and a lead that wants pitching up",
+    "tempo": 160, "swing": 50, "swingGrid": 0.25, "root": 4, "scale": "major", "degrees": [3, 4, 5, 0], "chordBeats": 4,
+    "tracks": [
+      { "role": "lead", "name": "lead", "sound": "chip-lead", "reverb": 0.2, "volume": 0.7 },
+      { "role": "bass", "name": "808", "sound": "bass-808", "volume": 0.85, "rhythm": [[0, 1], [1.5, 0.5], [2, 1], [3.5, 0.5, 12]] },
+      { "role": "chords", "name": "synths", "sound": "supersaw", "reverb": 0.25, "volume": 0.8, "low": 59, "rhythm": [[0, 0.5], [0.75, 0.5], [1.5, 0.5], [2.25, 0.5], [3, 1]] },
+      { "role": "drums", "name": "drums", "volume": 0.5,
+        "kit": [[49, "crash", 0], [57, "laser-perc", 0], [46, "open-hat-909", 1], [42, "hat-tick", 1], [39, "clap-909", 0], [38, "snare-tight", 0], [36, "kick-808", 0]],
+        "lanes": [
+          { "pitch": 36, "steps": "X......X.X...... X......X.X...x.." },
+          { "pitch": 39, "steps": "....X.......X..." },
+          { "pitch": 38, "steps": "....X.......X..." },
+          { "pitch": 42, "step": 0.125, "steps": "x.x.x.x.x.x.x.x.x.x.x.x.xxxx.x.x x.x.x.x.x.x.x.x.x.x.x.x.x.x.xxxx" },
+          { "pitch": 46, "steps": "..............x." },
+          { "pitch": 57, "steps": "................ ................ ................ ............x.x." }
+        ] }
+    ]
+  },
+  {
+    "id": "pluggnb", "name": "pluggnb", "blurb": "soft and floaty at 150: gentle 808s, finger snaps, sparse hats and dreamy keys",
+    "tempo": 150, "swing": 50, "swingGrid": 0.25, "root": 1, "scale": "major", "degrees": [3, 2, 5, 4], "chordBeats": 4,
+    "tracks": [
+      { "role": "lead", "name": "flute", "sound": "whistle-lead", "reverb": 0.35, "volume": 0.6 },
+      { "role": "bass", "name": "808", "sound": "bass-808", "volume": 0.8, "rhythm": [[0, 1.5], [2.5, 1.25]] },
+      { "role": "chords", "name": "keys", "sound": "electric-piano", "reverb": 0.4, "volume": 0.5, "low": 58, "rhythm": [[0, 2], [2.5, 1.5]] },
+      { "role": "drums", "name": "drums", "volume": 0.55,
+        "kit": [[51, "ride-bell", 0], [46, "open-hat-808", 1], [42, "hat-808", 1], [39, "snap", 0], [38, "snare-808", 0], [36, "kick-808", 0]],
+        "lanes": [
+          { "pitch": 36, "steps": "X.....X...X..... X.....X......x.." },
+          { "pitch": 39, "steps": "........X......." },
+          { "pitch": 38, "steps": "........o......." },
+          { "pitch": 42, "steps": "x.o.x.o.x.o.x.oo" },
+          { "pitch": 46, "steps": "................ ..........x....." },
+          { "pitch": 51, "steps": "................ ................ ................ ..............x." }
+        ] }
+    ]
+  }
+]
