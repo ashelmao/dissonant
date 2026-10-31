@@ -3,7 +3,8 @@
 
 use crate::arrangement::Arrangement;
 use crate::chord_track::ChordTrack;
-use crate::model::{NoteEvent, ProjectModel, Track, MIN_NOTE_TICKS};
+use crate::model::{NoteEvent, ProjectModel, Track, MIN_NOTE_TICKS, ROPE_OVERLAP_SECS};
+use crate::sequence::live_ropes;
 use crate::ticks::TICKS_PER_BEAT;
 use midly::num::{u15, u24, u28, u4, u7};
 use midly::{Format, Header, MetaMessage, MidiMessage, Smf, Timing, TrackEvent, TrackEventKind};
@@ -153,19 +154,29 @@ pub fn export(model: &ProjectModel, scope: MidiScope) -> Result<Vec<u8>, MidiErr
     }
     smf.tracks.push(to_deltas(conductor));
 
+    let overlap = overlap_ticks(model.tempo);
     for ((track, notes), name) in per_track.iter().zip(names.iter()) {
         let mut events: Vec<(u64, TrackEventKind)> = vec![(
             0,
             TrackEventKind::Meta(MetaMessage::TrackName(name.as_bytes())),
         )];
-        for n in notes.iter().filter(|n| !n.muted) {
+        // Everything in the file is heard, so no rope is cut for running past an end.
+        let ropes = if track.is_drum {
+            vec![]
+        } else {
+            live_ropes(notes, i64::MAX)
+        };
+        for (i, n) in notes.iter().enumerate().filter(|(_, n)| !n.muted) {
             // A note's colour group is its MIDI channel, the way FL Studio treats colour.
             // Drums stay on channel 10 whatever colour they carry.
             let channel = u4::new(if track.is_drum { 9 } else { n.color.min(15) });
             let key = u7::new(n.pitch.clamp(0, 127) as u8);
             let vel = u7::new(n.velocity.clamp(1, 127) as u8);
             let on = smf_tick(n.shifted_start());
-            let off = smf_tick(n.shifted_start() + n.length_ticks).max(on + 1);
+            let mut off = smf_tick(n.shifted_start() + n.length_ticks).max(on + 1);
+            if let Some(target) = ropes.get(i).and_then(|r| r.to) {
+                off = rope_off(notes, i, target, off, overlap);
+            }
             events.push((
                 on,
                 TrackEventKind::Midi {
@@ -191,6 +202,49 @@ pub fn export(model: &ProjectModel, scope: MidiScope) -> Result<Vec<u8>, MidiErr
     smf.write_std(&mut out)
         .map_err(|e| MidiError::Write(e.to_string()))?;
     Ok(out)
+}
+
+/// [`ROPE_OVERLAP_SECS`] in file ticks at the tempo the file is written at, never less than one
+/// tick: a file has no finer way to say "still held".
+fn overlap_ticks(bpm: f64) -> u64 {
+    let beats = ROPE_OVERLAP_SECS * bpm.max(1.0) / 60.0;
+    (beats * PPQ as f64).round().max(1.0) as u64
+}
+
+/// Where an exported note ends when a live rope slides out of it into `notes[target]`.
+///
+/// A file can't say "slide", but a synth in legato or mono mode glides when a key arrives
+/// while the last one is still down. A source that only touches its slide note (ending at or
+/// before its start, once on the file's grid) is held `overlap` ticks past that start, so the
+/// file plays back sliding in another DAW; a source that already overlaps is left as written.
+/// No portamento controllers (CC 5 / CC 65) are written: the slide time belongs to the synth
+/// that plays the file, and turning portamento on for every note would glide notes that have no
+/// rope.
+///
+/// The overlap needs two different keys to mean anything, so a rope between equal pitches (a
+/// tie) is left alone, as is a source whose stretched end would swallow the next note of its
+/// own key on its own channel: the note-off would end that note instead, or be paired with it
+/// on import. A chord's ropes are each stretched, and a polyphonic synth simply hears every
+/// pair overlap for a moment: one file can't glide several voices separately.
+fn rope_off(notes: &[NoteEvent], source: usize, target: usize, off: u64, overlap: u64) -> u64 {
+    let (src, tgt) = (&notes[source], &notes[target]);
+    let target_on = smf_tick(tgt.shifted_start());
+    if off > target_on || src.pitch == tgt.pitch {
+        return off;
+    }
+    let late = target_on + overlap;
+    let clash = notes.iter().enumerate().any(|(k, n)| {
+        k != source
+            && !n.muted
+            && n.pitch == src.pitch
+            && n.color == src.color
+            && (off..=late).contains(&smf_tick(n.shifted_start()))
+    });
+    if clash {
+        off
+    } else {
+        late
+    }
 }
 
 /// Sort absolute-tick events (note-offs before note-ons at the same tick) and convert to deltas.
@@ -420,6 +474,90 @@ mod tests {
             Err(MidiError::NoSuchPattern)
         ));
         assert!(matches!(import(b"not midi", BAR), Err(MidiError::Parse(_))));
+    }
+
+    /// Every note on the first exported track as `(key, on, off)` in file ticks, in the order
+    /// the notes start.
+    fn exported_notes(bytes: &[u8]) -> Vec<(u8, u64, u64)> {
+        let smf = Smf::parse(bytes).unwrap();
+        let mut at = 0u64;
+        let mut held = std::collections::HashMap::new();
+        let mut out = vec![];
+        for ev in &smf.tracks[1] {
+            at += ev.delta.as_int() as u64;
+            if let TrackEventKind::Midi { message, .. } = ev.kind {
+                match message {
+                    MidiMessage::NoteOn { key, vel } if vel.as_int() > 0 => {
+                        held.insert(key.as_int(), at);
+                    }
+                    MidiMessage::NoteOn { key, .. } | MidiMessage::NoteOff { key, .. } => {
+                        let on = held.remove(&key.as_int()).expect("an off pairs with an on");
+                        out.push((key.as_int(), on, at));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        out.sort_by_key(|&(key, on, _)| (on, key));
+        out
+    }
+
+    #[test]
+    fn a_touching_roped_note_is_held_into_its_slide_note_in_the_file() {
+        let mut model = ProjectModel::empty();
+        model.tempo = 120.0;
+        let pid = model.patterns[0].id;
+        let roped = |source: &NoteEvent, mut n: NoteEvent| {
+            n.slide_from = Some(source.id);
+            n
+        };
+        let touching = NoteEvent::new(0, BEAT, 60);
+        let overlapping = NoteEvent::new(2 * BEAT, 2 * BEAT, 60);
+        let plain = NoteEvent::new(5 * BEAT, BEAT, 62);
+        let gap = NoteEvent::new(8 * BEAT, BEAT, 60);
+        let tie = NoteEvent::new(12 * BEAT, BEAT, 69);
+        model.patterns[0].length_ticks = 16 * BEAT;
+        model.patterns[0].notes = vec![
+            touching.clone(),
+            roped(&touching, NoteEvent::new(BEAT, BEAT, 64)),
+            overlapping.clone(),
+            roped(&overlapping, NoteEvent::new(3 * BEAT, BEAT, 67)),
+            plain,
+            NoteEvent::new(6 * BEAT, BEAT, 65), // touches `plain`, with no rope
+            gap.clone(),
+            roped(&gap, NoteEvent::new(10 * BEAT, BEAT, 64)), // dead: starts after `gap` ends
+            tie.clone(),
+            roped(&tie, NoteEvent::new(13 * BEAT, BEAT, 69)), // live, but the same key
+        ];
+        let notes = exported_notes(&export(&model, pattern_scope(pid)).unwrap());
+        // 5 ms at 120 bpm is 4.8 file ticks at 480 PPQ.
+        assert_eq!(overlap_ticks(120.0), 5);
+        let q = PPQ as u64;
+        assert_eq!(
+            notes,
+            vec![
+                (60, 0, q + 5),
+                (64, q, 2 * q),
+                (60, 2 * q, 4 * q),
+                (67, 3 * q, 4 * q),
+                (62, 5 * q, 6 * q),
+                (65, 6 * q, 7 * q),
+                (60, 8 * q, 9 * q),
+                (64, 10 * q, 11 * q),
+                (69, 12 * q, 13 * q),
+                (69, 13 * q, 14 * q),
+            ],
+            "only the touching source is held past its slide note's start"
+        );
+
+        // A stretched end that would swallow the next note of the same key is left as written.
+        model.patterns[0].notes = vec![
+            touching.clone(),
+            roped(&touching, NoteEvent::new(BEAT, BEAT, 64)),
+            NoteEvent::new(BEAT, BEAT / 2, 60),
+        ];
+        let notes = exported_notes(&export(&model, pattern_scope(pid)).unwrap());
+        assert_eq!(notes[0], (60, 0, q), "{notes:?}");
     }
 
     #[test]

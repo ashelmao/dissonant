@@ -328,6 +328,19 @@ pub fn rope_is_live(source: &NoteEvent, target: &NoteEvent) -> bool {
     from < at && at <= from + source.length_ticks
 }
 
+/// How far a rope's source is held past its slide note's start wherever the slide can only be
+/// asked for with plain MIDI: on a track hosting a plugin, and in an exported MIDI file. A
+/// synth in legato or mono mode glides with its own portamento when a new key arrives while
+/// the last one is still down, so a source that merely touches its slide note is stretched to
+/// overlap it by this much.
+///
+/// Five milliseconds is long enough that the two keys overlap on any host that keeps event
+/// order (it is a couple of hundred samples at 44.1 kHz, wider than any sub-block a plugin
+/// splits its events into, and five SMF ticks at 480 PPQ and 120 bpm) and short enough that a
+/// polyphonic patch, which simply plays both notes, never lets the source be heard ringing on.
+/// The slide time itself is not sent: that is the synth's own portamento setting.
+pub const ROPE_OVERLAP_SECS: f64 = 0.005;
+
 /// Make one pattern's ropes valid: a rope whose source isn't in `notes` (deleted, or not
 /// copied), that points at its own note, or that closes a loop (A from B from A) is cut, and a
 /// slide time left without a rope goes with it. A loop is cut at its first note in slice
