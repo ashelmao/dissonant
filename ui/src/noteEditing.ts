@@ -3,6 +3,7 @@
 
 import type { NoteEvent, NoteProp } from "./types";
 import { NOTE_PROPS, noteProp, TICKS_PER_BEAT, uuid } from "./types";
+import { remapRopes, repointRopes, tidyRopes, unroped } from "./ropes";
 
 export const MIN_LENGTH_TICKS = TICKS_PER_BEAT / 16;
 
@@ -91,6 +92,24 @@ export function notesInRect(notes: NoteEvent[], tick0: number, tick1: number, pi
   return out;
 }
 
+/**
+ * Fresh-id copies of `originals`, each shaped by `place` (null leaves that one out), with the
+ * ropes among them pointing at each other's copies: a phrase copied whole slides the same way,
+ * and a rope whose source stayed behind is dropped. Every note-copying gesture goes through here.
+ */
+export function copyNotes(originals: NoteEvent[], place: (n: NoteEvent) => Partial<NoteEvent> | null = () => ({})): NoteEvent[] {
+  const copyOf = new Map<string, string>();
+  const copies: NoteEvent[] = [];
+  for (const n of originals) {
+    const at = place(n);
+    if (!at) continue;
+    const copy = { ...n, ...at, id: uuid() };
+    copyOf.set(n.id, copy.id);
+    copies.push(copy);
+  }
+  return remapRopes(copies, copyOf);
+}
+
 export function removeNotes(notes: NoteEvent[], ids: Set<string>): NoteEvent[] {
   return notes.filter((n) => !ids.has(n.id));
 }
@@ -107,7 +126,7 @@ export function duplicateNotes(notes: NoteEvent[], ids: Set<string>, gridTicks: 
   const start = Math.min(...sel.map((n) => n.startTick));
   const end = Math.max(...sel.map((n) => n.startTick + n.lengthTicks));
   const offset = Math.max(g, Math.ceil((end - start) / g) * g);
-  const copies = sel.map((n) => ({ ...n, id: uuid(), startTick: n.startTick + offset }));
+  const copies = copyNotes(sel, (n) => ({ startTick: n.startTick + offset }));
   return { notes: [...notes, ...copies], newIds: new Set(copies.map((c) => c.id)) };
 }
 
@@ -120,13 +139,12 @@ export function pasteNotes(notes: NoteEvent[], clipboard: NoteEvent[], atTick: n
   if (clipboard.length === 0) return { notes, newIds: new Set() };
   const at = Math.round(atTick);
   const start = Math.min(...clipboard.map((n) => n.startTick));
-  const copies: NoteEvent[] = [];
-  for (const n of clipboard) {
+  const copies = copyNotes(clipboard, (n) => {
     const startTick = n.startTick - start + at;
-    if (maxTick !== undefined && startTick >= maxTick) continue;
+    if (maxTick !== undefined && startTick >= maxTick) return null;
     const lengthTicks = maxTick === undefined ? n.lengthTicks : Math.min(n.lengthTicks, maxTick - startTick);
-    copies.push({ ...n, id: uuid(), startTick, lengthTicks });
-  }
+    return { startTick, lengthTicks };
+  });
   if (!copies.length) return { notes, newIds: new Set() };
   return { notes: [...notes, ...copies], newIds: new Set(copies.map((c) => c.id)) };
 }
@@ -216,10 +234,12 @@ export function arpeggiateNotes(
   let i = 0;
   for (let t = start; t < end; t += g) {
     const src = mode === "random" ? order[Math.floor(rng() * order.length)] : order[i % order.length];
-    out.push({ ...src, id: uuid(), startTick: t, lengthTicks: Math.min(g, end - t) });
+    // Copied alone, so a step never inherits its source note's rope.
+    out.push(...copyNotes([src], () => ({ startTick: t, lengthTicks: Math.min(g, end - t) })));
     i++;
   }
-  return out;
+  // Ropes that slid out of the stack had their source replaced; they go too.
+  return tidyRopes(out);
 }
 
 /** Offset the notes of each stack (same start) by `offsetTicks` per voice, low to high. */
@@ -267,17 +287,23 @@ export function chopNotes(notes: NoteEvent[], ids: Set<string>, gridTicks: numbe
   const g = gridOf(gridTicks);
   const target = new Set(sel(notes, ids).map((n) => n.id));
   const out: NoteEvent[] = [];
+  const pieces = new Map<string, NoteEvent[]>();
   for (const n of notes) {
     if (!target.has(n.id) || n.lengthTicks <= g) {
       out.push(n);
       continue;
     }
     const end = n.startTick + n.lengthTicks;
+    const parts: NoteEvent[] = [];
     for (let t = n.startTick; t < end; t += g) {
-      out.push({ ...n, id: t === n.startTick ? n.id : uuid(), startTick: t, lengthTicks: Math.min(g, end - t) });
+      // The first piece keeps the note's id and its rope; the rest start fresh.
+      const piece = t === n.startTick ? { ...n, lengthTicks: Math.min(g, end - t) } : unroped({ ...n, id: uuid(), startTick: t, lengthTicks: Math.min(g, end - t) });
+      parts.push(piece);
     }
+    pieces.set(n.id, parts);
+    out.push(...parts);
   }
-  return out;
+  return repointRopes(out, pieces);
 }
 
 /** Extend each note up to the next note's start (any pitch), FL legato. */
@@ -343,16 +369,21 @@ export function splitNotes(notes: NoteEvent[], ids: Set<string>, tick: number, m
   const min = Math.round(minLengthTicks);
   const target = new Set(sel(notes, ids).map((n) => n.id));
   const out: NoteEvent[] = [];
+  const pieces = new Map<string, NoteEvent[]>();
   for (const n of notes) {
     const end = n.startTick + n.lengthTicks;
     if (target.has(n.id) && at >= n.startTick + min && at <= end - min) {
-      out.push({ ...n, lengthTicks: at - n.startTick });
-      out.push({ ...n, id: uuid(), startTick: at, lengthTicks: end - at });
+      // The left half keeps the id and the rope into it; a rope out of the note moves to
+      // whichever half is sounding when its slide note starts.
+      const left = { ...n, lengthTicks: at - n.startTick };
+      const right = unroped({ ...n, id: uuid(), startTick: at, lengthTicks: end - at });
+      pieces.set(n.id, [left, right]);
+      out.push(left, right);
     } else {
       out.push(n);
     }
   }
-  return out;
+  return repointRopes(out, pieces);
 }
 
 /**
@@ -382,7 +413,18 @@ export function glueNotes(notes: NoteEvent[], ids: Set<string>): NoteEvent[] {
     merged.set(cur.id, cur);
   }
   if (dropped.size === 0) return notes;
-  return notes.filter((n) => !dropped.has(n.id)).map((n) => (targetIds.has(n.id) ? (merged.get(n.id) ?? n) : n));
+  const glued = notes.filter((n) => !dropped.has(n.id)).map((n) => (targetIds.has(n.id) ? (merged.get(n.id) ?? n) : n));
+  // A rope out of a swallowed note now comes out of the note that swallowed it; one that ran
+  // between two glued notes would be a note sliding from itself, and is cut.
+  const into = new Map<string, NoteEvent[]>();
+  for (const group of byPitch.values()) {
+    let keeper = group[0];
+    for (const n of group) {
+      if (merged.has(n.id)) keeper = merged.get(n.id)!;
+      else if (dropped.has(n.id)) into.set(n.id, [keeper]);
+    }
+  }
+  return tidyRopes(repointRopes(glued, into));
 }
 
 /** Copy the selection one `spanTicks` later (⌘B: the pattern length, FL's favourite). */
@@ -390,7 +432,7 @@ export function duplicateBySpan(notes: NoteEvent[], ids: Set<string>, spanTicks:
   const target = sel(notes, ids);
   const span = Math.round(spanTicks);
   if (!target.length || !(span > 0)) return { notes, newIds: new Set() };
-  const copies = target.map((n) => ({ ...n, id: uuid(), startTick: n.startTick + span }));
+  const copies = copyNotes(target, (n) => ({ startTick: n.startTick + span }));
   return { notes: [...notes, ...copies], newIds: new Set(copies.map((c) => c.id)) };
 }
 
@@ -707,7 +749,10 @@ export function tileGhost(ghost: NoteEvent[], ghostLengthTicks: number, lengthTi
     for (const n of ghost) {
       const start = n.startTick + off;
       if (n.muted || n.startTick >= step || start >= lengthTicks) continue;
-      out.push({ ...n, id: `${n.id}~${loop}`, startTick: start, lengthTicks: Math.min(n.lengthTicks, lengthTicks - start) });
+      const tile: NoteEvent = { ...n, id: `${n.id}~${loop}`, startTick: start, lengthTicks: Math.min(n.lengthTicks, lengthTicks - start) };
+      // Same suffix, so a ghost rope points at its source's tile in the same loop.
+      if (n.slideFrom) tile.slideFrom = `${n.slideFrom}~${loop}`;
+      out.push(tile);
     }
   }
   return out;
