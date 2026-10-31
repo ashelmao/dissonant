@@ -244,6 +244,72 @@ impl DrumLane {
     }
 }
 
+/// A factory drum loop (`assets/drum_loops.json`; the UI's loop picker reads the same file).
+/// Its lanes sit on GM pitches, so it plays on any kit that follows the GM layout, and `kit`
+/// names the factory kit it was written for. The browser groups loops by that kit's style.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DrumLoop {
+    pub id: String,
+    pub name: String,
+    pub blurb: String,
+    /// A factory kit id ([`crate::sound::factory_kit`]).
+    pub kit: String,
+    /// The tempo it was written at. Loading a loop leaves the song's tempo alone.
+    pub bpm: f64,
+    /// 50 straight … 75 hard shuffle: how late the off-16ths of the 16th lanes land, baked into
+    /// each hit's `shift_ticks` so the grid cell stays put.
+    #[serde(default = "straight")]
+    pub swing: f64,
+    pub lanes: Vec<DrumLane>,
+}
+
+fn straight() -> f64 {
+    50.0
+}
+
+impl DrumLoop {
+    /// Ticks in one pass of the loop: its longest lane.
+    pub fn length_ticks(&self) -> i64 {
+        self.lanes.iter().map(|l| l.cells().len() as i64 * beats_to_ticks(l.step)).max().unwrap_or(0)
+    }
+
+    /// How far a swung off-16th lands late, in ticks.
+    pub fn swing_ticks(&self) -> i64 {
+        beats_to_ticks(self.swing / 100.0 * 0.5) - beats_to_ticks(0.25)
+    }
+
+    /// Hits for `length` ticks, every lane repeated to fill it, sorted by time then pitch.
+    pub fn hits(&self, length: i64) -> Vec<NoteEvent> {
+        let sixteenth = beats_to_ticks(0.25);
+        let swing = self.swing_ticks();
+        let mut hits: Vec<NoteEvent> = self
+            .lanes
+            .iter()
+            .flat_map(|lane| {
+                let swung = beats_to_ticks(lane.step) == sixteenth;
+                lane.hits(length).into_iter().map(move |mut n| {
+                    if swung && (n.start_tick / sixteenth) % 2 == 1 {
+                        n.shift_ticks = swing;
+                    }
+                    n
+                })
+            })
+            .collect();
+        hits.sort_by_key(|n| (n.start_tick, n.pitch));
+        hits
+    }
+}
+
+const LOOPS_JSON: &str = include_str!("../assets/drum_loops.json");
+
+/// Every factory drum loop, in file order. Panics at first use if the bundled JSON is
+/// malformed (a test covers it).
+pub fn factory_loops() -> &'static [DrumLoop] {
+    static LOOPS: OnceLock<Vec<DrumLoop>> = OnceLock::new();
+    LOOPS.get_or_init(|| serde_json::from_str(LOOPS_JSON).expect("drum_loops.json is valid"))
+}
+
 /// What a vibe track plays.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "role", rename_all = "camelCase")]

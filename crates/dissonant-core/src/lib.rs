@@ -40,7 +40,7 @@ pub use model::{
 };
 pub use sequence::{MasterAutomation, Sequence, SequenceAudioClip, SequenceTrack, TrackAutomation};
 pub use sound::{
-    default_kit, factory_sound, factory_sounds, DrumPad, DrumPatch, ResolvedPad, Sound, SoundPatch, SynthPatch, MAX_DRUM_PADS,
+    default_kit, factory_kit, factory_kits, factory_sound, factory_sounds, DrumKit, DrumPad, DrumPatch, ResolvedPad, Sound, SoundPatch, SynthPatch, MAX_DRUM_PADS,
 };
 pub use tempo::{swing_warp_ticks, Tempo, TempoMap, TempoPoint};
 pub use theory::harmony::{self, ChordSuggestion, ProgressionStarter};
@@ -48,4 +48,4 @@ pub use theory::highlight::HighlightEngine;
 pub use theory::key_detector::{KeyCandidate, KeyDetectionResult, KeyDetector};
 pub use theory::tier::{Tier, TierClassifier};
 pub use ticks::{bar_ticks, beats_to_ticks, ticks_to_beats, TICKS_PER_BEAT};
-pub use vibes::{vibe_specs, vibes, Groove, VibeInfo, VibeRole, VibeSpec};
+pub use vibes::{factory_loops, vibe_specs, vibes, DrumLane, DrumLoop, Groove, VibeInfo, VibeRole, VibeSpec};

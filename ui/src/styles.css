@@ -1747,6 +1747,14 @@ select {
 .rollscroll canvas {
   display: block;
 }
+/* The ruler rides over the grid's top band and stays there as the rows scroll under it.
+   Clicks fall through to the grid canvas, which hit-tests the band itself. */
+.rollscroll canvas.rollruler {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  pointer-events: none;
+}
 .lanehdr {
   height: 22px;
   flex: none;
@@ -4374,6 +4382,63 @@ button.linkish {
 .drumrow .dname.dadd:disabled {
   opacity: 0.4;
   cursor: default;
+}
+/* Beside "+ add sound": the kit's name (opens the kit picker) and "loops". Sticky, like the
+   pad names. */
+.drumrow .dpresets {
+  position: sticky;
+  left: 64px;
+  z-index: 2;
+  flex: none;
+  display: flex;
+  gap: 4px;
+  margin-left: 6px;
+}
+.drumrow .dkits {
+  flex: none;
+  height: 18px;
+  padding: 0 8px;
+  background: var(--bg-1);
+  border: 1px solid var(--line-1);
+  border-radius: 2px;
+  font-family: var(--font-mono);
+  font-weight: 600;
+  font-size: 9px;
+  letter-spacing: 0;
+  text-transform: none;
+  color: var(--text-3);
+}
+.drumrow .dkits:hover,
+.drumrow .dkits.open {
+  color: var(--accent);
+  border-color: var(--line-3);
+}
+/* Kit picker: the sound picker's list, a pad count per kit, the focused kit's blurb below. */
+.sp-row .kp-meta {
+  flex: none;
+  font-family: var(--font-mono);
+  font-size: 8.5px;
+  color: var(--text-5);
+}
+.kp-blurb {
+  flex: none;
+  min-height: 26px;
+  padding: 2px 2px 0;
+  font-size: 10px;
+  line-height: 1.3;
+  color: var(--text-3);
+}
+/* The loop picker's "load its kit too". */
+.kp-opt {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 2px 0;
+  border-top: 1px solid var(--line-1);
+  font-size: 10px;
+  color: var(--text-2);
+  cursor: pointer;
 }
 /* ▶ hears a sound in the picker before it's picked. */
 .sp-row .sp-play {

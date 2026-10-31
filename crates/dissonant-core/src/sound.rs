@@ -496,6 +496,43 @@ pub fn default_kit() -> Vec<DrumPad> {
     .collect()
 }
 
+/// A named kit preset: a whole set of pads loaded onto a drum track in one `SetDrumPads`.
+/// Factory kits ship in `assets/drum_kits.json` (the UI's kit picker imports the same file).
+/// They keep the GM pitches (36 kick, 38 snare, 42 / 46 hats, 49 crash, …), so hits written
+/// on one kit play the matching drum on another.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DrumKit {
+    /// A short slug: `808`, `boom-bap`.
+    pub id: String,
+    pub name: String,
+    /// Browser grouping: "machines", "hip-hop", "club", …
+    pub style: String,
+    /// One line on what the kit is for.
+    pub blurb: String,
+    /// `[pitch, sound, choke]` rows, top to bottom.
+    pub pads: Vec<(u8, String, u8)>,
+}
+
+impl DrumKit {
+    pub fn drum_pads(&self) -> Vec<DrumPad> {
+        self.pads.iter().map(|(pitch, sound, choke)| DrumPad { pitch: *pitch, sound: sound.clone(), choke: *choke }).collect()
+    }
+}
+
+const FACTORY_KITS_JSON: &str = include_str!("../assets/drum_kits.json");
+
+/// Every factory kit, in file order. Panics at first use if the bundled JSON is malformed
+/// (a test covers it).
+pub fn factory_kits() -> &'static [DrumKit] {
+    static KITS: OnceLock<Vec<DrumKit>> = OnceLock::new();
+    KITS.get_or_init(|| serde_json::from_str(FACTORY_KITS_JSON).expect("drum_kits.json is valid"))
+}
+
+pub fn factory_kit(id: &str) -> Option<&'static DrumKit> {
+    factory_kits().iter().find(|k| k.id == id)
+}
+
 /// A kit pad with its sound looked up, for the engine.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedPad {

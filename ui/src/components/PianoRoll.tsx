@@ -201,6 +201,7 @@ export function PianoRoll() {
   };
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const rulerRef = useRef<HTMLCanvasElement>(null);
   const velRef = useRef<HTMLCanvasElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const [selection, setSelection] = useState<Set<string>>(new Set());
@@ -322,22 +323,34 @@ export function PianoRoll() {
     ctx.fillStyle = C.editor;
     ctx.fillRect(0, 0, W, H);
 
-    // Rows
+    // Rows: tinted per chord, each chord's tiers across its own span (the stretches between
+    // chords fall back to the key), so the rows read ahead of the playhead.
     const live = tierMap(playhead, chords, key);
+    const edges = [...new Set([0, totalTicks, ...chords.flatMap((c) => [c.startTick, c.startTick + c.lengthTicks])])]
+      .filter((t) => t >= 0 && t <= totalTicks)
+      .sort((a, b) => a - b);
+    const spans = edges.slice(1).map((end, i) => ({ start: edges[i], end, tiers: tierMap((edges[i] + end) / 2, chords, key) }));
     for (const [i, p] of visiblePitches.entries()) {
       const y = yForPitch(p);
       const blk = BLACK.has(p % 12);
       const octaveBreak = fold ? visiblePitches[i + 1] !== undefined && Math.floor(visiblePitches[i + 1] / 12) !== Math.floor(p / 12) : p % 12 === 0;
-      let bg = blk ? C.rowBlack : C.rowWhite;
-      if (highlightRows && !showLandscape) {
-        const t = live[p % 12];
-        if (rootPc !== null && p % 12 === rootPc && t !== "dissonance") bg = blk ? C.rootRowBlack : C.rootRow;
-        else if (t === "chordTone") bg = mixHex(TIER_COLORS.chordTone, blk ? C.rowBlack : C.rowWhite, blk ? 0.93 : 0.9);
-        else if (t === "tension") bg = mixHex(TIER_COLORS.tension, blk ? C.rowBlack : C.rowWhite, blk ? 0.95 : 0.93);
-        else if (t === "dissonance") bg = blk ? "#0e0e10" : "#121214";
-      }
-      ctx.fillStyle = bg;
+      const plain = blk ? C.rowBlack : C.rowWhite;
+      ctx.fillStyle = plain;
       ctx.fillRect(GUTTER, y, gridW, ROW_H);
+      if (highlightRows && !showLandscape) {
+        for (const s of spans) {
+          const t = s.tiers[p % 12];
+          let bg = plain;
+          if (rootPc !== null && p % 12 === rootPc && t !== "dissonance") bg = blk ? C.rootRowBlack : C.rootRow;
+          else if (t === "chordTone") bg = mixHex(TIER_COLORS.chordTone, plain, blk ? 0.93 : 0.9);
+          else if (t === "tension") bg = mixHex(TIER_COLORS.tension, plain, blk ? 0.95 : 0.93);
+          else if (t === "dissonance") bg = blk ? "#0e0e10" : "#121214";
+          if (bg === plain) continue;
+          const x0 = Math.round(GUTTER + s.start * pxPerTick);
+          ctx.fillStyle = bg;
+          ctx.fillRect(x0, y, Math.round(GUTTER + s.end * pxPerTick) - x0, ROW_H);
+        }
+      }
       ctx.fillStyle = octaveBreak ? C.octave : C.rowSep;
       ctx.fillRect(GUTTER, y + ROW_H - 1, gridW, 1);
     }
@@ -385,42 +398,6 @@ export function PianoRoll() {
       }
     }
 
-    // Ruler: loop bar (the pattern loops), bar + beat labels
-    ctx.fillStyle = C.ruler;
-    ctx.fillRect(0, 0, W, RULER_H);
-    ctx.fillStyle = C.line1;
-    ctx.fillRect(0, RULER_H - 1, W, 1);
-    // Loop brace: the whole pattern in the track color, a sub-region in accent.
-    ctx.globalAlpha = looping ? 0.8 : 0.25;
-    ctx.fillStyle = color;
-    ctx.fillRect(GUTTER, 2, gridW, 6);
-    if (loopRegion) {
-      ctx.fillStyle = C.accent;
-      ctx.fillRect(GUTTER + loopRegion[0] * pxPerTick, 2, (loopRegion[1] - loopRegion[0]) * pxPerTick, 6);
-    }
-    ctx.globalAlpha = 1;
-    for (let tk = 0; tk < totalTicks; tk += TICKS_PER_BEAT) {
-      const x = GUTTER + tk * pxPerTick;
-      const beat = ticksToBeats(tk);
-      const barIdx = Math.floor(beat / bpb);
-      const isBar = tk % ticksPerBar === 0;
-      if (!isBar && beatW < 40) continue;
-      ctx.fillStyle = isBar ? "#5a5a62" : "#2e2e36";
-      ctx.fillRect(Math.round(x), 10, 1, 18);
-      ctx.fillStyle = isBar ? C.text1 : C.text4;
-      ctx.font = isBar ? mono(600, 11) : mono(400, 9);
-      ctx.fillText(isBar ? `${barIdx + 1}` : `${barIdx + 1}.${Math.floor(beat % bpb) + 1}`, x + 4, 19);
-    }
-    // Chord names in the ruler
-    ctx.font = mono(500, 9);
-    ctx.fillStyle = C.accent;
-    for (const c of chords) {
-      const x = GUTTER + c.startTick * pxPerTick;
-      const label = c.name ?? "";
-      const tw = ctx.measureText(label).width;
-      ctx.fillText(label, x + c.lengthTicks * pxPerTick - tw - 4, 19);
-    }
-
     // Ghost notes: another pattern, dashed, tiered against these chords, behind everything else.
     if (ghostNotes.length) {
       ctx.setLineDash([3, 2]);
@@ -443,8 +420,8 @@ export function PianoRoll() {
       ctx.globalAlpha = 1;
       ctx.setLineDash([]);
     }
-    // A drum ghost: one faint line per hit (kick and snare/clap stronger than hats), plus a
-    // tick along the ruler's foot, so you can lock a bassline to the kick.
+    // A drum ghost: one faint line per hit (kick and snare/clap stronger than hats); the ruler
+    // carries a tick per hit along its foot, so you can lock a bassline to the kick.
     if (ghostHits.length) {
       ctx.fillStyle = ghostColor;
       for (const h of ghostHits) {
@@ -452,8 +429,6 @@ export function PianoRoll() {
         const strong = h.pitch === 36 || h.pitch === 38 || h.pitch === 39;
         ctx.globalAlpha = (strong ? 0.26 : 0.1) * (0.5 + 0.5 * (h.velocity / 127));
         ctx.fillRect(x, RULER_H, h.pitch === 36 ? 2 : 1, gridH);
-        ctx.globalAlpha = strong ? 0.9 : 0.45;
-        ctx.fillRect(x, RULER_H - (h.pitch === 36 ? 7 : 4), h.pitch === 36 ? 2 : 1, h.pitch === 36 ? 6 : 3);
       }
       ctx.globalAlpha = 1;
     }
@@ -588,7 +563,101 @@ export function PianoRoll() {
     }
     ctx.fillStyle = C.line1;
     ctx.fillRect(GUTTER - 1, RULER_H, 1, gridH);
-    // Ruler corner
+
+    // Playhead (its head is in the ruler)
+    const px = Math.round(GUTTER + playhead * pxPerTick);
+    if (!appearance.reducedMotion) {
+      ctx.shadowColor = "rgba(255,255,255,.5)";
+      ctx.shadowBlur = 6;
+    }
+    ctx.fillStyle = "#fff";
+    ctx.fillRect(px, RULER_H, 1, gridH);
+    ctx.shadowBlur = 0;
+
+    // Hover readout (kept below the ruler, wherever the rows have scrolled to)
+    if (hover && !dragRef.current) {
+      const t = tierMap(hover.tick, chords, key)[hover.pitch % 12];
+      const label = `${midiName(hover.pitch)}${t ? ` · ${t === "chordTone" ? "chord tone" : t}` : ""}`;
+      const why = explainNote(hover.pitch, chords, key, hover.tick);
+      ctx.font = mono(500, 9);
+      const tw = Math.max(ctx.measureText(label).width, ctx.measureText(why).width) + 12;
+      const hx = Math.min(GUTTER + hover.tick * pxPerTick + 8, W - tw - 4);
+      const hy = Math.max((scrollRef.current?.scrollTop ?? 0) + RULER_H + 2, yForPitch(hover.pitch) - 30);
+      ctx.fillStyle = "rgba(22,22,26,.94)";
+      ctx.fillRect(hx, hy, tw, 28);
+      ctx.fillStyle = t ? tierColor(t) : C.text1;
+      ctx.fillText(label, hx + 6, hy + 8);
+      ctx.fillStyle = "#b8b8c0";
+      ctx.fillText(why, hx + 6, hy + 20);
+    }
+  }, [shown, ghostNotes, ghostHits, ghostColor, chords, key, playhead, showLandscape, highlightRows, noteLength, beatW, pxPerTick, totalTicks, gridW, gridH, selection, hover, preview, rootPc, ticksPerBar, ROW_H, appearance, swing, swingGridTicks, visiblePitches, rowOf, fold, pixelRatio]);
+
+  // ─── Ruler canvas ─────────────────────────────────────────────────────────────────────────
+  // Its own canvas, sticky over the grid's top band, so the bars stay in view as the rows scroll.
+  useEffect(() => {
+    const canvas = rulerRef.current;
+    if (!canvas) return;
+    const dpr = pixelRatio;
+    const W = GUTTER + gridW;
+    const H = RULER_H;
+    if (canvas.width !== Math.round(W * dpr) || canvas.height !== Math.round(H * dpr)) {
+      canvas.width = Math.round(W * dpr);
+      canvas.height = Math.round(H * dpr);
+      canvas.style.width = `${W}px`;
+      canvas.style.height = `${H}px`;
+    }
+    const ctx = canvas.getContext("2d")!;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.textBaseline = "middle";
+    const mono = (w: number, px: number) => `${w} ${px}px "JetBrains Mono", ui-monospace, monospace`;
+
+    // Loop bar (the pattern loops), bar + beat labels
+    ctx.fillStyle = C.ruler;
+    ctx.fillRect(0, 0, W, RULER_H);
+    ctx.fillStyle = C.line1;
+    ctx.fillRect(0, RULER_H - 1, W, 1);
+    // Loop brace: the whole pattern in the track color, a sub-region in accent.
+    ctx.globalAlpha = looping ? 0.8 : 0.25;
+    ctx.fillStyle = color;
+    ctx.fillRect(GUTTER, 2, gridW, 6);
+    if (loopRegion) {
+      ctx.fillStyle = C.accent;
+      ctx.fillRect(GUTTER + loopRegion[0] * pxPerTick, 2, (loopRegion[1] - loopRegion[0]) * pxPerTick, 6);
+    }
+    ctx.globalAlpha = 1;
+    for (let tk = 0; tk < totalTicks; tk += TICKS_PER_BEAT) {
+      const x = GUTTER + tk * pxPerTick;
+      const beat = ticksToBeats(tk);
+      const barIdx = Math.floor(beat / bpb);
+      const isBar = tk % ticksPerBar === 0;
+      if (!isBar && beatW < 40) continue;
+      ctx.fillStyle = isBar ? "#5a5a62" : "#2e2e36";
+      ctx.fillRect(Math.round(x), 10, 1, 18);
+      ctx.fillStyle = isBar ? C.text1 : C.text4;
+      ctx.font = isBar ? mono(600, 11) : mono(400, 9);
+      ctx.fillText(isBar ? `${barIdx + 1}` : `${barIdx + 1}.${Math.floor(beat % bpb) + 1}`, x + 4, 19);
+    }
+    // Chord names
+    ctx.font = mono(500, 9);
+    ctx.fillStyle = C.accent;
+    for (const c of chords) {
+      const x = GUTTER + c.startTick * pxPerTick;
+      const label = c.name ?? "";
+      const tw = ctx.measureText(label).width;
+      ctx.fillText(label, x + c.lengthTicks * pxPerTick - tw - 4, 19);
+    }
+    // A drum ghost's hits, ticked along the foot
+    if (ghostHits.length) {
+      ctx.fillStyle = ghostColor;
+      for (const h of ghostHits) {
+        const x = Math.round(GUTTER + h.startTick * pxPerTick);
+        const strong = h.pitch === 36 || h.pitch === 38 || h.pitch === 39;
+        ctx.globalAlpha = strong ? 0.9 : 0.45;
+        ctx.fillRect(x, RULER_H - (h.pitch === 36 ? 7 : 4), h.pitch === 36 ? 2 : 1, h.pitch === 36 ? 6 : 3);
+      }
+      ctx.globalAlpha = 1;
+    }
+    // Corner over the keyboard: the grid value
     ctx.fillStyle = C.ruler;
     ctx.fillRect(0, 0, GUTTER, RULER_H);
     ctx.fillStyle = C.line1;
@@ -598,40 +667,16 @@ export function PianoRoll() {
     ctx.font = mono(400, 9);
     const gl = gridLabel(noteLength);
     ctx.fillText(gl, (GUTTER - ctx.measureText(gl).width) / 2, RULER_H / 2);
-
-    // Playhead
+    // Playhead head
     const px = Math.round(GUTTER + playhead * pxPerTick);
-    if (!appearance.reducedMotion) {
-      ctx.shadowColor = "rgba(255,255,255,.5)";
-      ctx.shadowBlur = 6;
-    }
     ctx.fillStyle = "#fff";
-    ctx.fillRect(px, RULER_H, 1, gridH);
-    ctx.shadowBlur = 0;
     ctx.beginPath();
     ctx.moveTo(px - 5, 8);
     ctx.lineTo(px + 5, 8);
     ctx.lineTo(px, 15);
     ctx.closePath();
     ctx.fill();
-
-    // Hover readout
-    if (hover && !dragRef.current) {
-      const t = tierMap(hover.tick, chords, key)[hover.pitch % 12];
-      const label = `${midiName(hover.pitch)}${t ? ` · ${t === "chordTone" ? "chord tone" : t}` : ""}`;
-      const why = explainNote(hover.pitch, chords, key, hover.tick);
-      ctx.font = mono(500, 9);
-      const tw = Math.max(ctx.measureText(label).width, ctx.measureText(why).width) + 12;
-      const hx = Math.min(GUTTER + hover.tick * pxPerTick + 8, W - tw - 4);
-      const hy = Math.max(RULER_H + 2, yForPitch(hover.pitch) - 30);
-      ctx.fillStyle = "rgba(22,22,26,.94)";
-      ctx.fillRect(hx, hy, tw, 28);
-      ctx.fillStyle = t ? tierColor(t) : C.text1;
-      ctx.fillText(label, hx + 6, hy + 8);
-      ctx.fillStyle = "#b8b8c0";
-      ctx.fillText(why, hx + 6, hy + 20);
-    }
-  }, [shown, ghostNotes, ghostHits, ghostColor, chords, key, playhead, showLandscape, highlightRows, noteLength, beatW, pxPerTick, totalTicks, gridW, gridH, selection, hover, preview, color, rootPc, bpb, ticksPerBar, loopRegion, looping, ROW_H, appearance, swing, swingGridTicks, visiblePitches, rowOf, fold, pixelRatio]);
+  }, [ghostHits, ghostColor, chords, playhead, noteLength, beatW, pxPerTick, totalTicks, gridW, color, bpb, ticksPerBar, loopRegion, looping, pixelRatio]);
 
   // ─── Property lane canvas ─────────────────────────────────────────────────────────────────
   // One stem per note, drawn for whichever property the lane picker selects. Unipolar
@@ -705,6 +750,8 @@ export function PianoRoll() {
     const rect = el.getBoundingClientRect();
     return { x: e.clientX - rect.left, y: e.clientY - rect.top };
   };
+  /** A grid-canvas y measured from the sticky ruler's top, which sits at the scroll offset. */
+  const rulerY = (y: number) => y - (scrollRef.current?.scrollTop ?? 0);
 
   const hitTest = (x: number, y: number): { note: NoteEvent; edge: boolean } | null => {
     const n = noteAt(shown, tickForX(x), pitchForY(y));
@@ -718,13 +765,13 @@ export function PianoRoll() {
     const canvas = canvasRef.current!;
     scrollRef.current?.focus();
     const { x, y } = local(e, canvas);
-    if (y < RULER_H) {
+    if (rulerY(y) < RULER_H) {
       if (x < GUTTER) return;
       if (e.button === 2) {
         setLoopRegion(null);
         return;
       }
-      if (y < 10) {
+      if (rulerY(y) < 10) {
         // Drag in the brace strip to set a loop region (snapped to beats).
         canvas.setPointerCapture(e.pointerId);
         loopDrag.current = { anchor: Math.max(0, Math.min(totalTicks, Math.round(tickForX(x) / TICKS_PER_BEAT) * TICKS_PER_BEAT)) };
@@ -834,7 +881,7 @@ export function PianoRoll() {
     if (!d) {
       const tick = tickForX(x);
       const pitch = pitchForY(y);
-      setHover(x >= GUTTER && y >= RULER_H && tick < totalTicks && pitch >= LOW && pitch <= HIGH ? { tick, pitch } : null);
+      setHover(x >= GUTTER && rulerY(y) >= RULER_H && tick < totalTicks && pitch >= LOW && pitch <= HIGH ? { tick, pitch } : null);
       return;
     }
     // Auto-scroll when dragging past the viewport's edges.
@@ -929,7 +976,7 @@ export function PianoRoll() {
     const rect = canvas.getBoundingClientRect();
     const x = e.clientX - rect.left;
     const y = e.clientY - rect.top;
-    if (x >= GUTTER || y < RULER_H) return;
+    if (x >= GUTTER || rulerY(y) < RULER_H) return;
     const pitch = pitchForY(y);
     const pc = ((pitch % 12) + 12) % 12;
     const byClass = e.metaKey || e.ctrlKey;
@@ -1160,6 +1207,7 @@ export function PianoRoll() {
         onKeyDown={onKeyDown}
         onScroll={(e) => setScrollLeft((e.target as HTMLDivElement).scrollLeft)}
       >
+        <canvas className="rollruler" ref={rulerRef} style={{ marginBottom: -RULER_H }} />
         <canvas
           ref={canvasRef}
           onPointerDown={onPointerDown}

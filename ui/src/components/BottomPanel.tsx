@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type MouseEvent } from "react";
 import { dbText, selectedPattern, selectedTrack, selectedTrackIndex, useStore } from "../store";
-import { kitSounds, movePad, padName, pitchProblem, removePad, replacePad } from "../drumKit";
+import { kitSounds, matchingKit, movePad, padName, pitchProblem, removePad, replacePad } from "../drumKit";
 import { lookupSound, MAX_DRUM_PADS, type DrumPad, type Sound } from "../sound";
 import { midiName } from "../theory";
 import { usePanelSize } from "../panels";
@@ -19,6 +19,7 @@ import { eqDb, hz, Knob, lin, log, panText, pct } from "./Knob";
 import { InstrumentPicker, PluginParams } from "./PluginBrowser";
 import { VMeter } from "./Meter";
 import { AddPadPicker } from "./AddPadPicker";
+import { KitPicker } from "./KitPicker";
 import { SoundPicker, useSoundName } from "./SoundPicker";
 
 const VOL = lin(0, 1.5);
@@ -389,7 +390,7 @@ function DrumKitDevice({ track }: { track: Track }) {
       <div className="title">
         <span className="led" />
         <span>drum kit</span>
-        <span className="meta">{pads.length} / {MAX_DRUM_PADS} pads</span>
+        <span className="meta">{matchingKit(pads)?.name ?? "custom"} · {pads.length} / {MAX_DRUM_PADS} pads</span>
       </div>
       <div className="pad">
         <div className="kitrow kithead">
@@ -437,6 +438,9 @@ function DrumKitDevice({ track }: { track: Track }) {
           <AddPadPicker track={track} className="chip tiny">
             + add sound
           </AddPadPicker>
+          <KitPicker track={track} className="chip tiny">
+            load kit ▾
+          </KitPicker>
           <span className="spacer" />
           <button className="chip tiny" onClick={() => setScreen("sound")} title="open the SOUND page to design drum sounds">edit sounds ↗</button>
         </div>

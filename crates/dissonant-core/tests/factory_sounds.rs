@@ -40,7 +40,7 @@ fn library_is_big_enough() {
     let drums = sounds.iter().filter(|s| s.is_drum()).count();
     let synths = sounds.len() - drums;
     assert!(synths >= 46, "only {synths} synth sounds");
-    assert!(drums >= 44, "only {drums} drum sounds");
+    assert!(drums >= 110, "only {drums} drum sounds");
     assert_eq!(factory_sounds().len(), sounds.len());
 }
 
