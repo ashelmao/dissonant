@@ -10,8 +10,8 @@ use crate::dsp::pan_gains;
 use crate::synth::PolySynth;
 use dissonant_core::{
     factory_sound, swing_warp_ticks, AutomationCurve, InsertTarget, MasterSettings, NoteEvent,
-    NoteRope, Sequence, SequenceTrack, SoundPatch, SynthPatch, Tempo, TrackAutomation, VoiceMode,
-    MAX_INSERTS, TICKS_PER_BEAT,
+    NoteRope, Sequence, SequenceTrack, SoundPatch, SynthPatch, Tempo, TempoMap, TrackAutomation,
+    VoiceMode, MAX_INSERTS, ROPE_OVERLAP_SECS, TICKS_PER_BEAT,
 };
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -499,6 +499,77 @@ fn handed_over_hit(notes: &[NoteEvent], rope: NoteRope, note: &NoteEvent) -> Opt
         .map(|to| hit_at(note, notes[to].shifted_start() as f64))
 }
 
+/// How a track's instrument plays the ropes on it; see [`Engine::ropes_on`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RopePlay {
+    /// The built-in synth: the slide note takes its source's voice over by tag and glides it,
+    /// and the source's own end is never sent.
+    Glide,
+    /// A hosted plugin, which is addressed by pitch and has no voice to hand over. The source
+    /// is held just past its slide note's start instead (see [`overlap_end`]), so a plugin in
+    /// legato or mono mode sees two keys overlap and glides with its own portamento. The slide
+    /// note itself plays and ends as written.
+    Overlap,
+}
+
+/// Where a plugin track ends the hit of `notes[source]` that a live rope hands to
+/// `notes[target]`, if not at its written end `end`. Everything is on the swung ticks the
+/// scheduler works in, and the result is clamped to the timeline like every other end.
+///
+/// Only a source that touches its slide note (ends at or before its start) is stretched, to
+/// [`ROPE_OVERLAP_SECS`] past that start: one that already overlaps it already glides on a
+/// legato plugin. The overlap is a fixed time rather than a number of ticks so it means the
+/// same thing at every tempo. `None` too when the two notes share a pitch (the rope is a tie,
+/// and a plugin would take the late note-off as ending the slide note). Whether the stretched
+/// end would cut another note of the same key is a separate question
+/// ([`key_starts_between`]), asked only when the end is about to be scheduled.
+///
+/// A chord's ropes are each stretched, so a polyphonic plugin hears every pair overlap for a
+/// moment: a pitch-addressed plugin can't glide several voices separately. MPE could, and is
+/// not built.
+fn overlap_end(
+    notes: &[NoteEvent],
+    source: usize,
+    target: usize,
+    end: f64,
+    swing: impl Fn(f64) -> f64,
+    map: &TempoMap,
+    length: f64,
+) -> Option<f64> {
+    let (src, tgt) = (&notes[source], &notes[target]);
+    let on = swing(tgt.shifted_start() as f64);
+    if end > on || src.pitch == tgt.pitch {
+        return None;
+    }
+    Some(
+        map.tick_at_seconds(map.seconds_at_tick(on) + ROPE_OVERLAP_SECS)
+            .min(length),
+    )
+}
+
+/// Whether any hit of another note of `notes[source]`'s pitch — including the source's own
+/// later repeats — starts within `[from, to]` (swung ticks). A plugin knows a note only by its
+/// key, so a source held on across such a start would end that note instead of its own.
+fn key_starts_between(
+    notes: &[NoteEvent],
+    source: usize,
+    from: f64,
+    to: f64,
+    swing: impl Fn(f64) -> f64,
+) -> bool {
+    let pitch = notes[source].pitch;
+    notes
+        .iter()
+        .filter(|n| !n.muted && n.pitch == pitch)
+        .any(|n| {
+            let hits = sub_hits(n);
+            let len = n.length_ticks as f64 / hits as f64;
+            let start = n.shifted_start() as f64;
+            // The stretched hit itself, and the source's hits before it, start before `from`.
+            (0..hits).any(|h| (from..=to).contains(&swing(start + len * h as f64)))
+        })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Event {
     offset: usize,
@@ -630,6 +701,10 @@ pub struct Engine {
     preview_closing: bool,
     /// Stereo scratch for the preview, and the scope's mono fold.
     preview_buf: (Vec<f32>, Vec<f32>),
+    /// Tracks the scheduler plays ropes on as if they hosted a plugin. A real plugin can't be
+    /// opened without one installed, and only the scheduling is under test.
+    #[cfg(test)]
+    pretend_plugin: Vec<usize>,
 }
 
 /// The chord bed's sound: the factory pad.
@@ -685,6 +760,8 @@ impl Engine {
             preview: None,
             preview_closing: false,
             preview_buf: (vec![0.0; 8192], vec![0.0; 8192]),
+            #[cfg(test)]
+            pretend_plugin: Vec::new(),
         }
     }
 
@@ -1646,27 +1723,38 @@ impl Engine {
         }
     }
 
-    /// The live ropes on track `ti`, indexed like its notes, or nothing when they don't apply.
+    /// The live ropes on track `ti`, indexed like its notes, and how its instrument plays them;
+    /// no ropes when they don't apply.
     ///
-    /// Only the built-in synth plays ropes: a drum hit has no voice to hand on, and a plugin is
-    /// addressed by pitch, so ropes are ignored there and every note plays (and ends) as
-    /// written. That is checked against the channel's actual instrument rather than the
-    /// track's settings, so a plugin still being swapped in never has a note-off held back.
-    /// A table that no longer matches the notes is ignored too (see [`SequenceTrack::ropes`]).
+    /// The built-in synth glides a voice from note to note. A plugin is addressed by pitch, so
+    /// it gets the overlap trick instead ([`RopePlay::Overlap`]). A drum hit has no voice to
+    /// hand on, so drums (and an audio track's silent instrument) ignore ropes. That is checked
+    /// against the channel's actual instrument rather than the track's settings, so a plugin
+    /// still being swapped in is never sent a slide it can't play, and the synth that stands in
+    /// for it never has a note-off held back that nothing will release. A table that no longer
+    /// matches the notes is ignored too (see [`SequenceTrack::ropes`]).
     ///
     /// Liveness was decided on raw ticks when the sequence was built and is not re-checked on
     /// swung times. Swing is a strictly increasing warp of the tick line, so a source that
     /// starts before its target and ends at or after it still does once both are swung, and a
     /// rope that touches still touches.
-    fn ropes_on<'s>(&self, ti: usize, track: &'s SequenceTrack) -> &'s [NoteRope] {
-        let synth = matches!(
-            self.channels.get(ti).map(|c| &c.instrument),
-            Some(Instrument::Synth(_))
-        );
-        if synth && track.ropes.len() == track.notes.len() {
-            &track.ropes
-        } else {
-            &[]
+    fn ropes_on<'s>(&self, ti: usize, track: &'s SequenceTrack) -> (RopePlay, &'s [NoteRope]) {
+        let play = match self.channels.get(ti).map(|c| &c.instrument) {
+            Some(Instrument::Synth(_)) => Some(RopePlay::Glide),
+            Some(Instrument::Plugin(_)) => Some(RopePlay::Overlap),
+            _ => None,
+        };
+        #[cfg(test)]
+        let play = play.map(|p| {
+            if self.pretend_plugin.contains(&ti) {
+                RopePlay::Overlap
+            } else {
+                p
+            }
+        });
+        match play {
+            Some(play) if track.ropes.len() == track.notes.len() => (play, &track.ropes),
+            _ => (RopePlay::Glide, &[]),
         }
     }
 
@@ -1680,6 +1768,13 @@ impl Engine {
     /// the slide still finds it. A source whose slide note has already started is not resumed
     /// at all: its voice would have been the slide note's by now, and its own end, which the
     /// scheduler holds back, would never release it.
+    ///
+    /// A plugin track resumes every note by its written length. A source that only touches its
+    /// slide note has ended by the time the slide note starts, so it stays out of the slide
+    /// note just as on a synth; its stretched note-off may still be ahead (the playhead landed
+    /// in the overlap's few milliseconds) and then reaches the plugin for a key it isn't
+    /// holding, which it ignores. A source that already overlaps is resumed, because a plugin
+    /// really does hear it until its own end.
     fn resume_notes_under(&mut self, from: f64) {
         let any_solo = self.sequence.any_solo();
         let seq = Arc::clone(&self.sequence);
@@ -1689,7 +1784,10 @@ impl Engine {
             if !track.audible(any_solo) || track.is_drum {
                 continue;
             }
-            let ropes = self.ropes_on(ti, track);
+            let ropes = match self.ropes_on(ti, track) {
+                (RopePlay::Glide, ropes) => ropes,
+                (RopePlay::Overlap, _) => &[],
+            };
             for (ni, note) in track.notes.iter().enumerate() {
                 if note.muted {
                     continue;
@@ -1760,12 +1858,13 @@ impl Engine {
             if !track.audible(any_solo) {
                 continue;
             }
-            let ropes = self.ropes_on(ti, track);
+            let (play, ropes) = self.ropes_on(ti, track);
             for (ni, note) in track.notes.iter().enumerate() {
                 if note.muted {
                     continue;
                 }
                 let rope = ropes.get(ni).copied().unwrap_or_default();
+                let handed = handed_over_hit(&track.notes, rope, note);
                 let pitch = note.pitch.clamp(0, 127) as u8;
                 let velocity = note.velocity.clamp(1, 127) as u8;
                 let shape = NoteShape::from_note(note);
@@ -1788,7 +1887,7 @@ impl Engine {
                                 shape,
                                 tag,
                                 // Only the first hit slides; the rest retrigger as written.
-                                slide: if h == 0 {
+                                slide: if h == 0 && play == RopePlay::Glide {
                                     rope_slide(&track.notes, rope, note)
                                 } else {
                                     None
@@ -1796,15 +1895,43 @@ impl Engine {
                             },
                         });
                     }
+                    // A hit whose voice a rope hands on is released by the slide note instead
+                    // on a synth, and held into the slide note on a plugin.
+                    let e = match (rope.to, play) {
+                        (Some(_), RopePlay::Glide) if handed == Some(h) => continue,
+                        (Some(target), RopePlay::Overlap) if handed == Some(h) => {
+                            match overlap_end(
+                                &track.notes,
+                                ni,
+                                target,
+                                e,
+                                swing,
+                                &seq.tempo_map,
+                                seq.length_ticks as f64,
+                            ) {
+                                // The note-off lands at `e` or `late`, never between, so it
+                                // belongs to this window only if `[e, late]` meets it. Only
+                                // then is it worth scanning the track for a note it would cut,
+                                // and the answer is the same in whichever window asks: the off
+                                // is scheduled exactly once, wherever the block boundaries or
+                                // the loop seam fall. One past the seam is never scheduled,
+                                // and the seam's release ends the note there instead.
+                                Some(late)
+                                    if late >= from
+                                        && e < to
+                                        && key_starts_between(&track.notes, ni, e, late, swing) =>
+                                {
+                                    e
+                                }
+                                Some(late) => late,
+                                None => e,
+                            }
+                        }
+                        _ => e,
+                    };
                     // A drum hit is a one-shot: it rings out on its own and has nothing to
-                    // release. A hit whose voice a rope hands on is released by the slide
-                    // note instead.
-                    if e > s
-                        && e >= from
-                        && e < to
-                        && !track.is_drum
-                        && handed_over_hit(&track.notes, rope, note) != Some(h)
-                    {
+                    // release.
+                    if e > s && e >= from && e < to && !track.is_drum {
                         self.events.push(Event {
                             offset: offset_of(e),
                             kind: EventKind::NoteOff {
@@ -3302,6 +3429,251 @@ mod tests {
             "and again on the next"
         );
         assert!(v[0].glide > 57.0 && v[0].glide < 59.0, "{}", v[0].glide);
+    }
+
+    // ── Ropes on a plugin ──
+
+    /// `roped`, with the first track's ropes scheduled as for a hosted plugin.
+    fn on_plugin(notes: Vec<NoteEvent>) -> Engine {
+        let mut e = roped(VoiceMode::Poly, 0.0, notes);
+        e.pretend_plugin.push(0);
+        e
+    }
+
+    /// Whether `offset` is [`ROPE_OVERLAP_SECS`] after `at` (220.5 samples, which rounds
+    /// either way).
+    fn overlaps(at: usize, offset: usize) -> bool {
+        let late = at as f64 + ROPE_OVERLAP_SECS * SR as f64;
+        (offset as f64 - late).abs() <= 0.5
+    }
+
+    /// Like [`note_events`], over `frames` samples actually played in blocks of `block`, with
+    /// every offset counted from the first block's start.
+    fn note_events_in_blocks(
+        e: &mut Engine,
+        frames: usize,
+        block: usize,
+    ) -> Vec<(usize, bool, u8)> {
+        let mut out = vec![];
+        let mut buf = vec![0.0f32; block * 2];
+        let mut done = 0;
+        while done < frames {
+            let n = (frames - done).min(block);
+            e.process(&mut buf[..n * 2]);
+            out.extend(e.events.iter().filter_map(|ev| match ev.kind {
+                EventKind::NoteOn { pitch, .. } => Some((done + ev.offset, true, pitch)),
+                EventKind::NoteOff { pitch, .. } => Some((done + ev.offset, false, pitch)),
+                _ => None,
+            }));
+            done += n;
+        }
+        out
+    }
+
+    #[test]
+    fn a_plugin_hears_a_touching_rope_as_two_keys_overlapping() {
+        let a = NoteEvent::new(0, B, 57);
+        let notes = vec![a.clone(), rope_secs(&a, NoteEvent::new(B, 2 * B, 64), 0.2)];
+        let events = note_events(&mut on_plugin(notes.clone()), SPAN);
+        assert_eq!(events.len(), 4, "{events:?}");
+        assert_eq!(&events[..2], &[(0, true, 57), (22_050, true, 64)]);
+        let (off, on, pitch) = events[2];
+        assert!(
+            !on && pitch == 57 && overlaps(22_050, off),
+            "the source ends just after the slide note starts: {events:?}"
+        );
+        assert_eq!(
+            events[3],
+            (66_150, false, 64),
+            "the slide note ends as written"
+        );
+        assert_eq!(
+            note_ons(&mut on_plugin(notes.clone()), SPAN),
+            vec![(0, 57, false), (22_050, 64, false)],
+            "a plugin is never asked to slide"
+        );
+        assert_eq!(
+            note_events(&mut roped(VoiceMode::Poly, 0.0, notes), SPAN),
+            vec![(0, true, 57), (22_050, true, 64), (66_150, false, 64)],
+            "a synth track still hands the voice over and never ends the source"
+        );
+    }
+
+    #[test]
+    fn a_plugin_keeps_written_ends_where_overlapping_would_be_wrong() {
+        let plain = |notes: Vec<NoteEvent>, expected: Vec<(usize, bool, u8)>, why: &str| {
+            let mut events = note_events(&mut on_plugin(notes), SPAN);
+            events.sort();
+            assert_eq!(events, expected, "{why}");
+        };
+        // Already overlapping: it glides on a legato plugin as it is.
+        let a = NoteEvent::new(0, 2 * B, 57);
+        plain(
+            vec![a.clone(), rope(&a, NoteEvent::new(B, 2 * B, 64))],
+            vec![
+                (0, true, 57),
+                (22_050, true, 64),
+                (44_100, false, 57),
+                (66_150, false, 64),
+            ],
+            "an overlapping source keeps its own end",
+        );
+        // No rope.
+        let a = NoteEvent::new(0, B, 57);
+        plain(
+            vec![a.clone(), NoteEvent::new(B, B, 64)],
+            vec![
+                (0, true, 57),
+                (22_050, false, 57),
+                (22_050, true, 64),
+                (44_100, false, 64),
+            ],
+            "touching notes without a rope end where they are written",
+        );
+        // A tie: a late note-off would end the slide note's own key.
+        plain(
+            vec![a.clone(), rope(&a, NoteEvent::new(B, B, 57))],
+            vec![
+                (0, true, 57),
+                (22_050, false, 57),
+                (22_050, true, 57),
+                (44_100, false, 57),
+            ],
+            "a rope between equal pitches",
+        );
+        // Another note of the source's key starting inside the overlap would be cut by it.
+        plain(
+            vec![
+                a.clone(),
+                rope(&a, NoteEvent::new(B, B, 64)),
+                NoteEvent::new(B, B / 2, 57),
+            ],
+            vec![
+                (0, true, 57),
+                (22_050, false, 57),
+                (22_050, true, 57),
+                (22_050, true, 64),
+                (33_075, false, 57),
+                (44_100, false, 64),
+            ],
+            "a note of the same key starting under the overlap",
+        );
+    }
+
+    #[test]
+    fn a_repeated_plugin_source_holds_only_the_hit_that_touches_the_slide() {
+        // Two hits, 0–1 and 1–2 beats; the slide note starts as the second ends.
+        let mut a = NoteEvent::new(0, 2 * B, 57);
+        a.repeats = 1;
+        let events = note_events(
+            &mut on_plugin(vec![a.clone(), rope(&a, NoteEvent::new(2 * B, B, 64))]),
+            SPAN,
+        );
+        assert_eq!(events.len(), 6, "{events:?}");
+        assert_eq!(
+            &events[..4],
+            &[
+                (0, true, 57),
+                (22_050, false, 57),
+                (22_050, true, 57),
+                (44_100, true, 64)
+            ],
+            "the first hit ends where it is written"
+        );
+        let (off, on, pitch) = events[4];
+        assert!(!on && pitch == 57 && overlaps(44_100, off), "{events:?}");
+        assert_eq!(events[5], (66_150, false, 64));
+
+        // The slide note starts as the *first* hit ends, which is where the second begins:
+        // holding the first on would cut the second, so nothing is stretched.
+        let mut events = note_events(
+            &mut on_plugin(vec![a.clone(), rope(&a, NoteEvent::new(B, B, 64))]),
+            SPAN,
+        );
+        events.sort();
+        assert_eq!(
+            events,
+            vec![
+                (0, true, 57),
+                (22_050, false, 57),
+                (22_050, true, 57),
+                (22_050, true, 64),
+                (44_100, false, 57),
+                (44_100, false, 64),
+            ]
+        );
+    }
+
+    /// The stretched end lands in whichever block holds its time, exactly once, however the
+    /// blocks fall around the slide note's start and the end itself.
+    #[test]
+    fn the_overlap_note_off_fires_once_across_block_boundaries() {
+        let a = NoteEvent::new(0, B, 57);
+        let notes = vec![a.clone(), rope(&a, NoteEvent::new(B, B, 64))];
+        let whole = note_events_in_blocks(&mut on_plugin(notes.clone()), SPAN, SPAN);
+        assert_eq!(
+            whole.iter().filter(|&&(_, on, p)| !on && p == 57).count(),
+            1
+        );
+        for block in [64, 441, 512, 22_051, 22_100, 22_270, 22_271, 22_272] {
+            let events = note_events_in_blocks(&mut on_plugin(notes.clone()), SPAN, block);
+            // The overlap is 220.5 samples, so where it rounds can depend on the block's start.
+            let same = events.len() == whole.len()
+                && events
+                    .iter()
+                    .zip(&whole)
+                    .all(|(a, b)| a.1 == b.1 && a.2 == b.2 && a.0.abs_diff(b.0) <= 1);
+            assert!(same, "blocks of {block}: {events:?} against {whole:?}");
+        }
+    }
+
+    /// A slide note starting a hair before the loop end: its source's stretched end falls past
+    /// the seam, so it is never scheduled, the seam's release ends the note instead, and the
+    /// next pass neither hangs on to it nor gets a stray note-off.
+    #[test]
+    fn an_overlap_past_the_loop_seam_is_left_to_the_seams_release() {
+        let a = NoteEvent::new(7 * B, B - 5, 57);
+        let notes = vec![a.clone(), rope(&a, NoteEvent::new(8 * B - 5, B, 64))];
+        let pass = 8 * 22_050;
+        let mut e = on_plugin(notes);
+        let events = note_events_in_blocks(&mut e, 2 * pass, 512);
+        let on_at = |tick: i64| (tick as f64 * 22_050.0 / B as f64).round() as usize;
+        assert_eq!(
+            events,
+            vec![
+                (on_at(7 * B), true, 57),
+                (on_at(8 * B - 5), true, 64),
+                (pass + on_at(7 * B), true, 57),
+                (pass + on_at(8 * B - 5), true, 64),
+            ],
+            "no note-off at all: both notes run into the seam"
+        );
+        run(&mut e, 512);
+        assert!(held(&e).is_empty(), "released at the seam: {:?}", held(&e));
+    }
+
+    #[test]
+    fn seeking_into_a_plugin_source_still_overlaps_its_slide_note() {
+        let a = NoteEvent::new(0, B, 57);
+        let notes = vec![a.clone(), rope(&a, NoteEvent::new(B, B, 64))];
+        let mut e = on_plugin(notes.clone());
+        e.handle(EngineCommand::Seek {
+            tick: (B / 2) as f64,
+        });
+        let events = note_events(&mut e, 22_050);
+        assert_eq!(
+            &events[..2],
+            &[(0, true, 57), (11_025, true, 64)],
+            "{events:?}"
+        );
+        assert!(events[2].0 > 11_025 && !events[2].1 && events[2].2 == 57);
+
+        // Into the slide note: the touching source has ended, so it is not resumed.
+        let mut e = on_plugin(notes);
+        e.handle(EngineCommand::Seek {
+            tick: (B + B / 2) as f64,
+        });
+        assert_eq!(note_ons(&mut e, 22_050), vec![(0, 64, false)]);
     }
 
     #[test]

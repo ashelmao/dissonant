@@ -36,7 +36,7 @@ pub use model::{
     ChordEvent, Clip, EqModel, Gate, Insert, KeyState, MasterSettings, MicModel, NoteEvent, Pedal,
     PedalKind, ProjectModel, Rack, ScaleType, Section, SongPattern, TimeSignature, Track,
     TrackKind, TrackPlugin, DEFAULT_SONG_BARS, MAX_CLIP_GAIN, MAX_FADE_SECONDS, MAX_INSERTS,
-    MAX_PEDALS, MAX_SHIFT_TICKS, MAX_SLIDE_SECS, MIN_NOTE_TICKS, SCHEMA_VERSION,
+    MAX_PEDALS, MAX_SHIFT_TICKS, MAX_SLIDE_SECS, MIN_NOTE_TICKS, ROPE_OVERLAP_SECS, SCHEMA_VERSION,
 };
 pub use sequence::{
     MasterAutomation, NoteRope, Sequence, SequenceAudioClip, SequenceTrack, TrackAutomation,

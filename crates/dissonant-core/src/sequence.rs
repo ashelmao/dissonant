@@ -64,7 +64,7 @@ pub struct NoteRope {
 
 /// The live ropes in `notes` on a timeline `length_ticks` long; see [`NoteRope`]. Empty when no
 /// note has a rope, which is nearly every track.
-fn live_ropes(notes: &[NoteEvent], length_ticks: i64) -> Vec<NoteRope> {
+pub(crate) fn live_ropes(notes: &[NoteEvent], length_ticks: i64) -> Vec<NoteRope> {
     if notes.iter().all(|n| n.slide_from.is_none()) {
         return vec![];
     }
