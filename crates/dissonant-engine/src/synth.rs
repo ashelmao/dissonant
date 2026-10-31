@@ -1,6 +1,8 @@
 //! Polyphonic subtractive + FM synth playing a [`SynthPatch`]: a pool of voices with velocity,
 //! round-robin allocation and oldest-note stealing in Poly, or one shared voice in Mono and
-//! Legato. A note always starts at its own pitch: nothing glides on its own.
+//! Legato. A note always starts at its own pitch: nothing glides on its own. The one exception
+//! is a slide (a rope from another note), which takes over the voice of the note it comes from
+//! in any mode and glides it to the new pitch.
 //!
 //! Per voice: 3 PolyBLEP oscillators (unison, FM / ring / hard sync between osc 1 and 2) +
 //! coloured noise → pre-drive → multimode SVF (key tracking, envelope, velocity, LFO) → the
@@ -15,11 +17,12 @@
 //! alone would: unity gains on both sides, no extra filter and the patch's own release.
 
 use crate::dsp::{
-    drive, drive_gain, midi_to_hz, note_filter, note_pan_gains, soft_limit, wave, Adsr, AdsrParams,
-    Chorus, Crusher, Echo, Lfo, NoteFilter, Rng, Svf,
+    drive, drive_gain, midi_to_hz, note_filter, note_filter_tuning, note_pan_gains, soft_limit,
+    wave, Adsr, AdsrParams, Chorus, Crusher, Echo, Lfo, NoteFilter, Rng, Svf,
 };
-use crate::engine::NoteShape;
+use crate::engine::{NoteShape, Slide, VoiceTag};
 use dissonant_core::sound::{Envelope, FilterMode, LfoTarget, OscWave, SynthPatch, VoiceMode};
+use dissonant_core::MAX_SLIDE_SECS;
 use std::f32::consts::{PI, SQRT_2};
 
 /// Samples per control block.
@@ -39,6 +42,11 @@ const QUIET: f32 = 1e-5;
 /// How far a note's `release` scales the patch's own tail, in octaves either way: 0 is a
 /// quarter of it, 0.5 leaves it alone, 1 stretches it fourfold.
 const RELEASE_OCTAVES: f32 = 2.0;
+
+/// A note filter as good as absent, in the octave form a slide eases through: log2 of a cutoff
+/// at the top of the range (20 kHz) and of a flat Q (0.707). A slide into or out of a note with
+/// no filter of its own starts or ends here.
+const OPEN_FILTER: (f32, f32) = (14.287_712, -0.500_217_9);
 
 /// Where a synth sits when its track has told it nothing. Only bare test synths are ever in
 /// that state; a channel pushes its own tone down on every `apply`.
@@ -74,8 +82,7 @@ struct Derived {
     pre_drive: (f32, f32),
     post_drive: (f32, f32),
     crush: (f32, f32),
-    /// Per-sample rates (1/τ) for the glide and pitch-envelope exponentials; 0 = jump.
-    glide_rate: f32,
+    /// Per-sample rate (1/τ) for the pitch-envelope exponential.
     pitch_env_rate: f32,
     lfo_inc: [f32; 2],
     lfo_on: [bool; 2],
@@ -94,12 +101,6 @@ impl Derived {
             pre_drive: drive_gain(p.filter.drive),
             post_drive: drive_gain(p.drive),
             crush: Crusher::params(p.crush),
-            // The exponentials get ~95% of the way in the knob's time (τ = time / 3).
-            glide_rate: if p.glide > 0.0 {
-                3.0 / (p.glide * sr)
-            } else {
-                0.0
-            },
             pitch_env_rate: 3.0 / (p.pitch_env_decay.max(0.001) * sr),
             lfo_inc: [p.lfo[0].rate / sr, p.lfo[1].rate / sr],
             lfo_on: [0, 1].map(|l| p.lfo[l].depth > 0.0 && p.lfo[l].target != LfoTarget::None),
@@ -181,7 +182,6 @@ struct Ctx {
     /// Smoothed knobs at the start and end of the block.
     from: Knobs,
     to: Knobs,
-    glide_mul: f32,
     pitch_env_mul: f32,
     /// Free-running LFO values.
     free_lfo: [f32; 2],
@@ -193,16 +193,75 @@ fn ramp(a: f32, b: f32, i: usize, n: usize) -> f32 {
     a + (b - a) * ((i + 1) as f32 / n as f32)
 }
 
+/// The rate (1/τ per sample) of an exponential that gets ~95% of the way in `secs` (τ = secs / 3);
+/// 0, a jump, for no time at all.
+fn slide_rate(secs: f32, sr: f32) -> f32 {
+    if secs > 0.0 {
+        3.0 / (secs * sr)
+    } else {
+        0.0
+    }
+}
+
+/// What a note's `release` multiplies the patch's tail by.
+fn release_scale(release: f32) -> f32 {
+    ((release.clamp(0.0, 1.0) - 0.5) * 2.0 * RELEASE_OCTAVES).exp2()
+}
+
+/// A note filter's tuning as log2 cutoff and Q, the form a slide eases through:
+/// [`OPEN_FILTER`] for a note with none.
+fn filter_octaves(filtered: bool, tone_hz: f32, shape: NoteShape) -> (f32, f32) {
+    if !filtered {
+        return OPEN_FILTER;
+    }
+    let (cutoff, q) = note_filter_tuning(tone_hz, shape.mod_x, shape.mod_y);
+    (cutoff.log2(), q.log2())
+}
+
+/// A slide easing the next note's expression in: where each part is heading, and how fast.
+/// Everything travels on the same exponential as the pitch, so the new note's level, pan,
+/// filter, detune and release all arrive together with it instead of on its first sample.
+#[derive(Debug, Clone, Copy)]
+struct Ease {
+    rate: f32,
+    /// How much of the way is still to go, from 1; the ease snaps home below [`EASE_DONE`].
+    left: f32,
+    velocity: f32,
+    pan: f32,
+    fine: f32,
+    release_scale: f32,
+    /// The note filter's tuning in octaves (see [`Voice::filter_at`]), and whether the filter
+    /// goes once it gets there because the new note has none.
+    filter_at: (f32, f32),
+    filter_off: bool,
+}
+
+/// What is left of an ease when it snaps to its target: -60 dB of the step, about 7τ.
+const EASE_DONE: f32 = 1e-3;
+
+/// One entry on the one-voice modes' held-key stack.
+#[derive(Debug, Clone, Copy, Default)]
+struct Key {
+    pitch: u8,
+    /// A sequenced note's tag; `None` for a live key, which is matched by pitch.
+    tag: Option<VoiceTag>,
+}
+
 #[derive(Debug, Clone)]
 struct Voice {
     /// The held key; `None` once released.
     pitch: Option<u8>,
+    /// The sequenced note this voice is playing, so that note's own end, or a slide out of it,
+    /// finds exactly this voice. `None` for a live key (released by pitch) and once released.
+    tag: Option<VoiceTag>,
     started_at: u64,
     /// 0–1
     velocity: f32,
     /// Note pitch in semitones and where the glide currently is.
     target: f32,
     glide: f32,
+    /// How fast `glide` chases `target` (1/τ per sample): set by each slide from its own time.
+    glide_rate: f32,
     /// 1 at note-on, decaying to 0.
     pitch_env: f32,
     amp_env: Adsr,
@@ -228,16 +287,27 @@ struct Voice {
     /// What the note's `release` multiplies the patch's tail by; 1 at neutral. Kept so that a
     /// live `set_patch` can re-apply it over the new patch's release.
     release_scale: f32,
+    /// The note's pan as the voice plays it, and its note filter's cutoff and Q as log2 values
+    /// ([`OPEN_FILTER`] when it has none): what a slide eases from.
+    pan: f32,
+    filter_at: (f32, f32),
+    /// Set while a slide eases the new note's expression in.
+    ease: Option<Ease>,
+    /// Velocity and pan gains at the start of the block being rendered, which `finish` ramps
+    /// from. The same as the current ones unless a slide is easing them in.
+    block_from: (f32, (f32, f32)),
 }
 
 impl Voice {
     fn new(p: &SynthPatch, sr: f32, seed: u32) -> Self {
         Voice {
             pitch: None,
+            tag: None,
             started_at: 0,
             velocity: 0.0,
             target: 60.0,
             glide: 60.0,
+            glide_rate: 0.0,
             pitch_env: 0.0,
             amp_env: Adsr::new(adsr(&p.amp_env), sr),
             filter_env: Adsr::new(adsr(&p.filter_env), sr),
@@ -254,6 +324,10 @@ impl Voice {
             note_filter: None,
             fine: 0.0,
             release_scale: 1.0,
+            pan: 0.5,
+            filter_at: OPEN_FILTER,
+            ease: None,
+            block_from: (0.0, (1.0, 1.0)),
         }
     }
 
@@ -261,7 +335,15 @@ impl Voice {
     /// its phases, filter state and envelope levels — slamming any of them to zero while it
     /// still sounds would be a step, i.e. an audible click — and its attack ramps on from
     /// wherever the old note had got to.
-    fn start(&mut self, p: &SynthPatch, pitch: u8, velocity: u8, reset: bool, at: u64) {
+    fn start(
+        &mut self,
+        p: &SynthPatch,
+        pitch: u8,
+        velocity: u8,
+        tag: Option<VoiceTag>,
+        reset: bool,
+        at: u64,
+    ) {
         if reset {
             self.amp_env.reset();
             self.filter_env.reset();
@@ -285,8 +367,10 @@ impl Voice {
             }
         }
         self.pitch = Some(pitch);
+        self.tag = tag;
         self.started_at = at;
         self.velocity = velocity as f32 / 127.0;
+        self.ease = None;
         self.jump_to(pitch);
         self.pitch_env = 1.0;
         self.amp_env.gate_on();
@@ -303,18 +387,109 @@ impl Voice {
     /// Point the voice at one note's own expression. Separate from [`Voice::start`] because
     /// Legato re-shapes a voice it deliberately does not restart.
     fn shape(&mut self, p: &SynthPatch, shape: NoteShape, tone_hz: f32, sr: f32) {
+        self.ease = None;
+        self.pan = shape.pan;
         self.gains = note_pan_gains(shape.pan);
         self.fine = shape.fine as f32 / 100.0;
-        self.release_scale = ((shape.release.clamp(0.0, 1.0) - 0.5) * 2.0 * RELEASE_OCTAVES).exp2();
+        self.release_scale = release_scale(shape.release);
         self.amp_env
             .set_release(p.amp_env.release * self.release_scale);
         self.note_filter = note_filter(sr, tone_hz, shape.mod_x, shape.mod_y);
+        self.filter_at = filter_octaves(self.note_filter.is_some(), tone_hz, shape);
+    }
+
+    /// Hand this voice to the next note of a rope: retag it, glide to `pitch` over `secs` and
+    /// ease the new note's expression in over the same time. Nothing restarts — no envelope,
+    /// LFO or pitch-envelope retrigger — so the two notes sound as one. At 0 seconds the pitch
+    /// jumps and the expression lands at once, still without an attack.
+    #[allow(clippy::too_many_arguments)]
+    fn slide_to(
+        &mut self,
+        p: &SynthPatch,
+        pitch: u8,
+        velocity: u8,
+        shape: NoteShape,
+        tag: Option<VoiceTag>,
+        secs: f32,
+        at: u64,
+        tone_hz: f32,
+        sr: f32,
+    ) {
+        self.pitch = Some(pitch);
+        self.tag = tag;
+        self.started_at = at;
+        let rate = slide_rate(secs, sr);
+        if rate <= 0.0 {
+            self.jump_to(pitch);
+            self.velocity = velocity as f32 / 127.0;
+            self.shape(p, shape, tone_hz, sr);
+            return;
+        }
+        self.target = pitch as f32;
+        self.glide_rate = rate;
+        let filtered = note_filter(sr, tone_hz, shape.mod_x, shape.mod_y).is_some();
+        if filtered && self.note_filter.is_none() {
+            // No filter on the way out: fade one in from wide open, where it is as good as
+            // absent.
+            self.filter_at = OPEN_FILTER;
+            self.note_filter = Some(NoteFilter::lowpass(
+                sr,
+                OPEN_FILTER.0.exp2(),
+                OPEN_FILTER.1.exp2(),
+            ));
+        }
+        self.ease = Some(Ease {
+            rate,
+            left: 1.0,
+            velocity: velocity as f32 / 127.0,
+            pan: shape.pan,
+            fine: shape.fine as f32 / 100.0,
+            release_scale: release_scale(shape.release),
+            filter_at: filter_octaves(filtered, tone_hz, shape),
+            filter_off: !filtered,
+        });
+    }
+
+    /// Move a slide's ease on by one block of `n` samples, snapping home at the end.
+    fn ease_block(&mut self, p: &SynthPatch, n: f32, sr: f32) {
+        let Some(mut e) = self.ease else {
+            return;
+        };
+        let k = 1.0 - (-n * e.rate).exp();
+        e.left *= 1.0 - k;
+        if e.left < EASE_DONE {
+            self.velocity = e.velocity;
+            self.pan = e.pan;
+            self.fine = e.fine;
+            self.release_scale = e.release_scale;
+            self.filter_at = e.filter_at;
+            if e.filter_off {
+                self.note_filter = None;
+            }
+            self.ease = None;
+        } else {
+            let mv = |a: &mut f32, b: f32| *a += (b - *a) * k;
+            mv(&mut self.velocity, e.velocity);
+            mv(&mut self.pan, e.pan);
+            mv(&mut self.fine, e.fine);
+            mv(&mut self.release_scale, e.release_scale);
+            mv(&mut self.filter_at.0, e.filter_at.0);
+            mv(&mut self.filter_at.1, e.filter_at.1);
+            self.ease = Some(e);
+        }
+        self.gains = note_pan_gains(self.pan);
+        self.amp_env
+            .set_release(p.amp_env.release * self.release_scale);
+        if let Some(f) = &mut self.note_filter {
+            f.retune(sr, self.filter_at.0.exp2(), self.filter_at.1.exp2());
+        }
     }
 
     fn release(&mut self) {
         self.amp_env.gate_off();
         self.filter_env.gate_off();
         self.pitch = None;
+        self.tag = None;
     }
 
     /// Render one block (`out_l.len()` ≤ [`BLOCK`]), adding into `out_l` / `out_r`.
@@ -329,6 +504,8 @@ impl Voice {
     ) {
         let n = out_l.len();
         let nf = n as f32;
+        self.block_from = (self.velocity, self.gains);
+        self.ease_block(p, nf, sr);
 
         // ── Block-rate modulation ──
         let (mut m_pitch, mut m_cut, mut m_amp, mut m_pw, mut m_fm) = (0.0, 0.0, 1.0, 0.0, 0.0);
@@ -354,7 +531,17 @@ impl Voice {
                 LfoTarget::None => {}
             }
         }
-        self.glide += (self.target - self.glide) * c.glide_mul;
+        if self.glide != self.target {
+            let k = if self.glide_rate > 0.0 {
+                1.0 - (-nf * self.glide_rate).exp()
+            } else {
+                1.0
+            };
+            self.glide += (self.target - self.glide) * k;
+            if (self.target - self.glide).abs() < 1e-4 {
+                self.glide = self.target;
+            }
+        }
         let hz = midi_to_hz(self.glide + p.pitch_env_amount * self.pitch_env + m_pitch + self.fine);
         self.pitch_env *= c.pitch_env_mul;
         if self.fresh {
@@ -545,7 +732,11 @@ impl Voice {
         mut filt: impl FnMut(&mut [Svf; 2], f32) -> f32,
     ) {
         let n = out_l.len();
-        let vel_gain = 1.0 - p.velocity * (1.0 - self.velocity);
+        // Both ends of the block: the same value unless a slide is easing them in, and then
+        // `ramp` returns it exactly, so an unslid note renders as it always has.
+        let vel_gain = |v: f32| 1.0 - p.velocity * (1.0 - v);
+        let (v0, (gl0, gr0)) = self.block_from;
+        let (vg0, vg) = (vel_gain(v0), vel_gain(self.velocity));
         let (pre, (pg, pn)) = (p.filter.drive, d.pre_drive);
         let (post, (qg, qn)) = (p.drive, d.post_drive);
         let a0 = self.last_amp;
@@ -560,13 +751,13 @@ impl Voice {
                 y = nf.process(y);
             }
             let y = soft_limit(y, 2.0);
-            let mut y = y * self.amp_env.tick() * vel_gain * ramp(a0, m_amp, i, n);
+            let mut y = y * self.amp_env.tick() * ramp(vg0, vg, i, n) * ramp(a0, m_amp, i, n);
             if post > 0.0 {
                 y = drive(y, post, qg, qn);
             }
             // Unity gains at centre, so an unpanned note lands on both sides untouched.
-            out_l[i] += y * gl;
-            out_r[i] += y * gr;
+            out_l[i] += y * ramp(gl0, gl, i, n);
+            out_r[i] += y * ramp(gr0, gr, i, n);
         }
         self.last_amp = m_amp;
         self.filter.iter_mut().for_each(Svf::sanitize);
@@ -652,7 +843,7 @@ pub struct PolySynth {
     lfo: [Lfo; 2],
     rng: Rng,
     /// The one-voice modes' held keys, oldest first.
-    held: [u8; MONO_STACK],
+    held: [Key; MONO_STACK],
     held_len: usize,
     /// The track's tone cutoff, which is what a note's Mod X sweeps around.
     tone_hz: f32,
@@ -698,7 +889,7 @@ impl PolySynth {
             counter: 0,
             lfo,
             rng,
-            held: [0; MONO_STACK],
+            held: [Key::default(); MONO_STACK],
             held_len: 0,
             tone_hz: DEFAULT_TONE_HZ,
             crusher: [Crusher::default(); 2],
@@ -740,10 +931,43 @@ impl PolySynth {
         }
     }
 
+    /// Start a live key: the controller or typing keyboard, the chord bed, an audition. It
+    /// carries no tag, so [`PolySynth::note_off`] finds it again by pitch.
     pub fn note_on(&mut self, pitch: u8, velocity: u8, shape: NoteShape) {
+        self.play(pitch, velocity, shape, None, None);
+    }
+
+    /// Start a sequenced note, which [`PolySynth::note_off_tagged`] releases by `tag`. With a
+    /// `slide`, the note takes over the voice playing the note the rope comes from, in any
+    /// voice mode, and glides it here; when no voice is playing that note any more (released,
+    /// stolen or never started) it plays as an ordinary note.
+    pub fn note_on_tagged(
+        &mut self,
+        pitch: u8,
+        velocity: u8,
+        shape: NoteShape,
+        tag: VoiceTag,
+        slide: Option<Slide>,
+    ) {
+        self.play(pitch, velocity, shape, Some(tag), slide);
+    }
+
+    fn play(
+        &mut self,
+        pitch: u8,
+        velocity: u8,
+        shape: NoteShape,
+        tag: Option<VoiceTag>,
+        slide: Option<Slide>,
+    ) {
         self.counter += 1;
+        if let Some(slide) = slide {
+            if self.slide(pitch, velocity, shape, tag, slide) {
+                return;
+            }
+        }
         if self.patch.voice.is_mono() {
-            self.mono_on(pitch, velocity, shape);
+            self.mono_on(pitch, velocity, shape, tag);
         } else {
             let idx = match self
                 .voices
@@ -773,41 +997,93 @@ impl PolySynth {
             let (tone_hz, sr) = (self.tone_hz, self.sample_rate);
             let v = &mut self.voices[idx];
             let reset = !v.amp_env.is_active();
-            v.start(&self.patch, pitch, velocity, reset, self.counter);
+            v.start(&self.patch, pitch, velocity, tag, reset, self.counter);
             v.shape(&self.patch, shape, tone_hz, sr);
         }
+    }
+
+    /// Hand the voice playing `slide.from` to this note; false when no voice is.
+    fn slide(
+        &mut self,
+        pitch: u8,
+        velocity: u8,
+        shape: NoteShape,
+        tag: Option<VoiceTag>,
+        slide: Slide,
+    ) -> bool {
+        let mono = self.patch.voice.is_mono();
+        if mono {
+            // The scheduler drops the source's own note-off once a rope takes it over, so its
+            // key comes off the stack here, whether or not there is still a voice to take.
+            self.unhold(|k| k.tag == Some(slide.from));
+        }
+        let Some(i) = self
+            .voices
+            .iter()
+            .position(|v| v.pitch.is_some() && v.tag == Some(slide.from))
+        else {
+            return false;
+        };
+        if mono {
+            // The slide note is the key now held: its own end releases the voice, and a newer
+            // key letting go falls back to it.
+            self.hold(Key { pitch, tag });
+        }
+        let secs = slide
+            .secs
+            .unwrap_or(self.patch.glide)
+            .clamp(0.0, MAX_SLIDE_SECS);
+        let (tone_hz, sr, at) = (self.tone_hz, self.sample_rate, self.counter);
+        self.voices[i].slide_to(
+            &self.patch,
+            pitch,
+            velocity,
+            shape,
+            tag,
+            secs,
+            at,
+            tone_hz,
+            sr,
+        );
+        true
     }
 
     /// Mono and Legato: one voice, last-note priority, and the pitch always jumps. In Legato a
     /// key pressed while another is held (and still sounding) takes the voice over with no
     /// new attack; otherwise, and always in Mono, the note replays its attack from wherever
     /// the envelope had got to.
-    fn mono_on(&mut self, pitch: u8, velocity: u8, shape: NoteShape) {
-        self.unhold(pitch);
+    fn mono_on(&mut self, pitch: u8, velocity: u8, shape: NoteShape, tag: Option<VoiceTag>) {
+        self.unhold(|k| k.tag == tag && (tag.is_some() || k.pitch == pitch));
         let overlapping = self.held_len > 0;
-        if self.held_len == MONO_STACK {
-            self.held.copy_within(1.., 0);
-            self.held_len -= 1;
-        }
-        self.held[self.held_len] = pitch;
-        self.held_len += 1;
+        self.hold(Key { pitch, tag });
         let (tone_hz, sr) = (self.tone_hz, self.sample_rate);
         let v = &mut self.voices[0];
         let sounding = v.amp_env.is_active();
         if overlapping && sounding && self.patch.voice == VoiceMode::Legato {
             v.pitch = Some(pitch);
+            v.tag = tag;
             v.started_at = self.counter;
             v.jump_to(pitch);
         } else {
-            v.start(&self.patch, pitch, velocity, !sounding, self.counter);
+            v.start(&self.patch, pitch, velocity, tag, !sounding, self.counter);
         }
         // A connected note takes the new key's expression too: it is the note that is sounding.
         v.shape(&self.patch, shape, tone_hz, sr);
     }
 
-    /// Drop `pitch` from the held stack; whether it was there.
-    fn unhold(&mut self, pitch: u8) -> bool {
-        match self.held[..self.held_len].iter().position(|&h| h == pitch) {
+    /// Push a key on top of the held stack, forgetting the oldest when it is full.
+    fn hold(&mut self, key: Key) {
+        if self.held_len == MONO_STACK {
+            self.held.copy_within(1.., 0);
+            self.held_len -= 1;
+        }
+        self.held[self.held_len] = key;
+        self.held_len += 1;
+    }
+
+    /// Drop the first held key that `is` picks; whether there was one.
+    fn unhold(&mut self, is: impl Fn(&Key) -> bool) -> bool {
+        match self.held[..self.held_len].iter().position(is) {
             Some(i) => {
                 self.held.copy_within(i + 1..self.held_len, i);
                 self.held_len -= 1;
@@ -817,21 +1093,29 @@ impl PolySynth {
         }
     }
 
-    /// Release *one* voice: the oldest one still holding `pitch`. Note-ons and note-offs are
-    /// 1:1, so releasing every matching voice would make two overlapping notes of the same
-    /// pitch cut each other short — the first note's end would silence the second.
+    /// The one voice's key just let go: fall back to the most recent key still held, without
+    /// a new attack, or release.
+    fn fall_back(&mut self) {
+        let v = &mut self.voices[0];
+        if self.held_len > 0 {
+            let prev = self.held[self.held_len - 1];
+            v.pitch = Some(prev.pitch);
+            v.tag = prev.tag;
+            v.jump_to(prev.pitch);
+        } else {
+            v.release();
+        }
+    }
+
+    /// Release a live key: *one* voice, the oldest untagged one still holding `pitch`. Note-ons
+    /// and note-offs are 1:1, so releasing every matching voice would make two overlapping
+    /// notes of the same pitch cut each other short — the first note's end would silence the
+    /// second. Sequenced notes are left alone: they are released by tag.
     pub fn note_off(&mut self, pitch: u8) {
-        if self.patch.voice.is_mono() && self.unhold(pitch) {
-            let v = &mut self.voices[0];
-            if v.pitch == Some(pitch) {
-                if self.held_len > 0 {
-                    // Fall back to the most recent key still held, without a new attack.
-                    let prev = self.held[self.held_len - 1];
-                    v.pitch = Some(prev);
-                    v.jump_to(prev);
-                } else {
-                    v.release();
-                }
+        let live = |tag: Option<VoiceTag>, p: Option<u8>| tag.is_none() && p == Some(pitch);
+        if self.patch.voice.is_mono() && self.unhold(|k| live(k.tag, Some(k.pitch))) {
+            if live(self.voices[0].tag, self.voices[0].pitch) {
+                self.fall_back();
             }
             return;
         }
@@ -839,11 +1123,31 @@ impl PolySynth {
             .voices
             .iter()
             .enumerate()
-            .filter(|(_, v)| v.pitch == Some(pitch))
+            .filter(|(_, v)| live(v.tag, v.pitch))
             .min_by_key(|(_, v)| v.started_at)
             .map(|(i, _)| i);
         if let Some(i) = oldest {
             self.voices[i].release();
+        }
+    }
+
+    /// Release the sequenced note `tag`. Once a slide has taken its voice over the voice
+    /// answers to the slide note instead, so a stray off for the old note releases nothing.
+    pub fn note_off_tagged(&mut self, tag: VoiceTag) {
+        if self.patch.voice.is_mono()
+            && self.unhold(|k| k.tag == Some(tag))
+            && self.voices[0].tag == Some(tag)
+        {
+            self.fall_back();
+            return;
+        }
+        // Poly, or a voice left over from before a switch to a one-voice mode.
+        if let Some(v) = self
+            .voices
+            .iter_mut()
+            .find(|v| v.pitch.is_some() && v.tag == Some(tag))
+        {
+            v.release();
         }
     }
 
@@ -915,11 +1219,6 @@ impl PolySynth {
         let ctx = Ctx {
             from,
             to,
-            glide_mul: if d.glide_rate > 0.0 {
-                1.0 - (-nf * d.glide_rate).exp()
-            } else {
-                1.0
-            },
             pitch_env_mul: (-nf * d.pitch_env_rate).exp(),
             free_lfo: [0, 1].map(|l| self.lfo[l].value(self.patch.lfo[l].wave)),
         };
@@ -987,6 +1286,34 @@ impl PolySynth {
         } else {
             self.quiet_run.saturating_add(n)
         };
+    }
+}
+
+/// One voice as a test sees it: where its pitch is, which note it plays and how loud its
+/// envelope is. Lets the scheduler's tests watch ropes land in the synth.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct VoiceProbe {
+    pub glide: f32,
+    pub target: f32,
+    pub tag: Option<VoiceTag>,
+    pub level: f32,
+}
+
+#[cfg(test)]
+impl PolySynth {
+    /// Every voice holding a note (not releasing), oldest first.
+    pub(crate) fn held_voices(&self) -> Vec<VoiceProbe> {
+        let mut held: Vec<&Voice> = self.voices.iter().filter(|v| v.pitch.is_some()).collect();
+        held.sort_by_key(|v| v.started_at);
+        held.iter()
+            .map(|v| VoiceProbe {
+                glide: v.glide,
+                target: v.target,
+                tag: v.tag,
+                level: v.amp_env.level(),
+            })
+            .collect()
     }
 }
 
@@ -1350,6 +1677,317 @@ mod tests {
         let poly = go(VoiceMode::Poly);
         assert_eq!(go(VoiceMode::Mono), poly);
         assert_eq!(go(VoiceMode::Legato), poly);
+    }
+
+    // ── Slides ──
+
+    const A: VoiceTag = VoiceTag(1);
+    const B: VoiceTag = VoiceTag(2);
+    const C: VoiceTag = VoiceTag(3);
+
+    fn slide(from: VoiceTag, secs: Option<f32>) -> Option<Slide> {
+        Some(Slide { from, secs })
+    }
+
+    /// The pitch of the one voice holding `tag`.
+    fn glide_of(s: &PolySynth, tag: VoiceTag) -> f32 {
+        let v = s
+            .voices
+            .iter()
+            .find(|v| v.tag == Some(tag))
+            .expect("a voice plays it");
+        v.glide
+    }
+
+    #[test]
+    fn a_slide_takes_the_voice_over_and_glides_without_an_attack_in_every_mode() {
+        for mode in [VoiceMode::Poly, VoiceMode::Mono, VoiceMode::Legato] {
+            let mut s = PolySynth::new(&voiced(mode), SR, 4);
+            s.note_on_tagged(57, 100, NoteShape::neutral(), A, None);
+            render(&mut s, 9_600);
+            s.note_on_tagged(69, 100, NoteShape::neutral(), B, slide(A, Some(0.2)));
+            render(&mut s, BLOCK);
+            let early = glide_of(&s, B);
+            assert!(
+                early > 57.0 && early < 60.0,
+                "{mode:?}: starts from the source, {early}"
+            );
+            let mut last = early;
+            let mut top = 0.0f32;
+            for _ in 0..(SR as usize / 20) / BLOCK {
+                render(&mut s, BLOCK);
+                let g = glide_of(&s, B);
+                assert!(
+                    g >= last && g - last < 1.0,
+                    "{mode:?}: moves gradually ({last} → {g})"
+                );
+                last = g;
+                top = s
+                    .voices
+                    .iter()
+                    .map(|v| v.amp_env.level())
+                    .fold(top, f32::max);
+            }
+            assert!(
+                last > 60.0 && last < 68.0,
+                "{mode:?}: on its way after 50 ms, {last}"
+            );
+            assert!(
+                top < 0.35,
+                "{mode:?}: the slide replayed the attack ({top})"
+            );
+            render(&mut s, 19_200);
+            assert!(
+                (freq(&render(&mut s, 9_600)) - 440.0).abs() < 10.0,
+                "{mode:?}: arrives"
+            );
+            assert_eq!(s.held_voices().len(), 1, "{mode:?}: one voice");
+            // The source's off would be held back by the scheduler; a stray one is harmless.
+            s.note_off_tagged(A);
+            assert_eq!(
+                s.held_voices().len(),
+                1,
+                "{mode:?}: the voice is the slide note's now"
+            );
+            s.note_off_tagged(B);
+            render(&mut s, 48_000);
+            assert!(s.is_silent(), "{mode:?}: the slide note's end releases it");
+        }
+    }
+
+    #[test]
+    fn a_chord_slides_only_the_voices_its_ropes_name() {
+        let mut s = PolySynth::new(&voiced(VoiceMode::Poly), SR, 6);
+        for (pitch, tag) in [(48, A), (52, B), (55, C)] {
+            s.note_on_tagged(pitch, 100, NoteShape::neutral(), tag, None);
+        }
+        render(&mut s, 9_600);
+        s.note_on_tagged(
+            50,
+            100,
+            NoteShape::neutral(),
+            VoiceTag(4),
+            slide(A, Some(0.05)),
+        );
+        s.note_on_tagged(
+            53,
+            100,
+            NoteShape::neutral(),
+            VoiceTag(5),
+            slide(B, Some(0.05)),
+        );
+        render(&mut s, 9_600);
+        let held = s.held_voices();
+        assert_eq!(held.len(), 3, "no new voice: {held:?}");
+        let targets: Vec<(f32, Option<VoiceTag>)> =
+            held.iter().map(|v| (v.target, v.tag)).collect();
+        assert!(targets.contains(&(50.0, Some(VoiceTag(4)))));
+        assert!(targets.contains(&(53.0, Some(VoiceTag(5)))));
+        assert_eq!(
+            glide_of(&s, C),
+            55.0,
+            "the third note keeps ringing where it was"
+        );
+        assert!(
+            held.iter().all(|v| v.level < 0.35),
+            "nothing re-attacked: {held:?}"
+        );
+    }
+
+    #[test]
+    fn a_slide_with_nothing_to_take_plays_as_an_ordinary_note() {
+        for mode in [VoiceMode::Poly, VoiceMode::Mono, VoiceMode::Legato] {
+            let mut s = PolySynth::new(&voiced(mode), SR, 4);
+            s.note_on_tagged(57, 100, NoteShape::neutral(), A, None);
+            render(&mut s, 2_400);
+            s.note_off_tagged(A);
+            render(&mut s, 2_400);
+            // The source is releasing: its voice no longer answers to its tag.
+            s.note_on_tagged(69, 100, NoteShape::neutral(), B, slide(A, Some(0.2)));
+            assert_eq!(glide_of(&s, B), 69.0, "{mode:?}: starts at its own pitch");
+            assert!(env_peak(&mut s, 1_200) > 0.9, "{mode:?}: attacks");
+        }
+    }
+
+    #[test]
+    fn slide_time_comes_from_the_note_or_the_patch_and_zero_jumps() {
+        // How far from 57 towards 69 the slide has got after 0.1 s.
+        let progress = |secs: Option<f32>| {
+            let mut s = PolySynth::new(&voiced(VoiceMode::Poly), SR, 2);
+            s.note_on_tagged(57, 100, NoteShape::neutral(), A, None);
+            render(&mut s, 2_400);
+            s.note_on_tagged(69, 100, NoteShape::neutral(), B, slide(A, secs));
+            render(&mut s, 4_800);
+            (glide_of(&s, B) - 57.0) / 12.0
+        };
+        // τ = time / 3: 0.1 s is a whole τ of the patch's 0.3 s glide, a third of one of 0.9 s.
+        let patch = progress(None);
+        assert!((patch - 0.63).abs() < 0.05, "patch glide: {patch}");
+        let slow = progress(Some(0.9));
+        assert!((slow - 0.28).abs() < 0.05, "override: {slow}");
+        assert!(
+            progress(Some(0.03)) > 0.99,
+            "a short slide is there already"
+        );
+        assert!(
+            progress(Some(5.0)) > progress(Some(MAX_SLIDE_SECS)) - 1e-6,
+            "clamped"
+        );
+
+        let mut s = PolySynth::new(&voiced(VoiceMode::Poly), SR, 2);
+        s.note_on_tagged(57, 100, NoteShape::neutral(), A, None);
+        render(&mut s, 2_400);
+        s.note_on_tagged(
+            69,
+            30,
+            NoteShape {
+                pan: 0.0,
+                ..NoteShape::neutral()
+            },
+            B,
+            slide(A, Some(0.0)),
+        );
+        assert_eq!(glide_of(&s, B), 69.0, "0 s jumps");
+        let v = s.voices.iter().find(|v| v.tag == Some(B)).unwrap();
+        assert!(
+            v.ease.is_none() && v.gains == note_pan_gains(0.0),
+            "and lands at once"
+        );
+        assert!(env_peak(&mut s, 1_200) < 0.35, "still without an attack");
+    }
+
+    #[test]
+    fn a_slide_eases_the_new_notes_expression_in() {
+        let mut p = voiced(VoiceMode::Poly);
+        p.velocity = 1.0;
+        p.amp_env.sustain = 1.0;
+        let mut s = PolySynth::new(&p, SR, 2);
+        s.set_tone_hz(4_000.0);
+        s.note_on_tagged(57, 20, NoteShape::neutral(), A, None);
+        render(&mut s, 9_600);
+        let shape = NoteShape {
+            pan: 1.0,
+            mod_x: 0.2,
+            fine: 50,
+            release: 1.0,
+            ..NoteShape::neutral()
+        };
+        s.note_on_tagged(57, 127, shape, B, slide(A, Some(0.2)));
+        let voice = |s: &PolySynth| s.voices.iter().find(|v| v.tag == Some(B)).unwrap().clone();
+        assert!(
+            voice(&s).note_filter.is_some(),
+            "a filter fades in from wide open"
+        );
+        // Over 0.1 s: the velocity block by block, and the right side's level (where the pan is
+        // heading) about one cycle of the note at a time.
+        let (mut vel, mut right) = (vec![voice(&s).velocity], vec![]);
+        for _ in 0..20 {
+            let mut r = vec![];
+            for _ in 0..15 {
+                r.extend(render_stereo(&mut s, BLOCK).1);
+                vel.push(voice(&s).velocity);
+            }
+            right.push(rms(&r));
+        }
+        let v = voice(&s);
+        let step = vel.windows(2).map(|w| w[1] - w[0]).fold(0.0, f32::max);
+        assert!(
+            vel.windows(2).all(|w| w[1] >= w[0]) && step < 0.01,
+            "velocity eases: {step}"
+        );
+        assert!(
+            v.velocity > 0.5 && v.velocity < 0.99,
+            "velocity on its way: {}",
+            v.velocity
+        );
+        assert!(v.pan > 0.6 && v.pan < 0.99, "pan on its way: {}", v.pan);
+        assert!(
+            v.fine > 0.25 && v.fine < 0.5,
+            "detune on its way: {}",
+            v.fine
+        );
+        assert!(
+            v.release_scale > 1.5 && v.release_scale < 4.0,
+            "release on its way"
+        );
+        // What you hear climbs too, without the jump a stepped level would make up front.
+        let jump = right
+            .windows(2)
+            .map(|w| (w[1] - w[0]).abs())
+            .fold(0.0, f32::max);
+        let climb = right[right.len() - 1] - right[0];
+        assert!(
+            climb > 2.0 * right[0],
+            "the right side gets louder: {right:?}"
+        );
+        assert!(jump < climb / 4.0, "no step: {jump} of {climb}");
+
+        render(&mut s, SR as usize);
+        let v = voice(&s);
+        assert!(v.ease.is_none(), "arrived");
+        assert_eq!(
+            (v.velocity, v.pan, v.fine, v.release_scale),
+            (1.0, 1.0, 0.5, 4.0)
+        );
+        assert_eq!(v.gains, note_pan_gains(1.0));
+
+        // And back out to a note with no filter of its own: the filter goes once it is open.
+        s.note_on_tagged(57, 127, NoteShape::neutral(), C, slide(B, Some(0.05)));
+        render(&mut s, SR as usize / 2);
+        let v = s.voices.iter().find(|v| v.tag == Some(C)).unwrap();
+        assert!(v.note_filter.is_none() && v.ease.is_none());
+        assert_eq!(v.gains, (1.0, 1.0));
+    }
+
+    /// The one-voice modes keep a stack of held keys. A rope's source never sends its own off,
+    /// so the slide must take its key off the stack, or a later fall-back would land on it.
+    #[test]
+    fn a_slide_leaves_no_stale_key_on_the_one_voice_stack() {
+        for mode in [VoiceMode::Mono, VoiceMode::Legato] {
+            let mut s = PolySynth::new(&voiced(mode), SR, 4);
+            s.note_on_tagged(57, 100, NoteShape::neutral(), A, None);
+            render(&mut s, 2_400);
+            s.note_on_tagged(64, 100, NoteShape::neutral(), B, slide(A, Some(0.05)));
+            render(&mut s, 2_400);
+            s.note_off_tagged(B);
+            assert!(
+                s.held_voices().is_empty(),
+                "{mode:?}: released, not fallen back to 57"
+            );
+
+            // The source has already handed the voice to another key: the slide plays plainly
+            // (connected or re-attacked as the mode says), and still clears the source's key.
+            let mut s = PolySynth::new(&voiced(mode), SR, 4);
+            s.note_on_tagged(57, 100, NoteShape::neutral(), A, None);
+            s.note_on_tagged(60, 100, NoteShape::neutral(), C, None);
+            render(&mut s, 2_400);
+            s.note_on_tagged(64, 100, NoteShape::neutral(), B, slide(A, Some(0.05)));
+            assert_eq!(glide_of(&s, B), 64.0, "{mode:?}");
+            s.note_off_tagged(C);
+            assert_eq!(s.held_voices()[0].tag, Some(B), "{mode:?}: B still sounds");
+            s.note_off_tagged(B);
+            assert!(
+                s.held_voices().is_empty(),
+                "{mode:?}: nothing left to fall back to"
+            );
+        }
+    }
+
+    /// Live keys and sequenced notes share a synth but never release each other.
+    #[test]
+    fn live_keys_and_tagged_notes_release_separately() {
+        let mut s = PolySynth::new(&voiced(VoiceMode::Poly), SR, 4);
+        s.note_on_tagged(60, 100, NoteShape::neutral(), A, None);
+        s.note_on(60, 100, NoteShape::neutral());
+        s.note_off(60);
+        assert_eq!(s.held_voices().len(), 1);
+        assert_eq!(
+            s.held_voices()[0].tag,
+            Some(A),
+            "the key-up released the live key"
+        );
+        s.note_off_tagged(A);
+        assert!(s.held_voices().is_empty());
     }
 
     #[test]

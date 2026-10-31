@@ -38,7 +38,9 @@ pub use model::{
     TrackKind, TrackPlugin, DEFAULT_SONG_BARS, MAX_CLIP_GAIN, MAX_FADE_SECONDS, MAX_INSERTS,
     MAX_PEDALS, MAX_SHIFT_TICKS, MAX_SLIDE_SECS, MIN_NOTE_TICKS, SCHEMA_VERSION,
 };
-pub use sequence::{MasterAutomation, Sequence, SequenceAudioClip, SequenceTrack, TrackAutomation};
+pub use sequence::{
+    MasterAutomation, NoteRope, Sequence, SequenceAudioClip, SequenceTrack, TrackAutomation,
+};
 pub use sound::{
     default_kit, factory_kit, factory_kits, factory_sound, factory_sounds, DrumKit, DrumPad, DrumPatch, ResolvedPad, Sound, SoundPatch, SynthPatch, VoiceMode, MAX_DRUM_PADS,
 };

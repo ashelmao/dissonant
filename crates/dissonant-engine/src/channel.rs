@@ -5,7 +5,7 @@ use crate::audio::{AudioLane, BlockContext};
 use crate::drums::{DrumBank, DrumKit};
 use crate::dsp::{db_to_linear, linear_to_db, pan_gains, Limiter, Reverb, StereoBiquad};
 use crate::effects::NativeEffect;
-use crate::engine::NoteShape;
+use crate::engine::{NoteShape, Slide, VoiceTag};
 use crate::synth::PolySynth;
 use dissonant_core::{MasterSettings, SequenceTrack, SynthPatch};
 use dissonant_plugins::PluginAudioUnit;
@@ -67,6 +67,31 @@ impl Instrument {
             // A plugin owns its own expression: MIDI is all the contract there is.
             Instrument::Plugin(p) => p.note_on(pitch, velocity),
             Instrument::Silent => {}
+        }
+    }
+
+    /// A sequenced note, released by [`Instrument::note_off_tagged`] with the same tag. Only
+    /// the built-in synth knows about tags and slides: a drum hit is a one-shot, and a plugin
+    /// is addressed by pitch, so a slide note on a plugin track plays as an ordinary note.
+    pub fn note_on_tagged(
+        &mut self,
+        pitch: u8,
+        velocity: u8,
+        shape: NoteShape,
+        tag: VoiceTag,
+        slide: Option<Slide>,
+    ) {
+        match self {
+            Instrument::Synth(s) => s.note_on_tagged(pitch, velocity, shape, tag, slide),
+            other => other.note_on(pitch, velocity, shape),
+        }
+    }
+
+    /// End the sequenced note `tag`, which a plugin knows only as `pitch`.
+    pub fn note_off_tagged(&mut self, pitch: u8, tag: VoiceTag) {
+        match self {
+            Instrument::Synth(s) => s.note_off_tagged(tag),
+            other => other.note_off(pitch),
         }
     }
 
