@@ -9,11 +9,18 @@ export type FilterMode = "off" | "lowpass12" | "lowpass24" | "highpass12" | "ban
 export type LfoWave = "sine" | "triangle" | "saw" | "square" | "sampleHold";
 /** Depth 1 means: pitch ±12 st, cutoff ±4 octaves, amp full tremolo, pulse width ±0.45, fm ±1. */
 export type LfoTarget = "none" | "pitch" | "cutoff" | "amp" | "pulseWidth" | "fm";
+/**
+ * How a synth shares its voices. Poly: many voices, every note attacks. Mono: one voice, every
+ * note attacks. Legato: one voice, and a note that overlaps or touches the last connects to it
+ * with no new attack. The pitch always jumps; only a rope slides.
+ */
+export type VoiceMode = "poly" | "mono" | "legato";
 
 export const OSC_WAVES: OscWave[] = ["sine", "triangle", "saw", "square", "pulse"];
 export const FILTER_MODES: FilterMode[] = ["off", "lowpass12", "lowpass24", "highpass12", "bandpass", "notch"];
 export const LFO_WAVES: LfoWave[] = ["sine", "triangle", "saw", "square", "sampleHold"];
 export const LFO_TARGETS: LfoTarget[] = ["none", "pitch", "cutoff", "amp", "pulseWidth", "fm"];
+export const VOICE_MODES: VoiceMode[] = ["poly", "mono", "legato"];
 
 /** Attack / decay / release in seconds, sustain 0–1. */
 export interface Envelope {
@@ -81,8 +88,8 @@ export interface SynthPatch {
   /** s, 0.001–2 */
   pitchEnvDecay: number;
   lfo: [LfoParams, LfoParams];
-  mono: boolean;
-  /** s, 0–2 */
+  voice: VoiceMode;
+  /** s, 0–2: the default slide time for a rope. Nothing glides on its own. */
   glide: number;
   velocity: number;
   drive: number;
@@ -209,7 +216,7 @@ export const DEFAULT_SYNTH_PATCH: SynthPatch = {
   pitchEnvAmount: 0,
   pitchEnvDecay: 0.05,
   lfo: [{ ...DEFAULT_LFO }, { ...DEFAULT_LFO }],
-  mono: false,
+  voice: "poly",
   glide: 0,
   velocity: 1,
   drive: 0,
@@ -291,7 +298,11 @@ export function filledPatch(patch: { kind: "synth" | "drum" } & Loose): SoundPat
   if (Array.isArray(patch.osc)) base.osc = [{ ...DEFAULT_OSC }, { ...DEFAULT_OSC }, { ...DEFAULT_OSC }];
   if (isObj(patch.ampEnv)) base.ampEnv = { ...DEFAULT_ENVELOPE };
   if (isObj(patch.filterEnv)) base.filterEnv = { ...DEFAULT_ENVELOPE };
-  return { kind: "synth", ...fill(base, patch) };
+  const filled = fill(base, patch);
+  // A patch saved before voice modes says `mono: true`; like `SynthPatch::sanitized`, it
+  // becomes Legato unless a voice mode other than poly is already set.
+  if (patch.mono === true && filled.voice === "poly") filled.voice = "legato";
+  return { kind: "synth", ...filled };
 }
 
 export function filledSound(s: { id: string; name: string; category?: string; patch: { kind: "synth" | "drum" } & Loose }): Sound {

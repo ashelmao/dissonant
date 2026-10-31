@@ -1,5 +1,6 @@
 //! Polyphonic subtractive + FM synth playing a [`SynthPatch`]: a pool of voices with velocity,
-//! round-robin allocation and oldest-note stealing, or one legato voice in mono mode.
+//! round-robin allocation and oldest-note stealing in Poly, or one shared voice in Mono and
+//! Legato. A note always starts at its own pitch: nothing glides on its own.
 //!
 //! Per voice: 3 PolyBLEP oscillators (unison, FM / ring / hard sync between osc 1 and 2) +
 //! coloured noise → pre-drive → multimode SVF (key tracking, envelope, velocity, LFO) → the
@@ -18,7 +19,7 @@ use crate::dsp::{
     Chorus, Crusher, Echo, Lfo, NoteFilter, Rng, Svf,
 };
 use crate::engine::NoteShape;
-use dissonant_core::sound::{Envelope, FilterMode, LfoTarget, OscWave, SynthPatch};
+use dissonant_core::sound::{Envelope, FilterMode, LfoTarget, OscWave, SynthPatch, VoiceMode};
 use std::f32::consts::{PI, SQRT_2};
 
 /// Samples per control block.
@@ -28,7 +29,7 @@ const MAX_UNISON: usize = 8;
 const FM_DEPTH: f32 = 1.5;
 /// The longest echo the patch allows; the buffer is allocated for it up front.
 const MAX_DELAY_S: f32 = 1.5;
-/// Held notes remembered in mono mode (last-note priority).
+/// Held notes remembered by the one-voice modes (last-note priority).
 const MONO_STACK: usize = 16;
 /// Time constant for knob changes (levels, FM, ring, effect mixes) made while notes sound.
 const SMOOTH_S: f32 = 0.005;
@@ -256,11 +257,11 @@ impl Voice {
         }
     }
 
-    /// Start a note gliding in from `from` semitones. A free voice (`reset`) starts clean; a
-    /// stolen one keeps its phases, filter state and envelope levels — slamming any of them
-    /// to zero while it still sounds would be a step, i.e. an audible click — and its attack
-    /// ramps on from wherever the old note had got to.
-    fn start(&mut self, p: &SynthPatch, pitch: u8, velocity: u8, from: f32, reset: bool, at: u64) {
+    /// Start a note, at its own pitch. A free voice (`reset`) starts clean; a stolen one keeps
+    /// its phases, filter state and envelope levels — slamming any of them to zero while it
+    /// still sounds would be a step, i.e. an audible click — and its attack ramps on from
+    /// wherever the old note had got to.
+    fn start(&mut self, p: &SynthPatch, pitch: u8, velocity: u8, reset: bool, at: u64) {
         if reset {
             self.amp_env.reset();
             self.filter_env.reset();
@@ -286,15 +287,21 @@ impl Voice {
         self.pitch = Some(pitch);
         self.started_at = at;
         self.velocity = velocity as f32 / 127.0;
-        self.target = pitch as f32;
-        self.glide = from;
+        self.jump_to(pitch);
         self.pitch_env = 1.0;
         self.amp_env.gate_on();
         self.filter_env.gate_on();
     }
 
+    /// Move to `pitch` at once. The glide smoother then has nothing to cover; only a slide
+    /// sets a target it has to travel to.
+    fn jump_to(&mut self, pitch: u8) {
+        self.target = pitch as f32;
+        self.glide = self.target;
+    }
+
     /// Point the voice at one note's own expression. Separate from [`Voice::start`] because
-    /// mono legato re-shapes a voice it deliberately does not restart.
+    /// Legato re-shapes a voice it deliberately does not restart.
     fn shape(&mut self, p: &SynthPatch, shape: NoteShape, tone_hz: f32, sr: f32) {
         self.gains = note_pan_gains(shape.pan);
         self.fine = shape.fine as f32 / 100.0;
@@ -644,11 +651,9 @@ pub struct PolySynth {
     /// Free-running LFOs (retriggered ones live in each voice).
     lfo: [Lfo; 2],
     rng: Rng,
-    /// Mono mode's held keys, oldest first.
+    /// The one-voice modes' held keys, oldest first.
     held: [u8; MONO_STACK],
     held_len: usize,
-    /// Where the next glide starts from.
-    last_note: Option<f32>,
     /// The track's tone cutoff, which is what a note's Mod X sweeps around.
     tone_hz: f32,
     /// One instance per side: the voices place themselves from their own pan, so the two
@@ -695,7 +700,6 @@ impl PolySynth {
             rng,
             held: [0; MONO_STACK],
             held_len: 0,
-            last_note: None,
             tone_hz: DEFAULT_TONE_HZ,
             crusher: [Crusher::default(); 2],
             chorus: [Chorus::new(sample_rate), Chorus::new(sample_rate)],
@@ -721,7 +725,7 @@ impl PolySynth {
     /// effect mixes glide over a few ms); nothing is cut or retriggered.
     pub fn set_patch(&mut self, patch: &SynthPatch) {
         let patch = patch.sanitized();
-        if patch.mono != self.patch.mono {
+        if patch.voice.is_mono() != self.patch.voice.is_mono() {
             // Keys held in the other mode are released through the poly path.
             self.held_len = 0;
         }
@@ -738,7 +742,7 @@ impl PolySynth {
 
     pub fn note_on(&mut self, pitch: u8, velocity: u8, shape: NoteShape) {
         self.counter += 1;
-        if self.patch.mono {
+        if self.patch.voice.is_mono() {
             self.mono_on(pitch, velocity, shape);
         } else {
             let idx = match self
@@ -766,55 +770,42 @@ impl PolySynth {
                         .unwrap(),
                 },
             };
-            // Poly portamento glides each new note in from the last one played.
-            let from = match self.last_note {
-                Some(last) if self.patch.glide > 0.0 => last,
-                _ => pitch as f32,
-            };
             let (tone_hz, sr) = (self.tone_hz, self.sample_rate);
             let v = &mut self.voices[idx];
             let reset = !v.amp_env.is_active();
-            v.start(&self.patch, pitch, velocity, from, reset, self.counter);
+            v.start(&self.patch, pitch, velocity, reset, self.counter);
             v.shape(&self.patch, shape, tone_hz, sr);
         }
-        self.last_note = Some(pitch as f32);
     }
 
-    /// Mono: last-note priority. A key pressed while another is held (and still sounding)
-    /// slides there legato — no envelope retrigger; otherwise the note starts afresh.
+    /// Mono and Legato: one voice, last-note priority, and the pitch always jumps. In Legato a
+    /// key pressed while another is held (and still sounding) takes the voice over with no
+    /// new attack; otherwise, and always in Mono, the note replays its attack from wherever
+    /// the envelope had got to.
     fn mono_on(&mut self, pitch: u8, velocity: u8, shape: NoteShape) {
         self.unhold(pitch);
-        let legato = self.held_len > 0;
+        let overlapping = self.held_len > 0;
         if self.held_len == MONO_STACK {
             self.held.copy_within(1.., 0);
             self.held_len -= 1;
         }
         self.held[self.held_len] = pitch;
         self.held_len += 1;
-        let glide = self.patch.glide > 0.0;
         let (tone_hz, sr) = (self.tone_hz, self.sample_rate);
         let v = &mut self.voices[0];
         let sounding = v.amp_env.is_active();
-        if legato && sounding {
+        if overlapping && sounding && self.patch.voice == VoiceMode::Legato {
             v.pitch = Some(pitch);
             v.started_at = self.counter;
-            v.target = pitch as f32;
-            if !glide {
-                v.glide = v.target;
-            }
+            v.jump_to(pitch);
         } else {
-            let from = if glide && sounding {
-                v.glide
-            } else {
-                pitch as f32
-            };
-            v.start(&self.patch, pitch, velocity, from, !sounding, self.counter);
+            v.start(&self.patch, pitch, velocity, !sounding, self.counter);
         }
-        // A legato slide takes the new key's expression too: it is the note that is sounding.
+        // A connected note takes the new key's expression too: it is the note that is sounding.
         v.shape(&self.patch, shape, tone_hz, sr);
     }
 
-    /// Drop `pitch` from the mono stack; whether it was there.
+    /// Drop `pitch` from the held stack; whether it was there.
     fn unhold(&mut self, pitch: u8) -> bool {
         match self.held[..self.held_len].iter().position(|&h| h == pitch) {
             Some(i) => {
@@ -830,18 +821,14 @@ impl PolySynth {
     /// 1:1, so releasing every matching voice would make two overlapping notes of the same
     /// pitch cut each other short — the first note's end would silence the second.
     pub fn note_off(&mut self, pitch: u8) {
-        if self.patch.mono && self.unhold(pitch) {
+        if self.patch.voice.is_mono() && self.unhold(pitch) {
             let v = &mut self.voices[0];
             if v.pitch == Some(pitch) {
                 if self.held_len > 0 {
-                    // Fall back to the most recent key still held.
+                    // Fall back to the most recent key still held, without a new attack.
                     let prev = self.held[self.held_len - 1];
                     v.pitch = Some(prev);
-                    v.target = prev as f32;
-                    if self.patch.glide <= 0.0 {
-                        v.glide = v.target;
-                    }
-                    self.last_note = Some(prev as f32);
+                    v.jump_to(prev);
                 } else {
                     v.release();
                 }
@@ -1256,34 +1243,113 @@ mod tests {
         ups as f32 * SR / buf.len() as f32
     }
 
-    #[test]
-    fn mono_glide_slides_between_held_notes() {
+    /// A sine patch whose envelope settles well below its peak, so a replayed attack shows up
+    /// as the level climbing back towards 1. Glide is up, to prove nothing reads it.
+    fn voiced(voice: VoiceMode) -> SynthPatch {
         let mut p = factory("sine");
-        p.mono = true;
+        p.voice = voice;
         p.glide = 0.3;
-        let mut s = PolySynth::new(&p, SR, 4);
+        p.amp_env.attack = 0.02;
+        p.amp_env.decay = 0.02;
+        p.amp_env.sustain = 0.3;
+        p
+    }
+
+    /// The amp envelope's highest level over the next `frames`, rendered in small steps.
+    fn env_peak(s: &mut PolySynth, frames: usize) -> f32 {
+        let mut top = 0.0f32;
+        for _ in 0..frames / BLOCK {
+            render(s, BLOCK);
+            top = top.max(
+                s.voices
+                    .iter()
+                    .map(|v| v.amp_env.level())
+                    .fold(0.0, f32::max),
+            );
+        }
+        top
+    }
+
+    #[test]
+    fn legato_connects_held_notes_and_jumps_without_gliding() {
+        let mut s = PolySynth::new(&voiced(VoiceMode::Legato), SR, 4);
         s.note_on(57, 100, NoteShape::neutral()); // 220 Hz
         let a = render(&mut s, 9_600);
-        s.note_on(69, 100, NoteShape::neutral()); // 440 Hz, legato
-        let early = render(&mut s, 2_400);
-        render(&mut s, 24_000);
-        let late = render(&mut s, 9_600);
+        s.note_on(69, 100, NoteShape::neutral()); // 440 Hz, while 57 is held
+        assert!(env_peak(&mut s, 2_400) < 0.35, "legato replayed the attack");
+        // The pitch is already there: no portamento, even with glide set.
+        let early = render(&mut s, 9_600);
         assert!((freq(&a) - 220.0).abs() < 10.0, "start {}", freq(&a));
         assert!(
-            freq(&early) > 225.0 && freq(&early) < 400.0,
+            (freq(&early) - 440.0).abs() < 10.0,
             "early {}",
             freq(&early)
         );
-        assert!((freq(&late) - 440.0).abs() < 10.0, "late {}", freq(&late));
-        // One voice, never retriggered.
         assert_eq!(s.voices.iter().filter(|v| v.amp_env.is_active()).count(), 1);
-        // Releasing the top note falls back to the held one.
+        // Releasing the top note falls back to the held one, at once and without an attack.
         s.note_off(69);
-        render(&mut s, 30_000);
+        assert!(
+            env_peak(&mut s, 2_400) < 0.35,
+            "falling back replayed the attack"
+        );
         assert!((freq(&render(&mut s, 9_600)) - 220.0).abs() < 10.0);
         s.note_off(57);
         render(&mut s, 48_000);
         assert!(s.is_silent());
+    }
+
+    #[test]
+    fn mono_replays_the_attack_on_every_note_and_jumps() {
+        let mut s = PolySynth::new(&voiced(VoiceMode::Mono), SR, 4);
+        s.note_on(57, 100, NoteShape::neutral());
+        render(&mut s, 9_600);
+        s.note_on(69, 100, NoteShape::neutral()); // held over 57, but Mono re-attacks
+        assert!(
+            env_peak(&mut s, 2_400) > 0.9,
+            "mono did not replay the attack"
+        );
+        assert!((freq(&render(&mut s, 9_600)) - 440.0).abs() < 10.0);
+        assert_eq!(
+            s.voices.iter().filter(|v| v.amp_env.is_active()).count(),
+            1,
+            "one voice"
+        );
+        // The older key still held takes over when the newer one lets go.
+        s.note_off(69);
+        render(&mut s, 2_400);
+        assert!((freq(&render(&mut s, 9_600)) - 220.0).abs() < 10.0);
+        s.note_off(57);
+        render(&mut s, 48_000);
+        assert!(s.is_silent());
+    }
+
+    #[test]
+    fn poly_notes_start_at_their_own_pitch_with_glide_set() {
+        let mut s = PolySynth::new(&voiced(VoiceMode::Poly), SR, 4);
+        s.note_on(57, 100, NoteShape::neutral());
+        render(&mut s, 2_400);
+        s.note_off(57);
+        render(&mut s, 24_000);
+        // Poly portamento would glide this in from 220 Hz over 0.3 s.
+        s.note_on(69, 100, NoteShape::neutral());
+        assert!(env_peak(&mut s, 1_200) > 0.9, "a poly note attacks");
+        assert!((freq(&render(&mut s, 9_600)) - 440.0).abs() < 10.0);
+    }
+
+    /// The three modes start a lone note the same way, so only overlaps tell them apart.
+    #[test]
+    fn a_lone_note_sounds_the_same_in_every_mode() {
+        let go = |voice| {
+            let mut s = PolySynth::new(&voiced(voice), SR, 4);
+            s.note_on(60, 100, NoteShape::neutral());
+            let mut buf = render(&mut s, 4_800);
+            s.note_off(60);
+            buf.extend(render(&mut s, 4_800));
+            buf
+        };
+        let poly = go(VoiceMode::Poly);
+        assert_eq!(go(VoiceMode::Mono), poly);
+        assert_eq!(go(VoiceMode::Legato), poly);
     }
 
     #[test]

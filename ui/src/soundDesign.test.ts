@@ -128,6 +128,21 @@ describe("randomize", () => {
       expect(p.metal.level).toBe(0);
     }
   });
+  it("rolls mostly poly, sometimes a one-voice mode, and keeps the glide it rolled", () => {
+    const counts = { poly: 0, mono: 0, legato: 0 };
+    let glides = 0;
+    for (let seed = 1; seed <= 300; seed++) {
+      const p = rollPatch(synth, seededRng(seed));
+      if (p.kind !== "synth") throw new Error("kind");
+      counts[p.voice]++;
+      if (p.voice === "poly" && p.glide > 0) glides++;
+    }
+    expect(counts.poly).toBeGreaterThan(counts.mono + counts.legato);
+    expect(counts.mono).toBeGreaterThan(0);
+    expect(counts.legato).toBeGreaterThan(0);
+    // Glide is the default slide time for ropes, so a poly patch can keep one too.
+    expect(glides).toBeGreaterThan(0);
+  });
   it("is repeatable with the same seed", () => {
     expect(rollPatch(synth, seededRng(7))).toEqual(rollPatch(synth, seededRng(7)));
   });
@@ -160,6 +175,17 @@ describe("mutate", () => {
       const before = toNorm(d, getPath(synth, d.path) as number);
       const after = toNorm(d, getPath(m, d.path) as number);
       expect(Math.abs(after - before)).toBeLessThanOrEqual(0.081);
+    }
+  });
+  it("keeps the voice mode and treats glide as always audible", () => {
+    const glide = SYNTH_PARAMS.find((d) => d.id === "voice.glide")!;
+    for (const voice of ["poly", "mono", "legato"] as const) {
+      const base: SoundPatch = { kind: "synth", ...DEFAULT_SYNTH_PATCH, voice };
+      expect(isRelevant(base, glide)).toBe(true);
+      for (let seed = 1; seed <= 20; seed++) {
+        const m = mutatePatch(base, seededRng(seed));
+        if (m.kind === "synth") expect(m.voice).toBe(voice);
+      }
     }
   });
   it("never touches output level or velocity", () => {
