@@ -34,7 +34,7 @@ fn synth_sound_json() -> serde_json::Value {
             "filterEnv": {"attack": 0.0078125, "decay": 0.5, "sustain": 0.25, "release": 1.5},
             "pitchEnvAmount": 12.0, "pitchEnvDecay": 0.125,
             "lfo": [lfo("sampleHold", "cutoff"), lfo("triangle", "pulseWidth")],
-            "mono": true, "glide": 0.0625, "velocity": 0.5, "drive": 0.375, "crush": 0.125,
+            "voice": "legato", "glide": 0.0625, "velocity": 0.5, "drive": 0.375, "crush": 0.125,
             "chorus": {"mix": 0.25, "rate": 1.5, "depth": 0.75},
             "delay": {"mix": 0.125, "time": 0.375, "feedback": 0.5},
             "level": 0.3125,

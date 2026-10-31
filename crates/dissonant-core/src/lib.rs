@@ -40,7 +40,7 @@ pub use model::{
 };
 pub use sequence::{MasterAutomation, Sequence, SequenceAudioClip, SequenceTrack, TrackAutomation};
 pub use sound::{
-    default_kit, factory_kit, factory_kits, factory_sound, factory_sounds, DrumKit, DrumPad, DrumPatch, ResolvedPad, Sound, SoundPatch, SynthPatch, MAX_DRUM_PADS,
+    default_kit, factory_kit, factory_kits, factory_sound, factory_sounds, DrumKit, DrumPad, DrumPatch, ResolvedPad, Sound, SoundPatch, SynthPatch, VoiceMode, MAX_DRUM_PADS,
 };
 pub use tempo::{swing_warp_ticks, Tempo, TempoMap, TempoPoint};
 pub use theory::harmony::{self, ChordSuggestion, ProgressionStarter};

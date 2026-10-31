@@ -2,7 +2,7 @@
 // randomize rolls it. The editors render knobs from these lists and randomize / mutate walk
 // the same lists, so a param added here is editable and rollable at once.
 
-import { DEFAULT_DRUM_PATCH, DEFAULT_SYNTH_PATCH, FILTER_MODES, LFO_TARGETS, LFO_WAVES, OSC_WAVES, type DrumPatch, type SoundPatch, type SynthPatch } from "../../sound";
+import { DEFAULT_DRUM_PATCH, DEFAULT_SYNTH_PATCH, FILTER_MODES, LFO_TARGETS, LFO_WAVES, OSC_WAVES, VOICE_MODES, type DrumPatch, type SoundPatch, type SynthPatch } from "../../sound";
 import { fmt, getPath, mutate, plausibleDrum, plausibleSynth, randomize, type BoolParam, type ChoiceParam, type ChoiceRand, type NumParam, type NumRand, type BoolRand, type ParamDef, type Path, type Rng, type Taper } from "../../soundDesign";
 
 export interface Section {
@@ -31,6 +31,7 @@ export const WAVE_LABELS: Record<string, string> = { sine: "sin", triangle: "tri
 export const FILTER_LABELS: Record<string, string> = { off: "off", lowpass12: "lp12", lowpass24: "lp24", highpass12: "hp12", bandpass: "bp", notch: "notch" };
 export const LFO_WAVE_LABELS: Record<string, string> = { sine: "sin", triangle: "tri", saw: "saw", square: "sqr", sampleHold: "s&h" };
 export const LFO_TARGET_LABELS: Record<string, string> = { none: "none", pitch: "pitch", cutoff: "cutoff", amp: "amp", pulseWidth: "pw", fm: "fm" };
+export const VOICE_MODE_LABELS: Record<string, string> = { poly: "poly", mono: "mono", legato: "legato" };
 
 // ─── Synth ──────────────────────────────────────────────────────────────────────────────────
 
@@ -127,8 +128,9 @@ export const SYNTH_SECTIONS: Section[] = [
     id: "voice",
     title: "voice",
     params: [
-      bool("voice.mono", "mono", ["mono"], { p: 0.2 }, "one note at a time"),
-      num("voice.glide", "glide", ["glide"], 0, 2, "pow", fmt.secs, { range: [0, 0.2] }, { hint: "portamento (mono)" }),
+      // Mostly poly: one-voice modes suit basses and leads, not every roll.
+      choice("voice.mode", "mode", ["voice"], VOICE_MODES, { pick: ["poly", "poly", "poly", "poly", "poly", "poly", "mono", "legato"] }, VOICE_MODE_LABELS),
+      num("voice.glide", "glide", ["glide"], 0, 2, "pow", fmt.secs, { range: [0, 0.2] }, { hint: "default slide time" }),
       unit("voice.velocity", "vel", ["velocity"], undefined, { noMutate: true, hint: "velocity → loudness" }),
     ],
   },
@@ -382,7 +384,6 @@ export function isRelevant(patch: SoundPatch, d: ParamDef): boolean {
     if (head === "delay" && idx !== "mix") return patch.delay.mix > 0;
     if (head === "pitchEnvDecay") return patch.pitchEnvAmount !== 0;
     if (head === "noiseColor") return patch.noiseLevel > 0;
-    if (head === "glide") return patch.mono;
     if (head === "filter" && idx !== "mode") return patch.filter.mode !== "off";
     if (head === "filterEnv") return patch.filter.mode !== "off" && patch.filter.envAmount !== 0;
     return true;

@@ -344,7 +344,7 @@ fn embedded_sounds_and_custom_drum_pads_round_trip() {
     let drums = model.tracks.iter().position(|t| t.is_drum).unwrap();
     let lead = SynthPatch {
         level: 0.5,
-        mono: true,
+        voice: VoiceMode::Legato,
         glide: 0.25,
         ..SynthPatch::default()
     };
@@ -393,6 +393,34 @@ fn embedded_sounds_and_custom_drum_pads_round_trip() {
     // And the copy in the file is what plays, on a machine whose library has never seen it.
     assert_eq!(decoded.resolve_synth("u-lead"), lead);
     assert_eq!(decoded.resolve_drum("u-boom"), boom);
+}
+
+/// Before voice modes a patch said `"mono": true`. An embedded copy in an old project opens as
+/// Legato (one connected voice, no automatic glide) and is saved back with `voice` only.
+#[test]
+fn an_embedded_mono_patch_opens_as_legato() {
+    let json = r#"{
+      "schemaVersion": 10,
+      "tracks": [
+        { "id": "11111111-1111-1111-1111-111111111111", "name": "bass", "voice": "u-bass" },
+        { "id": "22222222-2222-2222-2222-222222222222", "name": "keys", "voice": "u-keys" }
+      ],
+      "sounds": [
+        { "id": "u-bass", "name": "bass", "category": "bass",
+          "patch": { "kind": "synth", "mono": true, "glide": 0.05 } },
+        { "id": "u-keys", "name": "keys", "category": "keys",
+          "patch": { "kind": "synth", "mono": false } }
+      ]
+    }"#;
+    let m = ProjectModel::from_json(json).unwrap();
+    let bass = m.resolve_synth("u-bass");
+    assert_eq!(bass.voice, VoiceMode::Legato);
+    assert_eq!(bass.glide, 0.05, "glide stays, as the default slide time");
+    assert_eq!(bass.legacy_mono, None, "the legacy key is folded away");
+    assert_eq!(m.resolve_synth("u-keys").voice, VoiceMode::Poly);
+    let saved = m.to_json().unwrap();
+    assert!(!saved.contains("\"mono\""), "the legacy key is never written back");
+    assert!(saved.contains("\"voice\": \"legato\""));
 }
 
 #[test]

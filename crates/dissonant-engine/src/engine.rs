@@ -10,7 +10,8 @@ use crate::dsp::pan_gains;
 use crate::synth::PolySynth;
 use dissonant_core::{
     factory_sound, swing_warp_ticks, AutomationCurve, InsertTarget, MasterSettings, NoteEvent,
-    Sequence, SoundPatch, SynthPatch, Tempo, TrackAutomation, MAX_INSERTS, TICKS_PER_BEAT,
+    Sequence, SoundPatch, SynthPatch, Tempo, TrackAutomation, VoiceMode, MAX_INSERTS,
+    TICKS_PER_BEAT,
 };
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -1528,6 +1529,56 @@ impl Engine {
             self.collect_segment(start, end, base);
         }
         self.events.sort_by_key(|e| e.offset);
+        self.connect_touching_notes();
+    }
+
+    /// Let Legato hear a note that starts exactly where the previous one ends. Each note pushes
+    /// its own on and off, so at a shared offset the earlier note's off would land first and
+    /// the next note would find no key held and replay its attack. On a Legato track, each
+    /// note-off in a run of note events at one offset is moved after the note-ons there —
+    /// but never past a note-on of its own pitch: a repeated note has to end before it starts
+    /// again, or the old note's off would cut the new one short.
+    ///
+    /// Only built-in synths in Legato are touched, so Poly, Mono, drums and plugins keep the
+    /// order they were scheduled in. In place and allocation-free: a run is a handful of
+    /// events, so shuffling it with rotations costs nothing.
+    fn connect_touching_notes(&mut self) {
+        let tracks = &self.sequence.tracks;
+        let legato = |track: usize| {
+            tracks.get(track).is_some_and(|t| {
+                !t.is_drum && t.plugin.is_none() && t.synth.voice == VoiceMode::Legato
+            })
+        };
+        if !(0..tracks.len()).any(legato) {
+            return;
+        }
+        let is_note =
+            |e: &Event| matches!(e.kind, EventKind::NoteOn { .. } | EventKind::NoteOff { .. });
+        let events = &mut self.events;
+        let mut start = 0;
+        while start < events.len() {
+            let offset = events[start].offset;
+            let len = events[start..]
+                .iter()
+                .take_while(|e| e.offset == offset && is_note(e))
+                .count();
+            let run = &mut events[start..start + len];
+            start += len.max(1);
+            // Right to left, so every off to the right is already in place when one moves past it.
+            for i in (0..run.len()).rev() {
+                let EventKind::NoteOff { track, pitch } = run[i].kind else {
+                    continue;
+                };
+                if !legato(track) {
+                    continue;
+                }
+                let stop = run[i + 1..]
+                    .iter()
+                    .position(|e| matches!(e.kind, EventKind::NoteOn { track: t, pitch: p, .. } if t == track && p == pitch))
+                    .map_or(run.len(), |k| i + 1 + k);
+                run[i..stop].rotate_left(1);
+            }
+        }
     }
 
     /// Notes already sounding at `from` — the ones the playhead landed inside. Scheduling only
@@ -2301,6 +2352,137 @@ mod tests {
         let left = render(&mut e, 30_000, 512);
         let onset = onset_tick_sample(&e, &left);
         assert!((onset - 16_538).abs() <= 2, "onset {onset}");
+    }
+
+    /// Every note on and off the scheduler lines up for the next `frames` samples, in the
+    /// order they will fire: `(offset, on, pitch)`.
+    fn note_events(engine: &mut Engine, frames: usize) -> Vec<(usize, bool, u8)> {
+        engine.collect_events(frames);
+        engine
+            .events
+            .iter()
+            .filter_map(|e| match e.kind {
+                EventKind::NoteOn { pitch, .. } => Some((e.offset, true, pitch)),
+                EventKind::NoteOff { pitch, .. } => Some((e.offset, false, pitch)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// An engine playing `notes` on one track whose sound is `voice`.
+    fn playing_notes(voice: &str, notes: Vec<NoteEvent>) -> Engine {
+        let mut model = ProjectModel::empty();
+        model.tracks[0].voice = voice.into();
+        let pid = model.patterns[0].id;
+        model.patterns[0].length_ticks = 8 * B;
+        model.patterns[0].notes = notes;
+        let seq = Arc::new(Sequence::from_pattern(&model, &pid, 0).unwrap());
+        let mut e = Engine::new(SR, Arc::new(Shared::default()), &MasterSettings::default());
+        e.handle(EngineCommand::SetSequence(seq));
+        e.handle(EngineCommand::Play);
+        e
+    }
+
+    /// In Legato a note that starts where the last one ends connects to it, so its on has to
+    /// reach the synth while the last one is still held.
+    #[test]
+    fn touching_notes_on_a_legato_track_start_before_the_last_one_ends() {
+        let touching = || vec![NoteEvent::new(0, B, 57), NoteEvent::new(B, B, 60)];
+        // `sub-bass` is a factory Legato sound.
+        let legato = note_events(&mut playing_notes("sub-bass", touching()), 2 * SR as usize);
+        assert_eq!(
+            legato,
+            vec![
+                (0, true, 57),
+                (22_050, true, 60),
+                (22_050, false, 57),
+                (44_100, false, 60)
+            ]
+        );
+        // Poly keeps the order notes were scheduled in: the end of one, then the next.
+        let poly = note_events(&mut playing_notes("sine", touching()), 2 * SR as usize);
+        assert_eq!(
+            poly,
+            vec![
+                (0, true, 57),
+                (22_050, false, 57),
+                (22_050, true, 60),
+                (44_100, false, 60)
+            ]
+        );
+    }
+
+    /// A repeated pitch must end before it starts again, or the old note's off would release
+    /// the voice the new note just took over.
+    #[test]
+    fn touching_notes_of_one_pitch_still_end_before_they_restart() {
+        let notes = vec![
+            NoteEvent::new(0, B, 57),
+            NoteEvent::new(B, B, 57),
+            NoteEvent::new(B, B, 64),
+        ];
+        let events = note_events(&mut playing_notes("sub-bass", notes), 2 * SR as usize);
+        assert_eq!(
+            events[..4],
+            [
+                (0, true, 57),
+                (22_050, false, 57),
+                (22_050, true, 57),
+                (22_050, true, 64)
+            ]
+        );
+        // A note's own repeats are the same pitch touching itself: untouched.
+        let mut rep = NoteEvent::new(0, 2 * B, 57);
+        rep.repeats = 1;
+        let events = note_events(&mut playing_notes("sub-bass", vec![rep]), 2 * SR as usize);
+        assert_eq!(
+            events,
+            vec![
+                (0, true, 57),
+                (22_050, false, 57),
+                (22_050, true, 57),
+                (44_100, false, 57)
+            ]
+        );
+    }
+
+    /// End to end: a Legato bass playing two touching notes attacks once, where Mono attacks
+    /// twice. Measured as the loudest moment just after the join against the level the first
+    /// note settled at.
+    #[test]
+    fn legato_connects_touching_notes_in_playback() {
+        let join = |voice: VoiceMode| {
+            let mut model = ProjectModel::empty();
+            let mut patch = match factory_sound("sine").map(|s| &s.patch) {
+                Some(SoundPatch::Synth(p)) => *p,
+                _ => unreachable!(),
+            };
+            patch.voice = voice;
+            patch.amp_env.attack = 0.02;
+            patch.amp_env.decay = 0.02;
+            patch.amp_env.sustain = 0.3;
+            model.sounds.push(dissonant_core::Sound {
+                id: "u-test".into(),
+                name: "test".into(),
+                category: "bass".into(),
+                patch: SoundPatch::Synth(patch),
+            });
+            model.tracks[0].voice = "u-test".into();
+            let pid = model.patterns[0].id;
+            model.patterns[0].length_ticks = 8 * B;
+            model.patterns[0].notes = vec![NoteEvent::new(0, B, 57), NoteEvent::new(B, B, 60)];
+            let seq = Arc::new(Sequence::from_pattern(&model, &pid, 0).unwrap());
+            let mut e = Engine::new(SR, Arc::new(Shared::default()), &MasterSettings::default());
+            e.handle(EngineCommand::SetSequence(seq));
+            e.handle(EngineCommand::Play);
+            let left = render(&mut e, 30_000, 512);
+            let peak = |xs: &[f32]| xs.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+            peak(&left[22_050..24_000]) / peak(&left[18_000..22_000])
+        };
+        let legato = join(VoiceMode::Legato);
+        let mono = join(VoiceMode::Mono);
+        assert!(legato < 1.3, "legato re-attacked at the join: {legato}");
+        assert!(mono > 2.0, "mono should re-attack at the join: {mono}");
     }
 
     /// `repeats = r` sounds the note `r + 1` times, evenly spaced across its *own* length.
