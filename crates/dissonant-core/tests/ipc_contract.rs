@@ -337,6 +337,7 @@ fn every_command_variant_round_trips_from_the_ui_payload() {
 
     // The piano roll's commit path — one `setNotes` per gesture. The performance properties
     // are optional on the wire: a bare note takes the neutral value for each.
+    let source_id = Uuid::new_v4();
     let notes = parse(json!({
         "type": "setNotes",
         "patternId": pattern_id,
@@ -345,7 +346,8 @@ fn every_command_variant_round_trips_from_the_ui_payload() {
             {
                 "id": Uuid::new_v4(), "startTick": 1_920, "lengthTicks": 480, "pitch": 64, "velocity": 90,
                 "pan": 0.25, "release": 0.75, "fine": -50, "modX": 0.1, "modY": 0.9,
-                "shiftTicks": -120, "repeats": 3, "color": 5
+                "shiftTicks": -120, "repeats": 3, "color": 5,
+                "slideFrom": source_id, "slideSecs": 0.25
             },
         ],
     }));
@@ -382,9 +384,32 @@ fn every_command_variant_round_trips_from_the_ui_payload() {
             assert_eq!(notes[1].shift_ticks, -120);
             assert_eq!((notes[1].repeats, notes[1].color), (3, 5));
             assert_eq!(notes[1].shifted_start(), 1_800);
+            // No rope unless the UI sends one.
+            assert_eq!((notes[0].slide_from, notes[0].slide_secs), (None, None));
+            assert_eq!(notes[1].slide_from, Some(source_id));
+            assert_eq!(notes[1].slide_secs, Some(0.25));
         }
         other => panic!("expected SetNotes, got {other:?}"),
     }
+
+    // Ropes, drawn in the piano roll.
+    let note_id = Uuid::new_v4();
+    assert_eq!(
+        parse(json!({"type": "setRope", "patternId": pattern_id, "noteId": note_id, "sourceId": source_id})),
+        Command::SetRope { pattern_id, note_id, source_id }
+    );
+    assert_eq!(
+        parse(json!({"type": "clearRope", "patternId": pattern_id, "noteId": note_id})),
+        Command::ClearRope { pattern_id, note_id }
+    );
+    assert_eq!(
+        parse(json!({"type": "setSlideTime", "patternId": pattern_id, "noteId": note_id, "secs": 0.375})),
+        Command::SetSlideTime { pattern_id, note_id, secs: Some(0.375) }
+    );
+    assert_eq!(
+        parse(json!({"type": "setSlideTime", "patternId": pattern_id, "noteId": note_id, "secs": null})),
+        Command::SetSlideTime { pattern_id, note_id, secs: None }
+    );
 
     // The project progression, in song ticks.
     let chords = parse(json!({

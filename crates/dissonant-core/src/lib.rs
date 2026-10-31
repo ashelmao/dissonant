@@ -32,11 +32,11 @@ pub use document::{Command, Document, EditError, InsertTarget, TrackParam};
 pub use effects::{NativeKind, NativeParam, ParamMap, NATIVE_PREFIX};
 pub use midi_file::{ImportedMidi, ImportedTrack, MidiError, MidiScope};
 pub use model::{
-    tidy_chords, tile_chords, AmpHead, AmpModel, AmpRig, AudioClip, AudioSource, CabModel, Cabinet,
+    remap_ropes, rope_is_live, tidy_chords, tidy_ropes, tile_chords, AmpHead, AmpModel, AmpRig, AudioClip, AudioSource, CabModel, Cabinet,
     ChordEvent, Clip, EqModel, Gate, Insert, KeyState, MasterSettings, MicModel, NoteEvent, Pedal,
     PedalKind, ProjectModel, Rack, ScaleType, Section, SongPattern, TimeSignature, Track,
     TrackKind, TrackPlugin, DEFAULT_SONG_BARS, MAX_CLIP_GAIN, MAX_FADE_SECONDS, MAX_INSERTS,
-    MAX_PEDALS, MAX_SHIFT_TICKS, MIN_NOTE_TICKS, SCHEMA_VERSION,
+    MAX_PEDALS, MAX_SHIFT_TICKS, MAX_SLIDE_SECS, MIN_NOTE_TICKS, SCHEMA_VERSION,
 };
 pub use sequence::{MasterAutomation, Sequence, SequenceAudioClip, SequenceTrack, TrackAutomation};
 pub use sound::{

@@ -302,6 +302,8 @@ impl Sequence {
                 salt.extend_from_slice(&rep.to_le_bytes());
                 track.notes.push(NoteEvent {
                     id: Uuid::new_v5(&note.id, &salt),
+                    // Same salt: a rope points at its source's copy in the same repetition.
+                    slide_from: note.slide_from.map(|s| Uuid::new_v5(&s, &salt)),
                     start_tick: start,
                     length_ticks: note
                         .length_ticks
@@ -314,6 +316,9 @@ impl Sequence {
             base += ghost.length_ticks;
             rep += 1;
         }
+        // A source cut off at the sequence's end was never added; its rope goes rather than
+        // dangle. The edited pattern's own notes are already tidy, so this only touches ghosts.
+        crate::model::tidy_ropes(&mut track.notes);
         track.notes.sort_by_key(|n| n.start_tick);
         self
     }

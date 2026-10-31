@@ -2,6 +2,7 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 import { barTicks, beatsPerBar, effectiveKey, gridLabel, selectedPattern, selectedTrack, selectedTrackIndex, usePatternChords, useStore } from "../store";
 import { chordAt, explainNote, midiName, tierMap } from "../theory";
 import {
+  copyNotes,
   duplicateBySpan,
   duplicateNotes,
   glueNotes,
@@ -36,7 +37,6 @@ import {
   ticksToBeats,
   TIER_COLORS,
   trackColor,
-  uuid,
   type NoteEvent,
   type NoteProp,
   type Tier,
@@ -815,7 +815,7 @@ export function PianoRoll() {
       if (e.altKey && !hit.edge) {
         origin = "duplicate";
         const originals = notes.filter((n) => ids.has(n.id));
-        const copies = originals.map((o) => ({ ...o, id: uuid() }));
+        const copies = copyNotes(originals);
         base = [...notes, ...copies];
         ids = new Set(copies.map((c) => c.id));
         anchor = copies[originals.indexOf(hit.note)] ?? copies[0];

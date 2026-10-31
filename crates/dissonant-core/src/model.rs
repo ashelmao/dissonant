@@ -15,7 +15,7 @@
 use crate::effects::{NativeKind, ParamMap};
 use crate::ticks::{beats_to_ticks, TICKS_PER_BEAT};
 use serde::{Deserialize, Deserializer, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
 pub const SCHEMA_VERSION: u32 = 10;
@@ -160,6 +160,9 @@ pub const MAX_REPEATS: u8 = 14;
 /// Furthest a note may be nudged off its grid position, in ticks (four beats each way).
 pub const MAX_SHIFT_TICKS: i64 = 4 * TICKS_PER_BEAT;
 
+/// Longest slide a rope may ask for, in seconds; the patch's glide knob tops out here too.
+pub const MAX_SLIDE_SECS: f32 = 2.0;
+
 /// The shortest note the engine will schedule (a 1/64 note); trimming never produces less
 /// than this.
 pub const MIN_NOTE_TICKS: i64 = TICKS_PER_BEAT / 16;
@@ -216,6 +219,16 @@ pub struct NoteEvent {
     /// Colour group 0–15. Groups the roll by colour and becomes the MIDI channel on export.
     #[serde(default, skip_serializing_if = "is_zero_u8")]
     pub color: u8,
+    /// The note on the same pattern this one slides from: a rope. It is stored on the
+    /// destination so each note of a chord can slide to its own target, and only takes effect
+    /// while [`rope_is_live`] holds. Every path that copies notes remaps it to the copy of its
+    /// source, or drops it when the source was not copied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slide_from: Option<Uuid>,
+    /// How long the slide takes, in seconds (0–[`MAX_SLIDE_SECS`]). `None` uses the patch's
+    /// glide, so changing the sound changes every rope that never had its own time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slide_secs: Option<f32>,
     /// Schema ≤ 8 only; folded into `start_tick` by [`ProjectModel::normalized`].
     #[serde(default, rename = "startBeat", skip_serializing)]
     pub legacy_start_beat: Option<f64>,
@@ -245,6 +258,8 @@ impl NoteEvent {
             shift_ticks: 0,
             repeats: 0,
             color: 0,
+            slide_from: None,
+            slide_secs: None,
             legacy_start_beat: None,
             legacy_length_beats: None,
             legacy_shift: None,
@@ -279,6 +294,11 @@ impl NoteEvent {
         self.shift_ticks = self.shift_ticks.clamp(-MAX_SHIFT_TICKS, MAX_SHIFT_TICKS);
         self.repeats = self.repeats.min(MAX_REPEATS);
         self.color = self.color.min(15);
+        // Same range as the patch's glide; garbage means "use the glide" rather than a guess.
+        self.slide_secs = self
+            .slide_secs
+            .filter(|s| s.is_finite())
+            .map(|s| s.clamp(0.0, MAX_SLIDE_SECS));
         self
     }
 
@@ -287,6 +307,75 @@ impl NoteEvent {
         migrate_tick(&mut self.start_tick, &mut self.legacy_start_beat);
         migrate_tick(&mut self.length_ticks, &mut self.legacy_length_beats);
         migrate_tick(&mut self.shift_ticks, &mut self.legacy_shift);
+    }
+}
+
+/// Whether `target`'s rope from `source` actually slides: the source must still be sounding
+/// when the target starts. Touching counts (`target` starting exactly at the source's end), so a
+/// legato line drawn on the grid connects. Both starts are the shifted ones, because that is
+/// when the notes really sound. A muted source has no voice to slide out of, and a note can't
+/// slide from itself. Equal pitches are fine: the rope then acts as a tie.
+///
+/// A rope that isn't live is kept (moving a note never breaks its rope) and the target plays as
+/// an ordinary note. `ui/src/ropes.ts` mirrors this so the roll can draw live and dead ropes
+/// without asking; the two must stay identical.
+pub fn rope_is_live(source: &NoteEvent, target: &NoteEvent) -> bool {
+    if source.id == target.id || source.muted {
+        return false;
+    }
+    let from = source.shifted_start();
+    let at = target.shifted_start();
+    from < at && at <= from + source.length_ticks
+}
+
+/// Make one pattern's ropes valid: a rope whose source isn't in `notes` (deleted, or not
+/// copied), that points at its own note, or that closes a loop (A from B from A) is cut, and a
+/// slide time left without a rope goes with it. A loop is cut at its first note in slice
+/// order, which for a sorted pattern is the earliest, the one that could never have slid
+/// anyway. Chains (A → B → C) are fine.
+pub fn tidy_ropes(notes: &mut [NoteEvent]) {
+    let index: HashMap<Uuid, usize> = notes.iter().enumerate().map(|(i, n)| (n.id, i)).collect();
+    for i in 0..notes.len() {
+        let id = notes[i].id;
+        let Some(first) = notes[i].slide_from else {
+            notes[i].slide_secs = None;
+            continue;
+        };
+        // A missing source cuts this rope. Otherwise walk the chain upstream: reaching this note
+        // again is a loop through it; reaching a note seen before is a loop further up, cut when
+        // its own first note comes round; a missing link further up is that note's to cut.
+        let cut = !index.contains_key(&first) || {
+            let mut from = first;
+            let mut seen = HashSet::new();
+            loop {
+                if from == id {
+                    break true;
+                }
+                if !seen.insert(from) {
+                    break false;
+                }
+                match index.get(&from).and_then(|&j| notes[j].slide_from) {
+                    Some(next) => from = next,
+                    None => break false,
+                }
+            }
+        };
+        if cut {
+            notes[i].slide_from = None;
+            notes[i].slide_secs = None;
+        }
+    }
+}
+
+/// Point copied ropes at the copies: `copy_of` maps an original note id to its copy's id. A rope
+/// whose source has a copy follows it; one whose source was left behind is dropped with its
+/// slide time, since a copy sliding out of the original would tie two unrelated phrases.
+pub fn remap_ropes(notes: &mut [NoteEvent], copy_of: impl Fn(&Uuid) -> Option<Uuid>) {
+    for n in notes {
+        n.slide_from = n.slide_from.as_ref().and_then(&copy_of);
+        if n.slide_from.is_none() {
+            n.slide_secs = None;
+        }
     }
 }
 
@@ -1247,9 +1336,14 @@ impl SongPattern {
         let mut copy = self.clone();
         copy.id = Uuid::new_v4();
         copy.name = format!("{} copy", self.name);
+        let mut copy_of = HashMap::new();
         for n in &mut copy.notes {
-            n.id = Uuid::new_v4();
+            let fresh = Uuid::new_v4();
+            copy_of.insert(n.id, fresh);
+            n.id = fresh;
         }
+        // Every source is in the copy, so every rope survives, pointing inside the copy.
+        remap_ropes(&mut copy.notes, |id| copy_of.get(id).copied());
         copy
     }
 
@@ -1283,6 +1377,8 @@ impl SongPattern {
                 }
                 out.push(NoteEvent {
                     id: repeat_id(&note.id, rep),
+                    // A rope inside the loop points at its source's copy in the same turn.
+                    slide_from: note.slide_from.map(|s| repeat_id(&s, rep)),
                     start_tick: start,
                     length_ticks: ((start + note.length_ticks).min(end) - start)
                         .max(MIN_NOTE_TICKS),
@@ -1995,6 +2091,8 @@ impl ProjectModel {
             for n in pattern.notes.iter_mut() {
                 *n = n.clone().sanitized();
             }
+            // A hand-edited file can name a source that isn't there, or loop.
+            tidy_ropes(&mut pattern.notes);
         }
         let pattern_ids: Vec<Uuid> = self.patterns.iter().map(|p| p.id).collect();
         if !self.swing.is_finite() {

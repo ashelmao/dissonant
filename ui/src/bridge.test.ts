@@ -431,6 +431,83 @@ describe("setNotes", () => {
   });
 });
 
+// ─── ropes ─────────────────────────────────────────────────────────────────────────────────
+
+describe("ropes", () => {
+  const A = "aaaaaaaa-0000-4000-8000-000000000000";
+  const B = "bbbbbbbb-0000-4000-8000-000000000000";
+  const C = "cccccccc-0000-4000-8000-000000000000";
+  const roped = (id: string, startTick: number, pitch: number, extra: Partial<NoteEvent> = {}) => note(startTick, pitch, { id, ...extra });
+
+  async function seed(notes: NoteEvent[]) {
+    const { pattern } = await ids();
+    await b.apply({ type: "setNotes", patternId: pattern, notes });
+    return pattern;
+  }
+  const notes = async () => (await model()).patterns[0].notes;
+  const find = async (id: string) => (await notes()).find((n) => n.id === id)!;
+
+  it("setRope ropes a note, labelled for undo like document.rs", async () => {
+    const pattern = await seed([roped(A, 0, 60), roped(B, TICKS_PER_BEAT, 67)]);
+    const s = await b.apply({ type: "setRope", patternId: pattern, noteId: B, sourceId: A });
+    expect(s.undoLabel).toBe("add rope");
+    expect((await find(B)).slideFrom).toBe(A);
+    expect((await b.undo()).model.patterns[0].notes.find((n) => n.id === B)).not.toHaveProperty("slideFrom");
+  });
+
+  it("setRope refuses missing notes, self ropes and loops", async () => {
+    const pattern = await seed([roped(A, 0, 60), roped(B, TICKS_PER_BEAT, 62, { slideFrom: A }), roped(C, 2 * TICKS_PER_BEAT, 64, { slideFrom: B })]);
+    const rope = (noteId: string, sourceId: string): Command => ({ type: "setRope", patternId: pattern, noteId, sourceId });
+    await rejectsAndKeepsModel(rope(A, FAKE_ID), "no such note");
+    await rejectsAndKeepsModel(rope(FAKE_ID, A), "no such note");
+    const loop = "a note can't slide from itself, or from a note that slides from it";
+    await rejectsAndKeepsModel(rope(A, A), loop);
+    await rejectsAndKeepsModel(rope(A, B), loop);
+    await rejectsAndKeepsModel(rope(A, C), loop);
+    await rejectsAndKeepsModel({ type: "setRope", patternId: FAKE_ID, noteId: B, sourceId: A }, "no such pattern");
+  });
+
+  it("clearRope cuts the rope and its time, and leaves no keys behind", async () => {
+    const pattern = await seed([roped(A, 0, 60), roped(B, TICKS_PER_BEAT, 62, { slideFrom: A, slideSecs: 0.4 })]);
+    const s = await b.apply({ type: "clearRope", patternId: pattern, noteId: B });
+    expect(s.undoLabel).toBe("remove rope");
+    const got = await find(B);
+    expect(got).not.toHaveProperty("slideFrom");
+    expect(got).not.toHaveProperty("slideSecs");
+    await rejectsAndKeepsModel({ type: "clearRope", patternId: pattern, noteId: FAKE_ID }, "no such note");
+  });
+
+  it("setSlideTime clamps, resets and needs a rope", async () => {
+    const pattern = await seed([roped(A, 0, 60), roped(B, TICKS_PER_BEAT, 62, { slideFrom: A })]);
+    const time = (secs: number | null): Command => ({ type: "setSlideTime", patternId: pattern, noteId: B, secs });
+    expect((await b.apply(time(10))).undoLabel).toBe("change slide time");
+    expect((await find(B)).slideSecs).toBe(2);
+    await b.apply(time(0.5));
+    expect((await find(B)).slideSecs).toBe(0.5);
+    await b.apply(time(null));
+    expect(await find(B)).not.toHaveProperty("slideSecs");
+    await rejectsAndKeepsModel(time(Number.NaN), "invalid value");
+    await rejectsAndKeepsModel({ type: "setSlideTime", patternId: pattern, noteId: A, secs: 0.5 }, "that note has no rope");
+  });
+
+  it("setNotes cuts ropes to deleted notes and clamps slide times", async () => {
+    const pattern = await seed([roped(A, 0, 60), roped(B, TICKS_PER_BEAT, 62, { slideFrom: A, slideSecs: 9 })]);
+    expect((await find(B)).slideSecs).toBe(2);
+    await b.apply({ type: "setNotes", patternId: pattern, notes: (await notes()).filter((n) => n.id !== A) });
+    const got = await find(B);
+    expect(got).not.toHaveProperty("slideFrom");
+    expect(got).not.toHaveProperty("slideSecs");
+  });
+
+  it("duplicatePattern points the copy's ropes inside the copy", async () => {
+    const pattern = await seed([roped(A, 0, 60), roped(B, TICKS_PER_BEAT, 62, { slideFrom: A })]);
+    await b.apply({ type: "duplicatePattern", id: pattern });
+    const copy = (await model()).patterns[1].notes;
+    expect(copy[0].id).not.toBe(A);
+    expect(copy[1].slideFrom).toBe(copy[0].id);
+  });
+});
+
 // ─── chords and arrangement ────────────────────────────────────────────────────────────────
 
 describe("setChords", () => {
