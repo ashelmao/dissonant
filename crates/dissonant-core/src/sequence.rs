@@ -6,10 +6,11 @@ use crate::arrangement::Arrangement;
 use crate::automation::{AutoTarget, AutomationCurve, Breakpoint, Curve, MasterParam};
 use crate::chord_track::ChordTrack;
 use crate::document::TrackParam;
-use crate::model::{AmpRig, NoteEvent, ProjectModel, Track, TrackPlugin};
+use crate::model::{rope_is_live, AmpRig, NoteEvent, ProjectModel, Track, TrackPlugin};
 use crate::sound::{ResolvedPad, SynthPatch};
 use crate::tempo::TempoMap;
 use crate::ticks::{bar_ticks, TICKS_PER_BEAT};
+use std::collections::HashMap;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -29,6 +30,11 @@ pub struct SequenceTrack {
     /// Set on an audio track: the rig its audio and live input run through.
     pub amp: Option<AmpRig>,
     pub notes: Vec<NoteEvent>,
+    /// The live ropes between `notes`, one entry per note (same index), or empty when nothing
+    /// on the track slides. Filled by [`Sequence::resolve_ropes`], which every constructor
+    /// runs; notes changed by hand afterwards need it run again, and the engine ignores a table
+    /// whose length no longer matches `notes`.
+    pub ropes: Vec<NoteRope>,
     /// The synth patch `voice` resolves to (meaningless on drum tracks).
     pub synth: SynthPatch,
     /// The drum kit with each pad's sound looked up (empty on synth tracks).
@@ -37,6 +43,49 @@ pub struct SequenceTrack {
     /// the track rather than in one list on the [`Sequence`] so the engine can reach a
     /// channel's curves by the index it already has, with no lookup on the audio thread.
     pub automation: TrackAutomation,
+}
+
+/// One note's ropes as this timeline plays them, both ends as indices into the same
+/// [`SequenceTrack::notes`].
+///
+/// Worked out once when the sequence is built, so the scheduler never searches for a rope's
+/// source by id on the audio thread. Only live ropes ([`rope_is_live`]) whose slide note
+/// actually sounds (not muted, starting inside the timeline) are kept: a rope that can't happen
+/// must not hold its source's voice open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct NoteRope {
+    /// The note whose voice this one takes over as it starts.
+    pub from: Option<usize>,
+    /// The note that takes this one's voice over: the earliest, when several slide from it,
+    /// since only the first can have the voice. The voice then belongs to that note, so this
+    /// note's own end must not release it.
+    pub to: Option<usize>,
+}
+
+/// The live ropes in `notes` on a timeline `length_ticks` long; see [`NoteRope`]. Empty when no
+/// note has a rope, which is nearly every track.
+fn live_ropes(notes: &[NoteEvent], length_ticks: i64) -> Vec<NoteRope> {
+    if notes.iter().all(|n| n.slide_from.is_none()) {
+        return vec![];
+    }
+    let index: HashMap<Uuid, usize> = notes.iter().enumerate().map(|(i, n)| (n.id, i)).collect();
+    let mut ropes = vec![NoteRope::default(); notes.len()];
+    for (i, note) in notes.iter().enumerate() {
+        let Some(&j) = note.slide_from.and_then(|id| index.get(&id)) else {
+            continue;
+        };
+        if note.muted || note.shifted_start() >= length_ticks || !rope_is_live(&notes[j], note) {
+            continue;
+        }
+        ropes[i].from = Some(j);
+        // Ties go to the note listed first, which is also the one the scheduler fires first.
+        let start = note.shifted_start();
+        match ropes[j].to {
+            Some(k) if notes[k].shifted_start() <= start => {}
+            _ => ropes[j].to = Some(i),
+        }
+    }
+    ropes
 }
 
 /// The automation for one track's channel strip, flattened onto the timeline being played.
@@ -153,6 +202,7 @@ impl SequenceTrack {
             plugin: track.plugin.clone(),
             amp: track.amp.clone(),
             notes,
+            ropes: vec![],
             synth: model.resolve_synth(&track.voice),
             drum_pads,
             automation: TrackAutomation::for_track(model, &track.id, offset_ticks),
@@ -221,6 +271,7 @@ impl Sequence {
             track.notes = pattern.notes.clone();
         }
         seq.chords = ChordTrack::window(model.chords.chords(), offset, length);
+        seq.resolve_ropes();
         Some(seq)
     }
 
@@ -320,7 +371,21 @@ impl Sequence {
         // dangle. The edited pattern's own notes are already tidy, so this only touches ghosts.
         crate::model::tidy_ropes(&mut track.notes);
         track.notes.sort_by_key(|n| n.start_tick);
+        self.resolve_ropes();
         self
+    }
+
+    /// Work out every track's [`SequenceTrack::ropes`] from its notes. Drum hits never slide,
+    /// so drum tracks stay empty.
+    pub fn resolve_ropes(&mut self) {
+        let length = self.length_ticks;
+        for track in &mut self.tracks {
+            track.ropes = if track.is_drum {
+                vec![]
+            } else {
+                live_ropes(&track.notes, length)
+            };
+        }
     }
 
 
@@ -366,7 +431,7 @@ impl Sequence {
             .unwrap_or(0);
         // The song's hard end is the loop, but a take recorded past it must still be heard.
         let total = model.song_length_ticks.max(audio_end);
-        Sequence {
+        let mut seq = Sequence {
             tracks,
             chords: model.chords.clone(),
             // Same floor as `from_pattern`: a loaded project can carry a zero or negative
@@ -380,7 +445,9 @@ impl Sequence {
             tempo_map: map,
             master_automation: MasterAutomation::for_model(model, 0),
             audio,
-        }
+        };
+        seq.resolve_ropes();
+        seq
     }
 
     pub fn any_solo(&self) -> bool {
@@ -575,6 +642,47 @@ mod tests {
             s.chords.chord_at(17 * BEAT).unwrap().name.as_deref(),
             Some("C")
         );
+    }
+
+    #[test]
+    fn the_rope_table_keeps_only_ropes_that_can_happen() {
+        let mut model = ProjectModel::empty();
+        let roped = |source: &NoteEvent, mut n: NoteEvent| {
+            n.slide_from = Some(source.id);
+            n
+        };
+        let a = NoteEvent::new(0, 2 * BEAT, 60);
+        let b = roped(&a, NoteEvent::new(BEAT, 2 * BEAT, 62));
+        let c = roped(&b, NoteEvent::new(3 * BEAT, BEAT, 64)); // touches b's end: live
+        let d = roped(&a, NoteEvent::new(BEAT, BEAT, 67)); // a second target of a, same start
+        let gap = NoteEvent::new(5 * BEAT, BEAT, 60);
+        let dead = roped(&gap, NoteEvent::new(7 * BEAT, BEAT, 62)); // starts after gap ends
+        let mut silent = roped(&gap, NoteEvent::new(5 * BEAT + BEAT / 2, BEAT, 65));
+        silent.muted = true;
+        let past = NoteEvent::new(14 * BEAT, 4 * BEAT, 60);
+        let beyond = roped(&past, NoteEvent::new(16 * BEAT, BEAT, 62)); // past the loop end
+        let notes = vec![a, b, c, d, gap, dead, silent, past, beyond];
+        model.patterns[0].length_ticks = 16 * BEAT;
+        model.patterns[0].notes = notes;
+        let pid = model.patterns[0].id;
+        let seq = Sequence::from_pattern(&model, &pid, 0).unwrap();
+        let ropes = &seq.tracks[0].ropes;
+        assert_eq!(ropes.len(), 9);
+        let rope = |from, to| NoteRope { from, to };
+        let first = "a goes to the first of its two targets";
+        assert_eq!(ropes[0], rope(None, Some(1)), "{first}");
+        assert_eq!(ropes[1], rope(Some(0), Some(2)), "chains pass through");
+        assert_eq!(ropes[2], rope(Some(1), None));
+        assert_eq!(ropes[3], rope(Some(0), None), "the second target still names a");
+        assert_eq!(ropes[4], rope(None, None), "a dead or muted target holds nothing open");
+        assert_eq!(ropes[5], rope(None, None));
+        assert_eq!(ropes[6], rope(None, None));
+        assert_eq!(ropes[7], rope(None, None), "a target past the end never sounds");
+        assert_eq!(ropes[8], rope(None, None));
+
+        model.patterns[0].notes = vec![NoteEvent::new(0, BEAT, 60)];
+        let plain = Sequence::from_pattern(&model, &pid, 0).unwrap();
+        assert!(plain.tracks[0].ropes.is_empty(), "no ropes, no table");
     }
 
     #[test]

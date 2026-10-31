@@ -1021,16 +1021,20 @@ pub struct NoteFilter {
 
 impl NoteFilter {
     pub fn lowpass(sample_rate: f32, cutoff: f32, q: f32) -> Self {
+        let mut f = NoteFilter::default();
+        f.retune(sample_rate, cutoff, q);
+        f
+    }
+
+    /// New cutoff and Q, keeping the integrator states: a slide sweeps the filter from one
+    /// note's setting to the next while it rings, and starting over would click.
+    pub fn retune(&mut self, sample_rate: f32, cutoff: f32, q: f32) {
         let g = (PI * cutoff.clamp(10.0, sample_rate * 0.45) / sample_rate).tan();
         let k = 1.0 / q.max(0.05);
         let a1 = 1.0 / (1.0 + g * (g + k));
-        NoteFilter {
-            a1,
-            a2: g * a1,
-            a3: g * g * a1,
-            ic1: 0.0,
-            ic2: 0.0,
-        }
+        self.a1 = a1;
+        self.a2 = g * a1;
+        self.a3 = g * g * a1;
     }
 
     #[inline]
@@ -1058,10 +1062,16 @@ pub fn note_filter(sample_rate: f32, tone_hz: f32, mod_x: f32, mod_y: f32) -> Op
     if mod_x == 0.5 && mod_y == 0.5 {
         return None;
     }
+    let (cutoff, q) = note_filter_tuning(tone_hz, mod_x, mod_y);
+    Some(NoteFilter::lowpass(sample_rate, cutoff, q))
+}
+
+/// The cutoff and Q behind [`note_filter`], for retuning one that is already running.
+pub fn note_filter_tuning(tone_hz: f32, mod_x: f32, mod_y: f32) -> (f32, f32) {
     let octaves = (mod_x.clamp(0.0, 1.0) - 0.5) * 2.0 * MOD_X_OCTAVES;
     let cutoff = (tone_hz * octaves.exp2()).clamp(200.0, 20_000.0);
     let q = 0.707 * ((mod_y.clamp(0.0, 1.0) - 0.5) * 2.0 * MOD_Y_OCTAVES).exp2();
-    Some(NoteFilter::lowpass(sample_rate, cutoff, q))
+    (cutoff, q)
 }
 
 // ─── Guitar rig primitives ───────────────────────────────────────────────────────────────────

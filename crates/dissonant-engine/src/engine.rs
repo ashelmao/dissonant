@@ -10,8 +10,8 @@ use crate::dsp::pan_gains;
 use crate::synth::PolySynth;
 use dissonant_core::{
     factory_sound, swing_warp_ticks, AutomationCurve, InsertTarget, MasterSettings, NoteEvent,
-    Sequence, SoundPatch, SynthPatch, Tempo, TrackAutomation, VoiceMode, MAX_INSERTS,
-    TICKS_PER_BEAT,
+    NoteRope, Sequence, SequenceTrack, SoundPatch, SynthPatch, Tempo, TrackAutomation, VoiceMode,
+    MAX_INSERTS, TICKS_PER_BEAT,
 };
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -433,11 +433,70 @@ impl Default for NoteShape {
     }
 }
 
+/// Which sequenced note a voice is playing, so that note's own end — or a rope sliding out of
+/// it — finds exactly that voice, rather than whichever voice happens to hold the same pitch.
+///
+/// A note's index on its track and which of its hits it is: unique among everything that can
+/// sound at once on a track, and the same for a hit's on and its off however the blocks fall.
+/// A loop pass reuses the tags of the pass before, which is safe because the seam releases
+/// everything. The live keyboard, the chord bed and auditions carry no tag and are released by
+/// pitch. `Copy` and one word, for the same reason as [`NoteShape`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct VoiceTag(pub u32);
+
+impl VoiceTag {
+    /// Hit `hit` (at most 14, see [`sub_hits`]) of note `note` on its track.
+    pub fn for_hit(note: usize, hit: usize) -> Self {
+        VoiceTag(((note as u32) << 4) | (hit as u32 & 0xF))
+    }
+}
+
+/// What turns a note-on into a slide: a live rope from another note on the same track.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Slide {
+    /// The voice to take over: the tag of the note the rope comes from.
+    pub from: VoiceTag,
+    /// How long the glide (and the easing in of the new note's expression) takes. `None` uses
+    /// the patch's glide, which the synth knows and the scheduler doesn't need to.
+    pub secs: Option<f32>,
+}
+
 /// How many times a note strikes. FL's `repeats` is a count of *extra* hits spread evenly
 /// across the note's own length, so `r` sounds it `r + 1` times and 0 plays it once.
 #[inline]
 fn sub_hits(note: &NoteEvent) -> usize {
     note.repeats.min(14) as usize + 1
+}
+
+/// Which of `note`'s hits is sounding at `tick`, a hit counting as sounding up to and including
+/// its end: a rope that starts exactly where its source ends still catches it (touching is
+/// live). Only asked about ticks after the note's start.
+fn hit_at(note: &NoteEvent, tick: f64) -> usize {
+    let hits = sub_hits(note);
+    let len = note.length_ticks as f64 / hits as f64;
+    let start = note.shifted_start() as f64;
+    (0..hits)
+        .find(|&h| tick <= start + len * (h + 1) as f64)
+        .unwrap_or(hits - 1)
+}
+
+/// The slide a live rope gives the first hit of the note it ends on: from the hit of its source
+/// that is sounding as the note starts.
+fn rope_slide(notes: &[NoteEvent], rope: NoteRope, note: &NoteEvent) -> Option<Slide> {
+    let from = rope.from?;
+    let source = &notes[from];
+    Some(Slide {
+        from: VoiceTag::for_hit(from, hit_at(source, note.shifted_start() as f64)),
+        secs: note.slide_secs,
+    })
+}
+
+/// The hit of `note` whose voice a live rope out of it takes over, if any. That hit's own end
+/// must not release the voice: it belongs to the slide note by then, and the slide note's end
+/// releases it.
+fn handed_over_hit(notes: &[NoteEvent], rope: NoteRope, note: &NoteEvent) -> Option<usize> {
+    rope.to
+        .map(|to| hit_at(note, notes[to].shifted_start() as f64))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -453,10 +512,13 @@ enum EventKind {
         pitch: u8,
         velocity: u8,
         shape: NoteShape,
+        tag: VoiceTag,
+        slide: Option<Slide>,
     },
     NoteOff {
         track: usize,
         pitch: u8,
+        tag: VoiceTag,
     },
     ChordOn {
         pitch: u8,
@@ -1445,14 +1507,17 @@ impl Engine {
                 pitch,
                 velocity,
                 shape,
+                tag,
+                slide,
             } => {
                 if let Some(ch) = self.channels.get_mut(track) {
-                    ch.instrument.note_on(pitch, velocity, shape);
+                    ch.instrument
+                        .note_on_tagged(pitch, velocity, shape, tag, slide);
                 }
             }
-            EventKind::NoteOff { track, pitch } => {
+            EventKind::NoteOff { track, pitch, tag } => {
                 if let Some(ch) = self.channels.get_mut(track) {
-                    ch.instrument.note_off(pitch);
+                    ch.instrument.note_off_tagged(pitch, tag);
                 }
             }
             EventKind::ChordOn { pitch } => self.chord_bed.note_on(pitch, 80, NoteShape::neutral()),
@@ -1566,7 +1631,7 @@ impl Engine {
             start += len.max(1);
             // Right to left, so every off to the right is already in place when one moves past it.
             for i in (0..run.len()).rev() {
-                let EventKind::NoteOff { track, pitch } = run[i].kind else {
+                let EventKind::NoteOff { track, pitch, .. } = run[i].kind else {
                     continue;
                 };
                 if !legato(track) {
@@ -1581,19 +1646,51 @@ impl Engine {
         }
     }
 
+    /// The live ropes on track `ti`, indexed like its notes, or nothing when they don't apply.
+    ///
+    /// Only the built-in synth plays ropes: a drum hit has no voice to hand on, and a plugin is
+    /// addressed by pitch, so ropes are ignored there and every note plays (and ends) as
+    /// written. That is checked against the channel's actual instrument rather than the
+    /// track's settings, so a plugin still being swapped in never has a note-off held back.
+    /// A table that no longer matches the notes is ignored too (see [`SequenceTrack::ropes`]).
+    ///
+    /// Liveness was decided on raw ticks when the sequence was built and is not re-checked on
+    /// swung times. Swing is a strictly increasing warp of the tick line, so a source that
+    /// starts before its target and ends at or after it still does once both are swung, and a
+    /// rope that touches still touches.
+    fn ropes_on<'s>(&self, ti: usize, track: &'s SequenceTrack) -> &'s [NoteRope] {
+        let synth = matches!(
+            self.channels.get(ti).map(|c| &c.instrument),
+            Some(Instrument::Synth(_))
+        );
+        if synth && track.ropes.len() == track.notes.len() {
+            &track.ropes
+        } else {
+            &[]
+        }
+    }
+
     /// Notes already sounding at `from` — the ones the playhead landed inside. Scheduling only
     /// fires a note at its start tick, so without this, seeking into (or starting playback in)
     /// the middle of a long note gives silence until the next note begins. The chord bed has
     /// always resumed this way; notes now match it.
+    ///
+    /// Resumed notes start plainly, at their own pitch: landing inside a slide note plays it
+    /// as an ordinary note. A source whose slide note is still ahead resumes with its tag, so
+    /// the slide still finds it. A source whose slide note has already started is not resumed
+    /// at all: its voice would have been the slide note's by now, and its own end, which the
+    /// scheduler holds back, would never release it.
     fn resume_notes_under(&mut self, from: f64) {
         let any_solo = self.sequence.any_solo();
         let seq = Arc::clone(&self.sequence);
+        let swing = |tick: f64| swing_warp_ticks(tick, seq.swing, seq.swing_grid_ticks);
         for (ti, track) in seq.tracks.iter().enumerate() {
             // A drum hit is a one-shot: re-firing it mid-note would retrigger the sample.
             if !track.audible(any_solo) || track.is_drum {
                 continue;
             }
-            for note in &track.notes {
+            let ropes = self.ropes_on(ti, track);
+            for (ni, note) in track.notes.iter().enumerate() {
                 if note.muted {
                     continue;
                 }
@@ -1605,15 +1702,24 @@ impl Engine {
                 for h in 0..hits {
                     let s = start + len * h as f64;
                     if s < from && (s + len).min(seq.length_ticks as f64) > from {
-                        self.events.push(Event {
-                            offset: 0,
-                            kind: EventKind::NoteOn {
-                                track: ti,
-                                pitch: note.pitch.clamp(0, 127) as u8,
-                                velocity: note.velocity.clamp(1, 127) as u8,
-                                shape: NoteShape::from_note(note),
-                            },
+                        let rope = ropes.get(ni).copied().unwrap_or_default();
+                        let handed = rope.to.is_some_and(|to| {
+                            handed_over_hit(&track.notes, rope, note) == Some(h)
+                                && swing(track.notes[to].shifted_start() as f64) < from
                         });
+                        if !handed {
+                            self.events.push(Event {
+                                offset: 0,
+                                kind: EventKind::NoteOn {
+                                    track: ti,
+                                    pitch: note.pitch.clamp(0, 127) as u8,
+                                    velocity: note.velocity.clamp(1, 127) as u8,
+                                    shape: NoteShape::from_note(note),
+                                    tag: VoiceTag::for_hit(ni, h),
+                                    slide: None,
+                                },
+                            });
+                        }
                         break;
                     }
                 }
@@ -1654,10 +1760,12 @@ impl Engine {
             if !track.audible(any_solo) {
                 continue;
             }
-            for note in &track.notes {
+            let ropes = self.ropes_on(ti, track);
+            for (ni, note) in track.notes.iter().enumerate() {
                 if note.muted {
                     continue;
                 }
+                let rope = ropes.get(ni).copied().unwrap_or_default();
                 let pitch = note.pitch.clamp(0, 127) as u8;
                 let velocity = note.velocity.clamp(1, 127) as u8;
                 let shape = NoteShape::from_note(note);
@@ -1669,6 +1777,7 @@ impl Engine {
                 for h in 0..hits {
                     let s = swing(start + len * h as f64);
                     let e = swing(start + len * (h + 1) as f64).min(seq.length_ticks as f64);
+                    let tag = VoiceTag::for_hit(ni, h);
                     if s >= from && s < to {
                         self.events.push(Event {
                             offset: offset_of(s),
@@ -1677,15 +1786,32 @@ impl Engine {
                                 pitch,
                                 velocity,
                                 shape,
+                                tag,
+                                // Only the first hit slides; the rest retrigger as written.
+                                slide: if h == 0 {
+                                    rope_slide(&track.notes, rope, note)
+                                } else {
+                                    None
+                                },
                             },
                         });
                     }
                     // A drum hit is a one-shot: it rings out on its own and has nothing to
-                    // release.
-                    if e > s && e >= from && e < to && !track.is_drum {
+                    // release. A hit whose voice a rope hands on is released by the slide
+                    // note instead.
+                    if e > s
+                        && e >= from
+                        && e < to
+                        && !track.is_drum
+                        && handed_over_hit(&track.notes, rope, note) != Some(h)
+                    {
                         self.events.push(Event {
                             offset: offset_of(e),
-                            kind: EventKind::NoteOff { track: ti, pitch },
+                            kind: EventKind::NoteOff {
+                                track: ti,
+                                pitch,
+                                tag,
+                            },
                         });
                     }
                 }
@@ -2809,5 +2935,391 @@ mod tests {
                 p.pitch
             );
         }
+    }
+
+    // ── Ropes ──
+
+    /// An engine playing `notes` on one synth track in `mode`, with `glide` as the patch's
+    /// slide time. The envelope settles well below its peak, so a replayed attack shows up as
+    /// the level climbing back towards 1.
+    fn roped(mode: VoiceMode, glide: f32, notes: Vec<NoteEvent>) -> Engine {
+        let mut model = ProjectModel::empty();
+        model.tracks[0].voice = "sine".into();
+        let pid = model.patterns[0].id;
+        model.patterns[0].length_ticks = 8 * B;
+        model.patterns[0].notes = notes;
+        let mut seq = Sequence::from_pattern(&model, &pid, 0).unwrap();
+        let p = &mut seq.tracks[0].synth;
+        p.voice = mode;
+        p.glide = glide;
+        p.amp_env.attack = 0.02;
+        p.amp_env.decay = 0.02;
+        p.amp_env.sustain = 0.3;
+        let mut e = Engine::new(SR, Arc::new(Shared::default()), &MasterSettings::default());
+        e.handle(EngineCommand::SetSequence(Arc::new(seq)));
+        e.handle(EngineCommand::Play);
+        e
+    }
+
+    /// `note`, roped to slide from `source`.
+    fn rope(source: &NoteEvent, mut note: NoteEvent) -> NoteEvent {
+        note.slide_from = Some(source.id);
+        note
+    }
+
+    /// `rope`, with its own slide time.
+    fn rope_secs(source: &NoteEvent, note: NoteEvent, secs: f32) -> NoteEvent {
+        NoteEvent {
+            slide_secs: Some(secs),
+            ..rope(source, note)
+        }
+    }
+
+    /// The voices on the first track that are holding a note.
+    fn held(e: &Engine) -> Vec<crate::synth::VoiceProbe> {
+        match &e.channels[0].instrument {
+            Instrument::Synth(s) => s.held_voices(),
+            other => panic!("not a synth: {other:?}"),
+        }
+    }
+
+    /// Play `frames` more samples in small blocks; the loudest any held voice's envelope got.
+    fn run(e: &mut Engine, frames: usize) -> f32 {
+        let mut top = 0.0f32;
+        let mut buf = [0.0f32; 128];
+        let mut done = 0;
+        while done < frames {
+            let n = (frames - done).min(64);
+            e.process(&mut buf[..n * 2]);
+            top = held(e).iter().map(|v| v.level).fold(top, f32::max);
+            done += n;
+        }
+        top
+    }
+
+    /// Every note-on in the next `frames` samples, and whether it slides.
+    fn note_ons(e: &mut Engine, frames: usize) -> Vec<(usize, u8, bool)> {
+        e.collect_events(frames);
+        e.events
+            .iter()
+            .filter_map(|ev| match ev.kind {
+                EventKind::NoteOn { pitch, slide, .. } => Some((ev.offset, pitch, slide.is_some())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    const MODES: [VoiceMode; 3] = [VoiceMode::Poly, VoiceMode::Mono, VoiceMode::Legato];
+    /// A little over three and a half beats: everything these tests schedule, short of the loop.
+    const SPAN: usize = 7 * SR as usize / 2;
+
+    #[test]
+    fn a_rope_glides_into_its_note_without_an_attack_in_every_mode() {
+        for mode in MODES {
+            // Overlapping, and touching (the source ends just as the slide note starts).
+            for len in [2 * B, B] {
+                let a = NoteEvent::new(0, len, 57);
+                let notes = vec![a.clone(), rope_secs(&a, NoteEvent::new(B, 2 * B, 64), 0.2)];
+                assert_eq!(
+                    note_events(&mut roped(mode, 0.0, notes.clone()), SPAN),
+                    vec![(0, true, 57), (22_050, true, 64), (66_150, false, 64)],
+                    "{mode:?}: the source's own end is held back"
+                );
+                let mut e = roped(mode, 0.0, notes);
+                run(&mut e, 22_050 + 640);
+                let v = held(&e);
+                assert_eq!(v.len(), 1, "{mode:?}: one voice");
+                assert_eq!(v[0].tag, Some(VoiceTag::for_hit(1, 0)), "{mode:?}");
+                assert_eq!(v[0].target, 64.0);
+                assert!(
+                    v[0].glide > 57.0 && v[0].glide < 59.0,
+                    "{mode:?}: {}",
+                    v[0].glide
+                );
+                let top = run(&mut e, 22_050);
+                assert!(
+                    top < 0.35,
+                    "{mode:?}: the slide replayed the attack ({top})"
+                );
+                assert!((held(&e)[0].glide - 64.0).abs() < 0.01, "{mode:?}: arrives");
+                run(&mut e, 22_050);
+                assert!(
+                    held(&e).is_empty(),
+                    "{mode:?}: the slide note's end releases it"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_dead_rope_plays_its_note_with_an_attack() {
+        let a = NoteEvent::new(0, B, 57);
+        let notes = vec![a.clone(), rope(&a, NoteEvent::new(B + B / 2, B, 64))];
+        assert_eq!(
+            note_events(&mut roped(VoiceMode::Poly, 0.2, notes.clone()), SPAN),
+            vec![
+                (0, true, 57),
+                (22_050, false, 57),
+                (33_075, true, 64),
+                (55_125, false, 64)
+            ]
+        );
+        for mode in MODES {
+            let mut e = roped(mode, 0.2, notes.clone());
+            run(&mut e, 33_075 + 64);
+            let v = held(&e);
+            assert_eq!(v.len(), 1, "{mode:?}");
+            assert_eq!(
+                v[0].glide, 64.0,
+                "{mode:?}: at its own pitch from the start"
+            );
+            assert!(run(&mut e, 1_200) > 0.9, "{mode:?}: attacks");
+        }
+    }
+
+    #[test]
+    fn a_chord_slides_only_the_notes_with_ropes() {
+        let chord: Vec<NoteEvent> = [48, 52, 55].map(|p| NoteEvent::new(0, 2 * B, p)).into();
+        let mut notes = chord.clone();
+        notes.push(rope_secs(&chord[0], NoteEvent::new(B, B, 50), 0.05));
+        notes.push(rope_secs(&chord[1], NoteEvent::new(B, B, 53), 0.05));
+        let events = note_events(&mut roped(VoiceMode::Poly, 0.0, notes.clone()), SPAN);
+        let offs: Vec<u8> = events.iter().filter(|e| !e.1).map(|e| e.2).collect();
+        assert_eq!(
+            offs,
+            vec![55, 50, 53],
+            "only the unroped chord note ends on its own"
+        );
+
+        let mut e = roped(VoiceMode::Poly, 0.0, notes);
+        run(&mut e, 22_050 + 11_025);
+        let v = held(&e);
+        assert_eq!(v.len(), 3, "{v:?}");
+        let at = |tag: VoiceTag| *v.iter().find(|v| v.tag == Some(tag)).unwrap();
+        assert_eq!(
+            at(VoiceTag::for_hit(2, 0)).glide,
+            55.0,
+            "the third keeps ringing"
+        );
+        assert!((at(VoiceTag::for_hit(3, 0)).glide - 50.0).abs() < 0.01);
+        assert!((at(VoiceTag::for_hit(4, 0)).glide - 53.0).abs() < 0.01);
+        assert!(
+            v.iter().all(|v| v.level < 0.35),
+            "nothing re-attacked: {v:?}"
+        );
+    }
+
+    #[test]
+    fn a_rope_takes_its_own_time_or_the_patch_glide() {
+        let a = NoteEvent::new(0, 2 * B, 57);
+        // How far from 57 towards 64 the slide has got 0.1 s in.
+        let progress = |b: NoteEvent| {
+            let mut e = roped(VoiceMode::Poly, 0.3, vec![a.clone(), b]);
+            run(&mut e, 22_050 + 4_410);
+            (held(&e)[0].glide - 57.0) / 7.0
+        };
+        let patch = progress(rope(&a, NoteEvent::new(B, B, 64)));
+        assert!(
+            (patch - 0.63).abs() < 0.05,
+            "patch glide, one τ in: {patch}"
+        );
+        let own = progress(rope_secs(&a, NoteEvent::new(B, B, 64), 0.9));
+        assert!(
+            (own - 0.28).abs() < 0.05,
+            "its own, a third of a τ in: {own}"
+        );
+        let mut e = roped(
+            VoiceMode::Poly,
+            0.3,
+            vec![a.clone(), rope_secs(&a, NoteEvent::new(B, B, 64), 0.0)],
+        );
+        run(&mut e, 22_050 + 64);
+        assert_eq!(held(&e)[0].glide, 64.0, "0 s jumps");
+        assert_eq!(held(&e).len(), 1, "on the same voice");
+    }
+
+    #[test]
+    fn only_the_first_hit_of_a_repeated_slide_note_slides() {
+        let a = NoteEvent::new(0, 2 * B, 57);
+        let mut b = rope_secs(&a, NoteEvent::new(B, B, 64), 0.05);
+        b.repeats = 1;
+        let notes = vec![a, b];
+        assert_eq!(
+            note_ons(&mut roped(VoiceMode::Poly, 0.0, notes.clone()), SPAN),
+            vec![(0, 57, false), (22_050, 64, true), (33_075, 64, false)]
+        );
+        let mut e = roped(VoiceMode::Poly, 0.0, notes);
+        run(&mut e, 11_025);
+        assert!(
+            run(&mut e, 33_000 - 11_025) < 0.35,
+            "the first hit took the voice over"
+        );
+        assert!(run(&mut e, 1_200) > 0.9, "the second hit attacks");
+        let v = held(&e);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].tag, Some(VoiceTag::for_hit(1, 1)));
+        run(&mut e, 22_050);
+        assert!(held(&e).is_empty());
+    }
+
+    /// Two ropes from one note: the first takes its voice, the second finds nothing to take
+    /// and plays as an ordinary note. Nothing hangs.
+    #[test]
+    fn two_ropes_from_one_note_hand_its_voice_to_the_first() {
+        let a = NoteEvent::new(0, 2 * B, 57);
+        let notes = vec![
+            a.clone(),
+            rope_secs(&a, NoteEvent::new(B, 2 * B, 60), 0.05),
+            rope_secs(&a, NoteEvent::new(B + B / 2, 2 * B, 64), 0.05),
+        ];
+        assert_eq!(
+            note_events(&mut roped(VoiceMode::Poly, 0.0, notes.clone()), SPAN),
+            vec![
+                (0, true, 57),
+                (22_050, true, 60),
+                (33_075, true, 64),
+                (66_150, false, 60),
+                (77_175, false, 64)
+            ]
+        );
+        for mode in MODES {
+            let mut e = roped(mode, 0.0, notes.clone());
+            run(&mut e, 33_075 + 64);
+            let v = held(&e);
+            let last = v.last().unwrap();
+            assert_eq!(last.tag, Some(VoiceTag::for_hit(2, 0)), "{mode:?}");
+            assert_eq!(
+                last.glide, 64.0,
+                "{mode:?}: the second plays from its own pitch"
+            );
+            if mode == VoiceMode::Poly {
+                assert_eq!(v.len(), 2);
+                assert_eq!(
+                    v[0].tag,
+                    Some(VoiceTag::for_hit(1, 0)),
+                    "the first has a's voice"
+                );
+                assert!(run(&mut e, 1_200) > 0.9, "the second attacks");
+            }
+            run(&mut e, 2 * 22_050);
+            assert!(held(&e).is_empty(), "{mode:?}: nothing hangs");
+        }
+    }
+
+    #[test]
+    fn a_chain_of_ropes_passes_one_voice_along() {
+        let a = NoteEvent::new(0, B, 57);
+        let b = rope_secs(&a, NoteEvent::new(B / 2, B, 60), 0.05);
+        let c = rope_secs(&b, NoteEvent::new(B + B / 2, B, 64), 0.05);
+        let notes = vec![a, b, c];
+        assert_eq!(
+            note_events(&mut roped(VoiceMode::Poly, 0.0, notes.clone()), SPAN),
+            vec![
+                (0, true, 57),
+                (11_025, true, 60),
+                (33_075, true, 64),
+                (55_125, false, 64)
+            ]
+        );
+        for mode in MODES {
+            let mut e = roped(mode, 0.0, notes.clone());
+            run(&mut e, 11_025 + 4_410);
+            assert_eq!(held(&e)[0].tag, Some(VoiceTag::for_hit(1, 0)), "{mode:?}");
+            let top = run(&mut e, 33_075 - 15_435 + 1_470);
+            let v = held(&e);
+            assert_eq!(v.len(), 1, "{mode:?}");
+            assert_eq!(v[0].tag, Some(VoiceTag::for_hit(2, 0)), "{mode:?}");
+            assert!(
+                v[0].glide > 60.5 && v[0].glide < 64.0,
+                "{mode:?}: {}",
+                v[0].glide
+            );
+            assert!(top < 0.35, "{mode:?}: one attack for the whole chain");
+            run(&mut e, 22_050);
+            assert!(held(&e).is_empty(), "{mode:?}");
+        }
+    }
+
+    #[test]
+    fn seeking_respects_ropes() {
+        let a = NoteEvent::new(0, 2 * B, 57);
+        let notes = vec![a.clone(), rope_secs(&a, NoteEvent::new(B, B, 64), 0.2)];
+        for mode in MODES {
+            // Into the source, with its slide still ahead: the slide still happens.
+            let mut e = roped(mode, 0.0, notes.clone());
+            e.handle(EngineCommand::Seek {
+                tick: (B / 2) as f64,
+            });
+            run(&mut e, 11_025 + 640);
+            let v = held(&e);
+            assert_eq!(v.len(), 1, "{mode:?}");
+            assert_eq!(v[0].tag, Some(VoiceTag::for_hit(1, 0)), "{mode:?}");
+            assert!(
+                v[0].glide > 57.0 && v[0].glide < 59.0,
+                "{mode:?}: {}",
+                v[0].glide
+            );
+
+            // Into the slide note: it starts plainly at its own pitch, and the source, whose
+            // end is held back, stays out of it.
+            e.handle(EngineCommand::Seek {
+                tick: (B + B / 2) as f64,
+            });
+            run(&mut e, 64);
+            let v = held(&e);
+            assert_eq!(v.len(), 1, "{mode:?}: {v:?}");
+            assert_eq!(v[0].tag, Some(VoiceTag::for_hit(1, 0)), "{mode:?}");
+            assert_eq!(v[0].glide, 64.0, "{mode:?}");
+            run(&mut e, 11_025);
+            assert!(held(&e).is_empty(), "{mode:?}: nothing hangs");
+        }
+    }
+
+    /// A rope near the loop end: the slide note runs past the seam, where its end is never
+    /// scheduled. The seam's release still frees the voice, and the next pass slides again.
+    #[test]
+    fn a_rope_at_the_loop_end_frees_its_voice_at_the_seam() {
+        let a = NoteEvent::new(6 * B, 2 * B, 57);
+        let notes = vec![
+            a.clone(),
+            rope_secs(&a, NoteEvent::new(7 * B, 2 * B, 64), 0.2),
+        ];
+        let mut e = roped(VoiceMode::Poly, 0.0, notes);
+        run(&mut e, 7 * 22_050 + 640);
+        assert_eq!(
+            held(&e)[0].tag,
+            Some(VoiceTag::for_hit(1, 0)),
+            "slides on the first pass"
+        );
+        run(&mut e, 22_050);
+        assert!(held(&e).is_empty(), "released at the seam");
+        run(&mut e, 7 * 22_050);
+        let v = held(&e);
+        assert_eq!(v.len(), 1);
+        assert_eq!(
+            v[0].tag,
+            Some(VoiceTag::for_hit(1, 0)),
+            "and again on the next"
+        );
+        assert!(v[0].glide > 57.0 && v[0].glide < 59.0, "{}", v[0].glide);
+    }
+
+    #[test]
+    fn drum_tracks_ignore_ropes() {
+        let mut model = ProjectModel::starter();
+        model.tempo = 120.0;
+        model.patterns[1].length_ticks = 8 * B;
+        let drums = model.patterns[1].id;
+        let kick = NoteEvent::new(0, 2 * B, 36);
+        model.patterns[1].notes = vec![kick.clone(), rope(&kick, NoteEvent::new(B, B, 38))];
+        let seq = Sequence::from_pattern(&model, &drums, 0).unwrap();
+        assert!(seq.tracks[1].ropes.is_empty());
+        let mut e = Engine::new(SR, Arc::new(Shared::default()), &MasterSettings::default());
+        e.handle(EngineCommand::SetSequence(Arc::new(seq)));
+        e.handle(EngineCommand::Play);
+        assert_eq!(
+            note_ons(&mut e, SPAN),
+            vec![(0, 36, false), (22_050, 38, false)]
+        );
     }
 }
