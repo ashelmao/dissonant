@@ -81,6 +81,84 @@ export function resizeNotes(notes: NoteEvent[], ids: Set<string>, deltaTicks: nu
   return notes.map((n) => (ids.has(n.id) ? { ...n, lengthTicks: Math.max(min, n.lengthTicks + dt) } : n));
 }
 
+export type NoteEdge = "start" | "end";
+
+/**
+ * Drag one edge of `ids` by the same delta: the end edge moves the end, the start edge trims
+ * the start and leaves the end where it is. Each note keeps at least `minLengthTicks` (or its
+ * own length, if it was already shorter, so a shrink never makes a short note longer) and no
+ * start goes before 0.
+ */
+export function resizeEdge(notes: NoteEvent[], ids: Set<string>, edge: NoteEdge, deltaTicks: number, minLengthTicks = MIN_LENGTH_TICKS): NoteEvent[] {
+  const dt = Math.round(deltaTicks);
+  if (dt === 0) return notes;
+  const min = Math.round(minLengthTicks);
+  return notes.map((n) => {
+    if (!ids.has(n.id)) return n;
+    const floor = Math.min(min, n.lengthTicks);
+    if (edge === "end") return { ...n, lengthTicks: Math.max(floor, n.lengthTicks + dt) };
+    const end = n.startTick + n.lengthTicks;
+    const start = Math.min(Math.max(0, n.startTick + dt), end - floor);
+    return { ...n, startTick: start, lengthTicks: end - start };
+  });
+}
+
+/** Plain note values, longest first: whole … 1/64. */
+const NOTE_VALUES: [string, number][] = [
+  ["1/1", 4 * TICKS_PER_BEAT],
+  ["1/2", 2 * TICKS_PER_BEAT],
+  ["1/4", TICKS_PER_BEAT],
+  ["1/8", TICKS_PER_BEAT / 2],
+  ["1/16", TICKS_PER_BEAT / 4],
+  ["1/32", TICKS_PER_BEAT / 8],
+  ["1/64", TICKS_PER_BEAT / 16],
+];
+/** What a length under a whole note is summed from, longest first: the plain values and their dotted forms. */
+const SUM_TERMS: [string, number][] = NOTE_VALUES.slice(1)
+  .flatMap(([label, ticks]): [string, number][] => [[label, ticks], [`${label}.`, ticks * 1.5]])
+  .sort((a, b) => b[1] - a[1]);
+
+/**
+ * A length in note values, for the roll's drag readout. One value reads as itself ("1/8",
+ * dotted "1/4.", triplet "1/8T", spelled the way the grid menu spells them); anything else is
+ * a sum of plain and dotted values, longest first ("1/4 + 1/16", "1/2. + 1/8."), with whole
+ * notes counted ("2×1/1") and whatever is finer than 1/64 left in ticks.
+ */
+export function noteValueLabel(lengthTicks: number): string {
+  const t = Math.round(lengthTicks);
+  if (t <= 0) return "0";
+  const single = (v: number): string | null => {
+    for (const [label, ticks] of NOTE_VALUES) {
+      if (v === ticks) return label;
+      if (v * 2 === ticks * 3) return `${label}.`;
+      if (v * 3 === ticks * 2) return `${label}T`;
+    }
+    return null;
+  };
+  const one = single(t);
+  if (one) return one;
+  const whole = NOTE_VALUES[0][1];
+  const parts: string[] = [];
+  let rest = t;
+  const wholes = Math.floor(rest / whole);
+  if (wholes) {
+    parts.push(wholes === 1 ? "1/1" : `${wholes}×1/1`);
+    rest -= wholes * whole;
+  }
+  const tail = rest ? single(rest) : null;
+  if (tail) parts.push(tail);
+  else {
+    for (const [label, ticks] of SUM_TERMS) {
+      if (rest >= ticks) {
+        parts.push(label);
+        rest -= ticks;
+      }
+    }
+    if (rest) parts.push(`${rest}t`);
+  }
+  return parts.join(" + ");
+}
+
 /** Ids of notes overlapping a tick × pitch rectangle (inclusive pitch bounds). */
 export function notesInRect(notes: NoteEvent[], tick0: number, tick1: number, pitch0: number, pitch1: number): Set<string> {
   const [t0, t1] = tick0 <= tick1 ? [tick0, tick1] : [tick1, tick0];

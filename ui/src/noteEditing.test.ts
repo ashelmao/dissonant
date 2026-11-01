@@ -10,6 +10,8 @@ import {
   pasteNotes,
   placeNote,
   quantizeNotes,
+  noteValueLabel,
+  resizeEdge,
   resizeNotes,
   snapFloor,
   snapRound,
@@ -98,6 +100,38 @@ describe("resize / select / velocity", () => {
   it("resizes with a minimum length", () => {
     const out = resizeNotes(notes, new Set(["a", "b"]), -4800, 240);
     expect(out.every((x) => x.lengthTicks === 240)).toBe(true);
+  });
+
+  it("drags the end edge by one delta for every note, never below the minimum", () => {
+    const out = resizeEdge(notes, new Set(["a", "b"]), "end", 480, 240);
+    expect(out.map((x) => [x.startTick, x.lengthTicks])).toEqual([[0, 1440], [1920, 2400]]);
+    const shrunk = resizeEdge(notes, new Set(["a", "b"]), "end", -4800, 240);
+    expect(shrunk.every((x) => x.lengthTicks === 240)).toBe(true);
+  });
+
+  it("trims the start edge and keeps the end where it was", () => {
+    const out = resizeEdge(notes, new Set(["b"]), "start", 480, 240);
+    expect(out[1]).toMatchObject({ startTick: 2400, lengthTicks: 1440 });
+    // Pulled left past 0, the start stops there; pushed right, it stops a minimum short of the end.
+    expect(resizeEdge(notes, new Set(["b"]), "start", -9999, 240)[1]).toMatchObject({ startTick: 0, lengthTicks: 3840 });
+    expect(resizeEdge(notes, new Set(["b"]), "start", 9999, 240)[1]).toMatchObject({ startTick: 3600, lengthTicks: 240 });
+  });
+
+  it("never lengthens a note that was already shorter than the minimum", () => {
+    const short = [n("s", 960, 120, 60)];
+    expect(resizeEdge(short, new Set(["s"]), "end", -480, 240)[0].lengthTicks).toBe(120);
+    expect(resizeEdge(short, new Set(["s"]), "start", 480, 240)[0]).toMatchObject({ startTick: 960, lengthTicks: 120 });
+  });
+
+  it("names lengths in note values", () => {
+    expect(noteValueLabel(480)).toBe("1/8");
+    expect(noteValueLabel(1440)).toBe("1/4.");
+    expect(noteValueLabel(320)).toBe("1/8T");
+    expect(noteValueLabel(1200)).toBe("1/4 + 1/16");
+    expect(noteValueLabel(3600)).toBe("1/2. + 1/8.");
+    expect(noteValueLabel(3840 + 1440)).toBe("1/1 + 1/4.");
+    expect(noteValueLabel(2 * 3840)).toBe("2×1/1");
+    expect(noteValueLabel(960 + 15)).toBe("1/4 + 15t");
   });
 
   it("marquee selects overlapping notes in any drag direction", () => {
