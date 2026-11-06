@@ -61,6 +61,27 @@ pub enum LfoTarget {
     Fm,
 }
 
+/// How a synth patch shares out its voices between overlapping notes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum VoiceMode {
+    /// Many voices; every note replays its attack.
+    #[default]
+    Poly,
+    /// One voice, last-note priority; every note replays its attack.
+    Mono,
+    /// One voice, last-note priority; a note that overlaps or touches the one sounding takes
+    /// it over without a new attack. The pitch jumps: sliding is what ropes are for.
+    Legato,
+}
+
+impl VoiceMode {
+    /// One voice shared by every note, as opposed to a pool.
+    pub fn is_mono(self) -> bool {
+        self != VoiceMode::Poly
+    }
+}
+
 // ─── Synth patch ─────────────────────────────────────────────────────────────────────────────
 
 /// Attack / decay / release in seconds, sustain 0–1.
@@ -228,9 +249,9 @@ pub struct SynthPatch {
     /// Seconds, 0.001–2.
     pub pitch_env_decay: f32,
     pub lfo: [LfoParams; 2],
-    /// One voice, legato.
-    pub mono: bool,
-    /// Portamento seconds, 0–2.
+    pub voice: VoiceMode,
+    /// Seconds, 0–2: how long a slide (a rope between two notes) takes unless the note says
+    /// otherwise. Nothing glides on its own.
     pub glide: f32,
     /// How much velocity scales level, 0–1.
     pub velocity: f32,
@@ -242,6 +263,10 @@ pub struct SynthPatch {
     pub delay: DelayParams,
     /// Output level, 0–1.
     pub level: f32,
+    /// Patches saved before voice modes carry `mono: true` for one legato voice (which also
+    /// glided on its own). [`SynthPatch::sanitized`] folds it into `voice` and clears it.
+    #[serde(default, rename = "mono", skip_serializing)]
+    pub legacy_mono: Option<bool>,
 }
 
 impl Default for SynthPatch {
@@ -261,7 +286,7 @@ impl Default for SynthPatch {
             pitch_env_amount: 0.0,
             pitch_env_decay: 0.05,
             lfo: [LfoParams::default(); 2],
-            mono: false,
+            voice: VoiceMode::Poly,
             glide: 0.0,
             velocity: 1.0,
             drive: 0.0,
@@ -269,6 +294,7 @@ impl Default for SynthPatch {
             chorus: ChorusParams::default(),
             delay: DelayParams::default(),
             level: 0.22,
+            legacy_mono: None,
         }
     }
 }
@@ -496,6 +522,43 @@ pub fn default_kit() -> Vec<DrumPad> {
     .collect()
 }
 
+/// A named kit preset: a whole set of pads loaded onto a drum track in one `SetDrumPads`.
+/// Factory kits ship in `assets/drum_kits.json` (the UI's kit picker imports the same file).
+/// They keep the GM pitches (36 kick, 38 snare, 42 / 46 hats, 49 crash, …), so hits written
+/// on one kit play the matching drum on another.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DrumKit {
+    /// A short slug: `808`, `boom-bap`.
+    pub id: String,
+    pub name: String,
+    /// Browser grouping: "machines", "hip-hop", "club", …
+    pub style: String,
+    /// One line on what the kit is for.
+    pub blurb: String,
+    /// `[pitch, sound, choke]` rows, top to bottom.
+    pub pads: Vec<(u8, String, u8)>,
+}
+
+impl DrumKit {
+    pub fn drum_pads(&self) -> Vec<DrumPad> {
+        self.pads.iter().map(|(pitch, sound, choke)| DrumPad { pitch: *pitch, sound: sound.clone(), choke: *choke }).collect()
+    }
+}
+
+const FACTORY_KITS_JSON: &str = include_str!("../assets/drum_kits.json");
+
+/// Every factory kit, in file order. Panics at first use if the bundled JSON is malformed
+/// (a test covers it).
+pub fn factory_kits() -> &'static [DrumKit] {
+    static KITS: OnceLock<Vec<DrumKit>> = OnceLock::new();
+    KITS.get_or_init(|| serde_json::from_str(FACTORY_KITS_JSON).expect("drum_kits.json is valid"))
+}
+
+pub fn factory_kit(id: &str) -> Option<&'static DrumKit> {
+    factory_kits().iter().find(|k| k.id == id)
+}
+
 /// A kit pad with its sound looked up, for the engine.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedPad {
@@ -581,6 +644,11 @@ impl Envelope {
 
 impl SynthPatch {
     pub fn sanitized(mut self) -> Self {
+        // A legacy mono patch becomes Legato: still one connected voice, minus the automatic
+        // glide. A `voice` already set wins, so a hand-merged patch keeps the newer key.
+        if self.legacy_mono.take() == Some(true) && self.voice == VoiceMode::Poly {
+            self.voice = VoiceMode::Legato;
+        }
         for o in &mut self.osc {
             o.octave = o.octave.clamp(-3, 3);
             o.semi = o.semi.clamp(-12, 12);

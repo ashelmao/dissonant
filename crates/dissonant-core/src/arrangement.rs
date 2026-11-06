@@ -3,7 +3,7 @@
 //! own track; notes that would run past the clip's end are cut there. Pure and testable; song
 //! playback and the song-mode playhead read from these.
 
-use crate::model::{Clip, NoteEvent, SongPattern, MIN_NOTE_TICKS};
+use crate::model::{tidy_ropes, Clip, NoteEvent, SongPattern, MIN_NOTE_TICKS};
 use uuid::Uuid;
 
 pub struct Arrangement;
@@ -63,12 +63,17 @@ impl Arrangement {
                 salt.extend_from_slice(&rep.to_le_bytes());
                 result.push(NoteEvent {
                     id: Uuid::new_v5(&note.id, &salt),
+                    // Same salt, so a rope points at its source's occurrence in this very
+                    // repetition of this very clip.
+                    slide_from: note.slide_from.map(|s| Uuid::new_v5(&s, &salt)),
                     start_tick: start,
                     length_ticks: (end - start).max(MIN_NOTE_TICKS),
                     ..note.clone()
                 });
             }
         }
+        // A source the clip cut off was never emitted; its rope goes rather than dangle.
+        tidy_ropes(&mut result);
         result.sort_by_key(|n| n.start_tick);
         result
     }

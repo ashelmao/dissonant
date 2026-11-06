@@ -2,7 +2,7 @@
 //! every patch is already in range and reads the same in Rust and in the UI.
 
 use dissonant_core::sound::{
-    default_kit, factory_sound, factory_sounds, DrumPatch, Sound, SoundPatch, SynthPatch,
+    default_kit, factory_sound, factory_sounds, DrumPatch, Sound, SoundPatch, SynthPatch, VoiceMode,
 };
 use serde_json::{Map, Value};
 
@@ -40,7 +40,7 @@ fn library_is_big_enough() {
     let drums = sounds.iter().filter(|s| s.is_drum()).count();
     let synths = sounds.len() - drums;
     assert!(synths >= 46, "only {synths} synth sounds");
-    assert!(drums >= 44, "only {drums} drum sounds");
+    assert!(drums >= 110, "only {drums} drum sounds");
     assert_eq!(factory_sounds().len(), sounds.len());
 }
 
@@ -92,6 +92,61 @@ fn every_patch_is_already_in_range() {
             s.id
         );
     }
+}
+
+/// The bass and lead sounds that used to be `mono: true` were rewritten to Legato, so they keep
+/// their connected feel; plain synths stay Poly.
+#[test]
+fn mono_factory_sounds_became_legato() {
+    let voice = |id: &str| match factory_sound(id).map(|s| &s.patch) {
+        Some(SoundPatch::Synth(p)) => p.voice,
+        _ => panic!("no factory synth {id}"),
+    };
+    for id in ["sub-bass", "reese-bass", "acid-bass"] {
+        assert_eq!(voice(id), VoiceMode::Legato, "{id}");
+    }
+    assert_eq!(voice("saw"), VoiceMode::Poly);
+    let legato = factory_sounds()
+        .iter()
+        .filter(|s| matches!(&s.patch, SoundPatch::Synth(p) if p.voice == VoiceMode::Legato))
+        .count();
+    assert_eq!(legato, 16);
+}
+
+/// A user sound saved before voice modes, as it sits in the library file.
+#[test]
+fn a_legacy_mono_sound_loads_as_legato() {
+    let load = |patch: &str| {
+        let json =
+            format!(r#"{{"id": "u-x", "name": "x", "patch": {{"kind": "synth", {patch}}}}}"#);
+        match serde_json::from_str::<Sound>(&json)
+            .unwrap()
+            .sanitized()
+            .patch
+        {
+            SoundPatch::Synth(p) => p,
+            _ => unreachable!(),
+        }
+    };
+    let p = load(r#""mono": true, "glide": 0.2"#);
+    assert_eq!(
+        (p.voice, p.glide, p.legacy_mono),
+        (VoiceMode::Legato, 0.2, None)
+    );
+    assert_eq!(load(r#""mono": false"#).voice, VoiceMode::Poly);
+    assert_eq!(load(r#""voice": "mono""#).voice, VoiceMode::Mono);
+    assert_eq!(
+        load(r#""mono": true, "voice": "mono""#).voice,
+        VoiceMode::Mono,
+        "an explicit voice wins"
+    );
+    assert_eq!(
+        load(r#""mono": true"#),
+        SynthPatch {
+            voice: VoiceMode::Legato,
+            ..SynthPatch::default()
+        }
+    );
 }
 
 #[test]

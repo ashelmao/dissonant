@@ -233,7 +233,6 @@ export function plausibleSynth(p: SynthPatch): SynthPatch {
   const a = q.ampEnv;
   if (a.attack > 0.4) a.sustain = Math.max(a.sustain, 0.5); // a slow swell should arrive somewhere
   if (a.sustain < 0.15) a.decay = Math.max(a.decay, 0.18);
-  if (!q.mono) q.glide = 0;
   return q;
 }
 

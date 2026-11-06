@@ -84,6 +84,7 @@ import {
 import { deletePieces, deletePoint, insertPieces, insertPoint, punchSplit, windowPiece, type Piece } from "./clipEditing";
 import { defaultKit, filledSound, isFactory, lookupSound, validKit, type Sound } from "./sound";
 import { chordAt, normalize, progression } from "./theory";
+import { MAX_SLIDE_SECS, remapRopes, tidyRopes } from "./ropes";
 import { placeChord } from "./songSetup";
 import vibesJson from "../../crates/dissonant-core/assets/vibes.json";
 
@@ -546,6 +547,9 @@ const TOO_MANY_INSERTS = `an insert chain holds at most ${MAX_INSERTS} effects`;
 const PAST_SONG_END = "that is past the end of the song";
 const NO_SUCH_AUTOMATION_LANE = "no such automation lane";
 const NO_SUCH_AUTOMATION_POINT = "no such automation point";
+const NO_SUCH_NOTE = "no such note";
+const ROPE_LOOP = "a note can't slide from itself, or from a note that slides from it";
+const NO_ROPE = "that note has no rope";
 const NO_SUCH_DETECTED_CHORD = "no such detected chord";
 /** `ProjectModel` decoding refuses a schema it cannot migrate with this text. */
 export const OLD_SCHEMA = "This project was made with an older version of dissonant and can't be opened.";
@@ -835,7 +839,14 @@ function copyPattern(p: SongPattern): SongPattern {
   const copy = clone(p);
   copy.id = uuid();
   copy.name = `${p.name} copy`;
-  for (const n of copy.notes) n.id = uuid();
+  const copyOf = new Map<string, string>();
+  for (const n of copy.notes) {
+    const fresh = uuid();
+    copyOf.set(n.id, fresh);
+    n.id = fresh;
+  }
+  // Every source is in the copy, so every rope survives, pointing inside the copy.
+  copy.notes = remapRopes(copy.notes, copyOf);
   return copy;
 }
 
@@ -1095,7 +1106,7 @@ function sanitizeNote(n: NoteEvent): NoteEvent {
   ) {
     fail(INVALID_VALUE);
   }
-  return {
+  const out: NoteEvent = {
     ...n,
     pitch: clamp(n.pitch, 0, 127),
     velocity: clamp(n.velocity, 1, 127),
@@ -1103,6 +1114,12 @@ function sanitizeNote(n: NoteEvent): NoteEvent {
     startTick: Math.max(0, Math.round(n.startTick)),
     lengthTicks: Math.max(MIN_NOTE_TICKS, Math.round(n.lengthTicks)),
   };
+  // Same range as the patch's glide; garbage means "use the glide", as in `sanitized`.
+  if (out.slideSecs !== undefined) {
+    if (Number.isFinite(out.slideSecs)) out.slideSecs = clamp(out.slideSecs, 0, MAX_SLIDE_SECS);
+    else delete out.slideSecs;
+  }
+  return out;
 }
 
 /** The schema this build writes; mirrors `SCHEMA_VERSION` in crates/dissonant-core/src/model.rs.
@@ -1274,7 +1291,7 @@ function normalizedModel(m: ProjectModel): ProjectModel {
   const trackIds = new Set(m.tracks.map((t) => t.id));
   // A pattern of a track that no longer exists is invisible and never played.
   m.patterns = (m.patterns ?? []).filter((p) => trackIds.has(p.trackId));
-  for (const p of m.patterns) p.notes = (p.notes ?? []).map(sanitizeNote);
+  for (const p of m.patterns) p.notes = tidyRopes((p.notes ?? []).map(sanitizeNote));
   // An audio track is never also a drum track, and always carries a rig; a note track never
   // does. Hand-edited files can carry either combination.
   for (const t of m.tracks) {
@@ -1859,10 +1876,40 @@ function reduce(m: ProjectModel, c: Command): void {
       pattern(c.id).lengthTicks = c.ticks;
       break;
     case "setNotes":
-      pattern(c.patternId).notes = c.notes
-        .map(sanitizeNote)
-        .sort((a, b) => a.startTick - b.startTick || a.pitch - b.pitch);
+      // Deleting a note is committing the array without it; tidying is what cuts the ropes
+      // that pointed at it.
+      pattern(c.patternId).notes = tidyRopes(
+        c.notes.map(sanitizeNote).sort((a, b) => a.startTick - b.startTick || a.pitch - b.pitch),
+      );
       break;
+    case "setRope": {
+      const p = pattern(c.patternId);
+      if (!p.notes.some((n) => n.id === c.sourceId)) fail(NO_SUCH_NOTE);
+      // Meeting the target upstream of the source means the rope would close a loop.
+      let from: string | undefined = c.sourceId;
+      for (let i = 0; i <= p.notes.length && from !== undefined; i++) {
+        if (from === c.noteId) fail(ROPE_LOOP);
+        const id: string = from;
+        from = p.notes.find((n) => n.id === id)?.slideFrom;
+      }
+      const target = p.notes.find((n) => n.id === c.noteId) ?? fail(NO_SUCH_NOTE);
+      target.slideFrom = c.sourceId;
+      break;
+    }
+    case "clearRope": {
+      const target = pattern(c.patternId).notes.find((n) => n.id === c.noteId) ?? fail(NO_SUCH_NOTE);
+      delete target.slideFrom;
+      delete target.slideSecs;
+      break;
+    }
+    case "setSlideTime": {
+      if (c.secs !== null && !Number.isFinite(c.secs)) fail(INVALID_VALUE);
+      const target = pattern(c.patternId).notes.find((n) => n.id === c.noteId) ?? fail(NO_SUCH_NOTE);
+      if (!target.slideFrom) fail(NO_ROPE);
+      if (c.secs === null) delete target.slideSecs;
+      else target.slideSecs = clamp(c.secs, 0, MAX_SLIDE_SECS);
+      break;
+    }
     case "setChords":
       // The project progression, in song ticks.
       m.chords = tidyChords(c.chords);
@@ -3040,6 +3087,12 @@ function mockBridge(): Bridge {
         return "insert settings";
       case "updateAutomationPoint":
         return "move automation point";
+      case "setRope":
+        return "add rope";
+      case "clearRope":
+        return "remove rope";
+      case "setSlideTime":
+        return "change slide time";
       default:
         return c.type
           .replace(/([A-Z])/g, " $1")

@@ -182,7 +182,7 @@ export function Editor() {
             className="chip"
             style={{ cursor: "help" }}
             title={keys(
-              "click: place a note (keep dragging to move it) · ⌥: off the grid (or paint, per Settings)\ndrag: move (⇧ one axis) · right edge: resize · ⌥-drag a note: duplicate\n⇧/⌘-drag: marquee · ⇧-click: toggle · double-click a key: select that pitch (⌘: pitch class)\nright-click: erase · Tab/⇧Tab: next/previous note · 0: mute\n⌫ delete · ⌘A ⌘C ⌘X ⌘V ⌘D · ⇧⌘E split at playhead · ⌘J glue · ⌘B duplicate one loop later\narrows nudge (⇧ = octave / bar, ⌥ = fine) · [ ] velocity · ⌥-wheel transpose (⌥⇧ octave)\n⌘-wheel zoom at cursor · ⇧-wheel scroll · ruler: seek · velocity lane: drag stems, ⌥-drag ramp",
+              "click: place a note (keep dragging to move it) · ⌥: off the grid (or paint, per Settings)\ndrag: move (⇧ one axis) · right edge: resize · ⌥-drag a note: duplicate\nrope: drag the dot past a note onto another to slide into it · click a rope, ⌫ removes it · drag its midpoint: slide time · double-click it: back to glide\n⇧/⌘-drag: marquee · ⇧-click: toggle · double-click a key: select that pitch (⌘: pitch class)\nright-click: erase · Tab/⇧Tab: next/previous note · 0: mute\n⌫ delete · ⌘A ⌘C ⌘X ⌘V ⌘D · ⇧⌘E split at playhead · ⌘J glue · ⌘B duplicate one loop later\narrows nudge (⇧ = octave / bar, ⌥ = fine) · [ ] velocity · ⌥-wheel transpose (⌥⇧ octave)\n⌘-wheel zoom at cursor · ⇧-wheel scroll · ruler: seek · velocity lane: drag stems, ⌥-drag ramp",
             )}
           >
             ?

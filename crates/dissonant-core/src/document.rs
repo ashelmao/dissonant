@@ -180,6 +180,26 @@ pub enum Command {
         pattern_id: Uuid,
         notes: Vec<NoteEvent>,
     },
+    /// Rope `note_id` to `source_id`, both in `pattern_id`: the source's voice will slide into
+    /// this note while the rope is live (see [`crate::model::rope_is_live`]). Replaces any rope
+    /// the note had. A note can't slide from itself or from a note downstream of it.
+    SetRope {
+        pattern_id: Uuid,
+        note_id: Uuid,
+        source_id: Uuid,
+    },
+    /// Cut `note_id`'s rope, and its slide time with it. A note with no rope is left alone.
+    ClearRope {
+        pattern_id: Uuid,
+        note_id: Uuid,
+    },
+    /// The slide time of `note_id`'s rope in seconds (clamped to 0–2), or `None` to go back to
+    /// the patch's glide. Sent `transient` while the rope's midpoint is dragged.
+    SetSlideTime {
+        pattern_id: Uuid,
+        note_id: Uuid,
+        secs: Option<f32>,
+    },
     /// Replace the project's chord progression (song ticks).
     SetChords {
         chords: Vec<ChordEvent>,
@@ -410,6 +430,12 @@ pub enum EditError {
     NotANativeEffect,
     #[error("no such parameter")]
     NoSuchParam,
+    #[error("no such note")]
+    NoSuchNote,
+    #[error("a note can't slide from itself, or from a note that slides from it")]
+    RopeLoop,
+    #[error("that note has no rope")]
+    NoRope,
     #[error("no such detected chord")]
     NoSuchDetectedChord,
 }
@@ -671,6 +697,9 @@ impl Command {
             RenamePattern { .. } => "rename pattern",
             SetPatternLength { .. } => "change pattern length",
             SetNotes { .. } => "edit notes",
+            SetRope { .. } => "add rope",
+            ClearRope { .. } => "remove rope",
+            SetSlideTime { .. } => "change slide time",
             SetChords { .. } => "edit chords",
             AddClip { .. } => "add clip",
             UpdateClip { .. } => "edit clip",
@@ -795,6 +824,10 @@ fn check_auto_target(m: &ProjectModel, target: AutoTarget) -> Result<(), EditErr
         Some(id) if m.track(&id).is_none() => Err(EditError::NoSuchTrack),
         _ => Ok(()),
     }
+}
+
+fn note_mut<'a>(p: &'a mut SongPattern, id: &Uuid) -> Result<&'a mut NoteEvent, EditError> {
+    p.notes.iter_mut().find(|n| &n.id == id).ok_or(EditError::NoSuchNote)
 }
 
 fn insert_mut(
@@ -1076,7 +1109,57 @@ fn apply_to(m: &mut ProjectModel, command: Command) -> Result<(), EditError> {
             let p = m.pattern_mut(&pattern_id).ok_or(EditError::NoSuchPattern)?;
             let mut notes: Vec<NoteEvent> = notes.into_iter().map(NoteEvent::sanitized).collect();
             notes.sort_by(|a, b| a.start_tick.cmp(&b.start_tick).then(a.pitch.cmp(&b.pitch)));
+            // The roll deletes a note by committing the array without it; this is what cuts the
+            // ropes that pointed at it. Ropes the UI copied wrongly are caught here too.
+            crate::model::tidy_ropes(&mut notes);
             p.notes = notes;
+        }
+        SetRope {
+            pattern_id,
+            note_id,
+            source_id,
+        } => {
+            let p = m.pattern_mut(&pattern_id).ok_or(EditError::NoSuchPattern)?;
+            if !p.notes.iter().any(|n| n.id == source_id) {
+                return Err(EditError::NoSuchNote);
+            }
+            // Walk upstream from the source: meeting the target on the way means the new rope
+            // would close a loop. Commands keep a pattern loop-free, but the walk is bounded
+            // anyway so a model built by hand can't hang it.
+            let mut from = Some(source_id);
+            for _ in 0..=p.notes.len() {
+                let Some(id) = from else { break };
+                if id == note_id {
+                    return Err(EditError::RopeLoop);
+                }
+                from = p.notes.iter().find(|n| n.id == id).and_then(|n| n.slide_from);
+            }
+            note_mut(p, &note_id)?.slide_from = Some(source_id);
+        }
+        ClearRope {
+            pattern_id,
+            note_id,
+        } => {
+            let p = m.pattern_mut(&pattern_id).ok_or(EditError::NoSuchPattern)?;
+            let n = note_mut(p, &note_id)?;
+            n.slide_from = None;
+            n.slide_secs = None;
+        }
+        SetSlideTime {
+            pattern_id,
+            note_id,
+            secs,
+        } => {
+            if secs.is_some_and(|s| !s.is_finite()) {
+                return Err(EditError::InvalidValue);
+            }
+            let p = m.pattern_mut(&pattern_id).ok_or(EditError::NoSuchPattern)?;
+            let n = note_mut(p, &note_id)?;
+            // A time with no rope to time would sit in the file meaning nothing.
+            if n.slide_from.is_none() {
+                return Err(EditError::NoRope);
+            }
+            n.slide_secs = secs.map(|s| s.clamp(0.0, crate::model::MAX_SLIDE_SECS));
         }
         SetChords { chords } => {
             m.chords = crate::chord_track::ChordTrack::new(crate::model::tidy_chords(chords))
@@ -1227,6 +1310,7 @@ fn apply_to(m: &mut ProjectModel, command: Command) -> Result<(), EditError> {
                 pattern
                     .notes
                     .sort_by(|a, b| a.start_tick.cmp(&b.start_tick).then(a.pitch.cmp(&b.pitch)));
+                crate::model::tidy_ropes(&mut pattern.notes);
                 m.clips.push(Clip::new(pattern.id, 0, length_ticks));
                 m.tracks.push(track);
                 m.patterns.push(pattern);

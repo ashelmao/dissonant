@@ -18,15 +18,16 @@ const EQ_UID: &str = "clap:/Library/Audio/Plug-Ins/CLAP/FabFilter Pro-Q 3.clap:c
 // ---------------------------------------------------------------- fixtures
 
 /// Three tracks (melody + drums + guitar), one pattern on each note track (the melody's 16
-/// beats with two notes, the drums' 8 beats and empty), both placed in the starter's 128-beat
+/// beats with three notes, the last roped to the second, the drums' 8 beats and empty), both placed in the starter's 128-beat
 /// song with its chords, one audio take on the guitar track, and effect chains on the melody
 /// track and the master. Rich enough that every `Command` variant has something to bite on.
 fn fixture() -> ProjectModel {
     let mut m = ProjectModel::starter();
-    m.patterns[0].notes = vec![
-        NoteEvent::new(0, BEAT, 60).with_velocity(90),
-        NoteEvent::new(4 * BEAT, 2 * BEAT, 64).with_velocity(70),
-    ];
+    let second = NoteEvent::new(4 * BEAT, 2 * BEAT, 64).with_velocity(70);
+    // Touching the second, so the rope is live; the rope commands have something to bite on.
+    let mut third = NoteEvent::new(6 * BEAT, BEAT, 67);
+    third.slide_from = Some(second.id);
+    m.patterns[0].notes = vec![NoteEvent::new(0, BEAT, 60).with_velocity(90), second, third];
     m.patterns[1].notes.clear(); // the starter's groove
     m.patterns[1].length_ticks = 8 * BEAT;
     let p0 = m.patterns[0].id;
@@ -176,6 +177,9 @@ fn every_variant_is_accounted_for(c: Command) -> &'static str {
         Command::RenamePattern { .. } => "RenamePattern",
         Command::SetPatternLength { .. } => "SetPatternLength",
         Command::SetNotes { .. } => "SetNotes",
+        Command::SetRope { .. } => "SetRope",
+        Command::ClearRope { .. } => "ClearRope",
+        Command::SetSlideTime { .. } => "SetSlideTime",
         Command::SetChords { .. } => "SetChords",
         Command::AddClip { .. } => "AddClip",
         Command::UpdateClip { .. } => "UpdateClip",
@@ -318,6 +322,20 @@ fn one_of_every_variant(m: &ProjectModel) -> Vec<Command> {
         Command::SetNotes {
             pattern_id: p1,
             notes: vec![NoteEvent::new(BEAT, BEAT, 62)],
+        },
+        Command::SetRope {
+            pattern_id: p0,
+            note_id: m.patterns[0].notes[1].id,
+            source_id: m.patterns[0].notes[0].id,
+        },
+        Command::ClearRope {
+            pattern_id: p0,
+            note_id: m.patterns[0].notes[2].id,
+        },
+        Command::SetSlideTime {
+            pattern_id: p0,
+            note_id: m.patterns[0].notes[2].id,
+            secs: Some(0.5),
         },
         Command::SetChords {
             chords: vec![ChordEvent::new(
@@ -1797,8 +1815,8 @@ fn duplicating_a_pattern_deep_copies_its_notes_on_the_same_track_with_fresh_ids(
 
     assert_eq!(
         original.notes.len(),
-        2,
-        "fixture should have two melody notes"
+        3,
+        "fixture should have three melody notes"
     );
     assert_eq!(
         copy.notes.len(),
@@ -1824,6 +1842,9 @@ fn duplicating_a_pattern_deep_copies_its_notes_on_the_same_track_with_fresh_ids(
         musical(&copy),
         "duplicated notes differ musically"
     );
+    // The rope comes along, pointing at the copy of its source rather than back into the
+    // original pattern.
+    assert_eq!(copy.notes[2].slide_from, Some(copy.notes[1].id));
 
     // Editing the copy must not reach back into the original.
     d.apply(
@@ -1836,7 +1857,7 @@ fn duplicating_a_pattern_deep_copies_its_notes_on_the_same_track_with_fresh_ids(
     .unwrap();
     assert_eq!(
         d.model().patterns[0].notes.len(),
-        2,
+        3,
         "editing the copy mutated the original"
     );
 }
@@ -1900,7 +1921,7 @@ fn from_pattern_uses_pattern_local_positions_and_honours_pattern_length() {
     let starts: Vec<i64> = seq.tracks[0].notes.iter().map(|n| n.start_tick).collect();
     assert_eq!(
         starts,
-        vec![0, 4 * BEAT],
+        vec![0, 4 * BEAT, 6 * BEAT],
         "pattern-mode notes must keep their pattern-local ticks"
     );
     assert!(
@@ -1973,7 +1994,7 @@ fn pattern_mode_chords_follow_the_chord_offset() {
 fn song_flattening_produces_absolute_tick_positions() {
     let mut m = fixture();
     let (_, t1, p0, p1) = ids(&m);
-    // p0 is 16 beats with notes at 0 and 4; melody 2 is 8 beats with a note at 2; the drums
+    // p0 is 16 beats with notes at 0, 4 and 6; melody 2 is 8 beats with a note at 2; the drums
     // play under all of it from their own pattern.
     let p2 = add_melody_pattern(&mut m, 8 * BEAT, vec![NoteEvent::new(2 * BEAT, BEAT, 67)]);
     m.patterns[1].notes = vec![NoteEvent::new(0, BEAT / 4, 36)];
@@ -1991,8 +2012,15 @@ fn song_flattening_produces_absolute_tick_positions() {
     );
 
     let starts: Vec<i64> = seq.tracks[0].notes.iter().map(|n| n.start_tick).collect();
-    // p0 @0 → 0,4 ; melody 2 @16 → 18 ; p0 @24 → 24,28
-    assert_eq!(starts, vec![0, 4 * BEAT, 18 * BEAT, 24 * BEAT, 28 * BEAT]);
+    // p0 @0 → 0,4,6 ; melody 2 @16 → 18 ; p0 @24 → 24,28,30
+    assert_eq!(
+        starts,
+        vec![0, 4 * BEAT, 6 * BEAT, 18 * BEAT, 24 * BEAT, 28 * BEAT, 30 * BEAT]
+    );
+    // Each placement of p0 ropes its own third note to its own second.
+    let notes = &seq.tracks[0].notes;
+    assert_eq!(notes[2].slide_from, Some(notes[1].id));
+    assert_eq!(notes[6].slide_from, Some(notes[5].id));
     let drums: Vec<i64> = seq.tracks[1].notes.iter().map(|n| n.start_tick).collect();
     assert_eq!(
         drums,

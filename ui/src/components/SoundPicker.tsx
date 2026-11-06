@@ -134,7 +134,7 @@ const POP_W = 250;
 const POP_H = 320;
 
 /** Fixed to the window so the devices panel's scrolling can't clip it; opens above when low. */
-function Popover({ anchor, onClose, children }: { anchor: HTMLElement; onClose: () => void; children: ReactNode }) {
+export function Popover({ anchor, onClose, children, width = POP_W }: { anchor: HTMLElement; onClose: () => void; children: ReactNode; width?: number }) {
   const ref = useRef<HTMLDivElement>(null);
   const closeRef = useRef(onClose);
   closeRef.current = onClose;
@@ -162,11 +162,11 @@ function Popover({ anchor, onClose, children }: { anchor: HTMLElement; onClose: 
   const r = anchor.getBoundingClientRect();
   const below = window.innerHeight - r.bottom - 8;
   const above = r.top - 8;
-  const left = Math.max(8, Math.min(r.left, window.innerWidth - POP_W - 8));
+  const left = Math.max(8, Math.min(r.left, window.innerWidth - width - 8));
   const style: React.CSSProperties =
     below >= Math.min(POP_H, above) ? { left, top: r.bottom + 2, maxHeight: Math.min(POP_H, below) } : { left, bottom: window.innerHeight - r.top + 2, maxHeight: Math.min(POP_H, above) };
   return createPortal(
-    <div className="sp-pop" ref={ref} style={{ ...style, width: POP_W }}>
+    <div className="sp-pop" ref={ref} style={{ ...style, width }}>
       {children}
     </div>,
     document.body,

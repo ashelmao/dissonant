@@ -36,7 +36,8 @@ pub use detect::{clip_mono, hear, place_on_song, HeardChord, HeardNote, Hearing,
 pub use effects::NativeEffect;
 pub use drums::{render_drum, DrumBank, DrumKit, RenderedDrum};
 pub use engine::{
-    Engine, EngineCommand, NoteShape, PreviewPatch, Shared, MAX_TRACKS, SCOPE_SAMPLES,
+    Engine, EngineCommand, NoteShape, PreviewPatch, Shared, Slide, VoiceTag, MAX_TRACKS,
+    SCOPE_SAMPLES,
 };
 pub use input::{
     align_take, default_input_name, input_latency_ms, list_input_devices, AudioInput,

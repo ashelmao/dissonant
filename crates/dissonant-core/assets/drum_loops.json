@@ -1,0 +1,625 @@
+[
+  { "id": "backbeat", "name": "backbeat", "kit": "starter", "bpm": 110, "blurb": "kick on one and three, snare on two and four: the beat under most songs",
+    "lanes": [
+      { "pitch": 42, "steps": "x.x.x.x.x.x.x.x." },
+      { "pitch": 38, "steps": "....X.......X..." },
+      { "pitch": 36, "steps": "X.......X.x....." }
+    ] },
+  { "id": "four-on-the-floor", "name": "four on the floor", "kit": "starter", "bpm": 124, "blurb": "a kick on every beat, open hats in between: dance music's heartbeat",
+    "lanes": [
+      { "pitch": 46, "steps": "..x...x...x...x." },
+      { "pitch": 39, "steps": "....x.......x..." },
+      { "pitch": 36, "steps": "X...X...X...X..." }
+    ] },
+  { "id": "half-time", "name": "half-time", "kit": "starter", "bpm": 140, "blurb": "the snare only on three, so the bar feels twice as long",
+    "lanes": [
+      { "pitch": 42, "steps": "x.x.x.x.x.x.x.x." },
+      { "pitch": 38, "steps": "........X......." },
+      { "pitch": 36, "steps": "X.........x..... X.....x...x....." }
+    ] },
+  { "id": "motorik", "name": "motorik", "kit": "starter", "bpm": 130, "blurb": "straight 16ths that never stop: the krautrock autobahn",
+    "lanes": [
+      { "pitch": 42, "steps": "XoxoXoxoXoxoXoxo" },
+      { "pitch": 38, "steps": "....X.......X..." },
+      { "pitch": 36, "steps": "X...X...X.x.X..." }
+    ] },
+  { "id": "sparse-pulse", "name": "sparse pulse", "kit": "starter", "bpm": 90, "blurb": "a soft kick and one hat: pulse without a beat, room for everything else",
+    "lanes": [
+      { "pitch": 42, "steps": "........o......." },
+      { "pitch": 36, "steps": "x.......x......." }
+    ] },
+
+  { "id": "electro-funk-808", "name": "electro funk", "kit": "808", "bpm": 118, "blurb": "syncopated 808 kick, clap stacked on the snare, cowbell on the off",
+    "lanes": [
+      { "pitch": 56, "steps": "......x.......x." },
+      { "pitch": 42, "steps": "x.xxx.x.x.xxx.x." },
+      { "pitch": 39, "steps": "....x.......x..." },
+      { "pitch": 38, "steps": "....X.......X..." },
+      { "pitch": 36, "steps": "X......x..X..... X......x..x..X.." }
+    ] },
+  { "id": "miami-bass", "name": "miami bass", "kit": "808", "bpm": 130, "blurb": "booty-shaking 808: fast hats, a kick that keeps tripping forward",
+    "lanes": [
+      { "pitch": 42, "steps": "XxoxXxoxXxoxXxox" },
+      { "pitch": 39, "steps": "....x.......x..x" },
+      { "pitch": 38, "steps": "....X.......X..." },
+      { "pitch": 36, "steps": "X..x..x...X..x.." }
+    ] },
+  { "id": "conga-808", "name": "808 conga line", "kit": "808", "bpm": 112, "blurb": "the 808's hand drums doing the work, a rimshot answering",
+    "lanes": [
+      { "pitch": 75, "steps": "x.....x.....x... ....x...x......." },
+      { "pitch": 62, "steps": "..x..x....x..x.." },
+      { "pitch": 37, "steps": "....x.......x..." },
+      { "pitch": 36, "steps": "X.......X..x...." }
+    ] },
+  { "id": "breakbeat-909", "name": "909 breakbeat", "kit": "909", "bpm": 128, "blurb": "a broken kick under a straight 909 backbeat, open hat at the turn",
+    "lanes": [
+      { "pitch": 46, "steps": "..............x." },
+      { "pitch": 42, "steps": "x.x.x.x.x.x.x..." },
+      { "pitch": 38, "steps": "....X.......X..o" },
+      { "pitch": 36, "steps": "X.........x..... X.x.......x....." }
+    ] },
+  { "id": "tom-roll-909", "name": "909 tom roll", "kit": "909", "bpm": 126, "blurb": "four bars of 909 with toms tumbling into the next phrase",
+    "lanes": [
+      { "pitch": 49, "steps": "X............... ................ ................ ................" },
+      { "pitch": 46, "steps": "..x...x...x...x." },
+      { "pitch": 39, "steps": "....x.......x..." },
+      { "pitch": 50, "steps": "................ ................ ................ ........x.x....." },
+      { "pitch": 45, "steps": "................ ................ ................ ............x.x." },
+      { "pitch": 36, "steps": "X...X...X...X..." }
+    ] },
+  { "id": "freestyle-707", "name": "freestyle", "kit": "707", "bpm": 116, "blurb": "mid-80s latin freestyle: tambourine, cowbell, a kick that skips",
+    "lanes": [
+      { "pitch": 54, "steps": "....x.......x..." },
+      { "pitch": 56, "steps": "x..x..x...x..x.." },
+      { "pitch": 42, "steps": "x.xxx.xxx.xxx.xx" },
+      { "pitch": 39, "steps": "....x.......x..." },
+      { "pitch": 38, "steps": "....X.......X..." },
+      { "pitch": 36, "steps": "X..x..x...x....." }
+    ] },
+  { "id": "pop-707", "name": "707 pop", "kit": "707", "bpm": 108, "blurb": "bright and square: the drum machine on a hundred radio hits",
+    "lanes": [
+      { "pitch": 42, "steps": "x.x.x.x.x.x.x.x." },
+      { "pitch": 38, "steps": "....X.......X..." },
+      { "pitch": 36, "steps": "X.......X.x..... X.......X......." },
+      { "pitch": 37, "steps": "................ ..............x." }
+    ] },
+  { "id": "bossa-box", "name": "rhythm box bossa", "kit": "cr78", "bpm": 120, "blurb": "the preset button marked bossa: rim clicks, clave, soft kick",
+    "lanes": [
+      { "pitch": 75, "steps": "x.....x.....x... ....x.....x....." },
+      { "pitch": 42, "steps": "x.x.x.x.x.x.x.x." },
+      { "pitch": 37, "steps": "..x..x....x..x.." },
+      { "pitch": 36, "steps": "X..x....X..x...." }
+    ] },
+  { "id": "slow-soul-box", "name": "slow soul box", "kit": "cr78", "bpm": 90, "blurb": "a home organ's rhythm unit playing ballad, guiro on the one",
+    "lanes": [
+      { "pitch": 73, "steps": "x.......x......." },
+      { "pitch": 42, "steps": "x.x.x.x.x.x.x.x." },
+      { "pitch": 38, "steps": "....x.......x..." },
+      { "pitch": 36, "steps": "X......x..X....." }
+    ] },
+  { "id": "pop-linn", "name": "80s pop", "kit": "linn", "bpm": 112, "blurb": "the sampled kit that ran the decade, tambourine on the offbeats",
+    "lanes": [
+      { "pitch": 54, "steps": "..x...x...x...x." },
+      { "pitch": 42, "steps": "x.x.x.x.x.x.x.x." },
+      { "pitch": 39, "steps": "....x.......x..." },
+      { "pitch": 38, "steps": "....X.......X..." },
+      { "pitch": 36, "steps": "X.......X.x....." }
+    ] },
+  { "id": "new-wave", "name": "new wave", "kit": "linn", "bpm": 140, "blurb": "nervous 16th hats and a kick on every beat",
+    "lanes": [
+      { "pitch": 42, "steps": "xoxoxoxoxoxoxoxo" },
+      { "pitch": 38, "steps": "....X.......X..." },
+      { "pitch": 36, "steps": "X...X...X...X..." }
+    ] },
+
+  { "id": "boom-bap", "name": "boom bap", "kit": "boom-bap", "bpm": 90, "swing": 58, "blurb": "the head-nod: dusty kick, cracking snare, hats a little late",
+    "lanes": [
+      { "pitch": 42, "steps": "x.x.x.x.x.x.x.x." },
+      { "pitch": 38, "steps": "....X.......X... ....X.......X..o" },
+      { "pitch": 36, "steps": "X......x..x..... X......x.x......" }
+    ] },
+  { "id": "lazy-boom-bap", "name": "lazy boom bap", "kit": "boom-bap", "bpm": 86, "swing": 62, "blurb": "a stumbling kick and a shaker, swung hard: behind the beat on purpose",
+    "lanes": [
+      { "pitch": 70, "steps": "..x...x...x...x." },
+      { "pitch": 42, "steps": "x.xox.xox.xox.xo" },
+      { "pitch": 38, "steps": "....X.......X... ....X..o....X..." },
+      { "pitch": 36, "steps": "X.....x...x..x.. ..X...x...x....." }
+    ] },
+  { "id": "rimshot-nod", "name": "rimshot nod", "kit": "boom-bap", "bpm": 94, "swing": 56, "blurb": "a rim instead of a snare: quieter, for verses that need space",
+    "lanes": [
+      { "pitch": 42, "steps": "x.x.x.x.x.x.x.x." },
+      { "pitch": 37, "steps": "....x.......x..." },
+      { "pitch": 36, "steps": "X.......x.x..... X.......x...x..." }
+    ] },
+  { "id": "trap", "name": "trap", "kit": "trap", "bpm": 140, "blurb": "half-time snare on three, 808 kicks, hats that roll into the turn",
+    "lanes": [
+      { "pitch": 42, "step": 0.125, "steps": "x...x...x...x...x...x...x...x... x...x...x...x...x.x.x.x.xxxxx..." },
+      { "pitch": 39, "steps": "........X......." },
+      { "pitch": 38, "steps": "........X......." },
+      { "pitch": 36, "steps": "X......x...X.... X.....x..x......" }
+    ] },
+  { "id": "triplet-trap", "name": "triplet flow", "kit": "trap", "bpm": 145, "blurb": "hats in triplets, so everything on top bounces",
+    "lanes": [
+      { "pitch": 42, "step": 0.3333333333333333, "steps": "XxoXxoXxoXxo" },
+      { "pitch": 39, "steps": "........X......." },
+      { "pitch": 36, "steps": "X.........x..... ..X.......x....." }
+    ] },
+  { "id": "sparse-trap", "name": "sparse trap", "kit": "trap", "bpm": 130, "blurb": "almost empty: long 808s and a few hats, the vocal does the rest",
+    "lanes": [
+      { "pitch": 42, "step": 0.125, "steps": "x.......x.......x.......x.x.x.x." },
+      { "pitch": 37, "steps": "..............x." },
+      { "pitch": 38, "steps": "........X......." },
+      { "pitch": 36, "steps": "X..........x.... ......X...x....." }
+    ] },
+  { "id": "rage", "name": "rage stomp", "kit": "rage", "bpm": 160, "blurb": "a blown-out kick stomping under a huge clap, a zap at the end",
+    "lanes": [
+      { "pitch": 72, "steps": "...............x" },
+      { "pitch": 42, "steps": "x.x.x.x.x.x.x.x." },
+      { "pitch": 39, "steps": "........X......." },
+      { "pitch": 38, "steps": "........X......." },
+      { "pitch": 35, "steps": "X............... ......X........." },
+      { "pitch": 36, "steps": "X.....X...X..... X.....X...X.X..." }
+    ] },
+  { "id": "drill", "name": "uk drill", "kit": "drill", "bpm": 142, "blurb": "sliding-808 territory: triplet hats, snares that land a little off",
+    "lanes": [
+      { "pitch": 42, "step": 0.3333333333333333, "steps": "x.xx.xx.xx.x" },
+      { "pitch": 37, "steps": "...x.......x...." },
+      { "pitch": 38, "steps": "........X....... ........X.....x." },
+      { "pitch": 36, "steps": "X......x..X..... ..X....x...x...." }
+    ] },
+  { "id": "jersey-bounce", "name": "jersey bounce", "kit": "jersey", "bpm": 140, "blurb": "the five-kick jersey pattern, claps on two and four, the squeak",
+    "lanes": [
+      { "pitch": 67, "steps": "......x.......x." },
+      { "pitch": 42, "steps": "x.x.x.x.x.x.x.x." },
+      { "pitch": 39, "steps": "....X.......X..." },
+      { "pitch": 36, "steps": "X...X...X..X..X." }
+    ] },
+  { "id": "drift-phonk", "name": "drift phonk", "kit": "phonk", "bpm": 140, "blurb": "cowbell melody over a half-time snare and a distorted kick",
+    "lanes": [
+      { "pitch": 56, "steps": "x..x..x.x..x..x." },
+      { "pitch": 42, "steps": "x.x.x.x.x.x.x.x." },
+      { "pitch": 39, "steps": "........X......." },
+      { "pitch": 36, "steps": "X.....X...X....." }
+    ] },
+  { "id": "memphis", "name": "memphis", "kit": "phonk", "bpm": 130, "swing": 55, "blurb": "a tape-worn 90s backbeat with cowbell on every off",
+    "lanes": [
+      { "pitch": 56, "steps": "..x...x...x...x." },
+      { "pitch": 42, "steps": "XoxoXoxoXoxoXoxo" },
+      { "pitch": 38, "steps": "....X.......X..." },
+      { "pitch": 35, "steps": "X..............." },
+      { "pitch": 36, "steps": "X.......X.x....." }
+    ] },
+
+  { "id": "classic-house", "name": "classic house", "kit": "house", "bpm": 124, "blurb": "four on the floor, offbeat open hat, a shaker running 16ths",
+    "lanes": [
+      { "pitch": 46, "steps": "..x...x...x...x." },
+      { "pitch": 70, "steps": "oxoxoxoxoxoxoxox" },
+      { "pitch": 39, "steps": "....x.......x..." },
+      { "pitch": 36, "steps": "X...X...X...X..." }
+    ] },
+  { "id": "deep-house", "name": "deep house", "kit": "house", "bpm": 120, "swing": 56, "blurb": "softer and swung, with congas talking across the bar",
+    "lanes": [
+      { "pitch": 46, "steps": "..x...x...x...x." },
+      { "pitch": 70, "steps": "x.xxx.xxx.xxx.xx" },
+      { "pitch": 39, "steps": "....x.......x..." },
+      { "pitch": 62, "steps": "...x.....x...x.." },
+      { "pitch": 64, "steps": "......x........x" },
+      { "pitch": 36, "steps": "X...X...X...X..." }
+    ] },
+  { "id": "jackin-house", "name": "jackin' house", "kit": "house", "bpm": 126, "swing": 62, "blurb": "shuffled 16th hats and a tambourine: Chicago, sweaty",
+    "lanes": [
+      { "pitch": 54, "steps": "....x.......x..." },
+      { "pitch": 42, "steps": "oxoxoxoxoxoxoxox" },
+      { "pitch": 38, "steps": "....x.......x..." },
+      { "pitch": 36, "steps": "X...X...X...X..." }
+    ] },
+  { "id": "warehouse-techno", "name": "warehouse techno", "kit": "techno", "bpm": 130, "blurb": "relentless kick, open hats on the off, rims scattered on top",
+    "lanes": [
+      { "pitch": 46, "steps": "..x...x...x...x." },
+      { "pitch": 42, "steps": "x...x...x...x..." },
+      { "pitch": 39, "steps": "....x.......x..." },
+      { "pitch": 37, "steps": "...x..x....x..x." },
+      { "pitch": 36, "steps": "X...X...X...X..." }
+    ] },
+  { "id": "rolling-techno", "name": "rolling techno", "kit": "techno", "bpm": 134, "blurb": "a ride in 8ths and rims in threes over four, so it never sits still",
+    "lanes": [
+      { "pitch": 51, "steps": "x.x.x.x.x.x.x.x." },
+      { "pitch": 67, "steps": "................ ..............x." },
+      { "pitch": 37, "steps": "..x..x..x..x..x." },
+      { "pitch": 36, "steps": "X...X...X...X..." }
+    ] },
+  { "id": "minimal-click", "name": "minimal click", "kit": "minimal", "bpm": 124, "blurb": "tiny sounds in odd places: the groove is in the gaps",
+    "lanes": [
+      { "pitch": 72, "steps": "..........x....." },
+      { "pitch": 42, "steps": "..x...x...x...x." },
+      { "pitch": 75, "steps": ".x.....x........" },
+      { "pitch": 39, "steps": "....x.......x..." },
+      { "pitch": 37, "steps": "...x.......x..x." },
+      { "pitch": 36, "steps": "X...X...X...X..." }
+    ] },
+  { "id": "micro-house", "name": "micro house", "kit": "minimal", "bpm": 122, "swing": 60, "blurb": "woodblocks and a ghosted snare, swung soft",
+    "lanes": [
+      { "pitch": 76, "steps": "..x..x....x..x.." },
+      { "pitch": 42, "steps": "oxoxoxoxoxoxoxox" },
+      { "pitch": 38, "steps": "....o.......x..." },
+      { "pitch": 36, "steps": "X...X...X...X..." }
+    ] },
+  { "id": "electro-breaker", "name": "electro breaker", "kit": "electro", "bpm": 128, "blurb": "b-boy electro: broken 808 kick, syn toms at the end of the phrase",
+    "lanes": [
+      { "pitch": 42, "steps": "x.x.x.x.x.x.x.x." },
+      { "pitch": 39, "steps": "....x.......x..." },
+      { "pitch": 38, "steps": "....X.......X..." },
+      { "pitch": 50, "steps": "................ ............x..." },
+      { "pitch": 45, "steps": "................ ..............x." },
+      { "pitch": 36, "steps": "X......x..X..... X......x..x....." }
+    ] },
+  { "id": "robot-funk", "name": "robot funk", "kit": "electro", "bpm": 110, "blurb": "slower, funkier, cowbell doing the bassline's job",
+    "lanes": [
+      { "pitch": 72, "steps": "...............x" },
+      { "pitch": 56, "steps": "x..x..x...x.x..." },
+      { "pitch": 42, "steps": "x.x.x.x.x.x.x.x." },
+      { "pitch": 38, "steps": "....X.......X..." },
+      { "pitch": 36, "steps": "X..x......x..x.." }
+    ] },
+  { "id": "two-step", "name": "2-step", "kit": "garage", "bpm": 132, "swing": 60, "blurb": "the skippy UK garage kick that never lands where you expect",
+    "lanes": [
+      { "pitch": 70, "steps": "oxoxoxoxoxoxoxox" },
+      { "pitch": 39, "steps": "....X.......X..." },
+      { "pitch": 37, "steps": "..x..x....x..x.." },
+      { "pitch": 36, "steps": "X.........X..... X.....x........." }
+    ] },
+  { "id": "speed-garage", "name": "speed garage", "kit": "garage", "bpm": 135, "swing": 54, "blurb": "four on the floor with a sub drop on the one and snaps on the off",
+    "lanes": [
+      { "pitch": 46, "steps": "..x...x...x...x." },
+      { "pitch": 39, "steps": "....x.......x..." },
+      { "pitch": 40, "steps": ".......x.......x" },
+      { "pitch": 35, "steps": "X..............." },
+      { "pitch": 36, "steps": "X...X...X...X..." }
+    ] },
+  { "id": "footwork", "name": "footwork", "kit": "footwork", "bpm": 160, "blurb": "triplet kicks against a straight clap: chicago juke at 160",
+    "lanes": [
+      { "pitch": 42, "steps": "x.x.x.x.x.x.x.x." },
+      { "pitch": 39, "steps": "....X.......X..." },
+      { "pitch": 50, "step": 0.3333333333333333, "steps": "..........x." },
+      { "pitch": 45, "step": 0.3333333333333333, "steps": "...........x" },
+      { "pitch": 36, "step": 0.3333333333333333, "steps": "X.xX.xX..X.x" }
+    ] },
+  { "id": "juke", "name": "juke", "kit": "footwork", "bpm": 160, "blurb": "rimshots chattering over a stuttering kick",
+    "lanes": [
+      { "pitch": 42, "steps": "xoxoxoxoxoxoxoxo" },
+      { "pitch": 39, "steps": "....X.......X..." },
+      { "pitch": 37, "steps": "..x...x...x...x." },
+      { "pitch": 36, "steps": "X..X..X...X..X.." }
+    ] },
+  { "id": "gabber", "name": "gabber", "kit": "gabber", "bpm": 180, "blurb": "the kick at 180 for three bars, then the snare roll that breaks it",
+    "lanes": [
+      { "pitch": 46, "steps": "..x...x...x...x." },
+      { "pitch": 38, "steps": "................ ................ ................ ....x.x.xxxxXXXX" },
+      { "pitch": 36, "steps": "X...X...X...X... X...X...X...X... X...X...X...X... X..............." }
+    ] },
+  { "id": "synthwave-drive", "name": "synthwave drive", "kit": "synthwave", "bpm": 100, "blurb": "gated backbeat with syn toms closing every four bars",
+    "lanes": [
+      { "pitch": 49, "steps": "X............... ................ ................ ................" },
+      { "pitch": 42, "steps": "x.x.x.x.x.x.x.x." },
+      { "pitch": 38, "steps": "....X.......X..." },
+      { "pitch": 50, "steps": "................ ................ ................ ........x.x....." },
+      { "pitch": 45, "steps": "................ ................ ................ ............x.x." },
+      { "pitch": 36, "steps": "X.......X......." }
+    ] },
+  { "id": "outrun", "name": "outrun", "kit": "synthwave", "bpm": 118, "blurb": "four on the floor and 16th hats: night driving",
+    "lanes": [
+      { "pitch": 42, "steps": "XoxoXoxoXoxoXoxo" },
+      { "pitch": 39, "steps": "....X.......X..." },
+      { "pitch": 38, "steps": "....X.......X..." },
+      { "pitch": 36, "steps": "X...X...X...X..." }
+    ] },
+
+  { "id": "amen", "name": "amen break", "kit": "jungle", "bpm": 172, "blurb": "the four-bar break everything in jungle is cut from",
+    "lanes": [
+      { "pitch": 51, "steps": "x.o.x.o.x.o.x.o." },
+      { "pitch": 49, "steps": "................ ................ ................ ..........X....." },
+      { "pitch": 40, "steps": ".......o.o.....o .......o.o.....o .......o.o....o. .........o......" },
+      { "pitch": 38, "steps": "....X.......X... ....X.......X... ....X.......x... .o..X..o......o." },
+      { "pitch": 36, "steps": "X.X.......Xx.... X.X.......Xx.... X.X.......X..... ..XX......X....." }
+    ] },
+  { "id": "rolling-jungle", "name": "rolling jungle", "kit": "jungle", "bpm": 165, "blurb": "ghost snares everywhere, hats driving straight through",
+    "lanes": [
+      { "pitch": 42, "steps": "x.x.x.x.x.x.x.x." },
+      { "pitch": 40, "steps": "..o.....o.o..... ..o.....o...o..." },
+      { "pitch": 38, "steps": "....X..o....X... .o..X.......X..o" },
+      { "pitch": 36, "steps": "X.........X..... ..X.......X....." }
+    ] },
+  { "id": "two-step-dnb", "name": "two-step dnb", "kit": "dnb", "bpm": 174, "blurb": "the dnb skeleton: kick, snare, a kick just before three",
+    "lanes": [
+      { "pitch": 70, "steps": "oxoxoxoxoxoxoxox" },
+      { "pitch": 42, "steps": "x.x.x.x.x.x.x.x." },
+      { "pitch": 38, "steps": "....X.......X..." },
+      { "pitch": 36, "steps": "X.........X....." }
+    ] },
+  { "id": "liquid", "name": "liquid", "kit": "dnb", "bpm": 172, "blurb": "a ride instead of hats, a lighter touch for the pretty chords",
+    "lanes": [
+      { "pitch": 51, "steps": "x.x.x.x.x.x.x.x." },
+      { "pitch": 70, "steps": "o.oxo.oxo.oxo.ox" },
+      { "pitch": 38, "steps": "....X.......X... ....X.......X..o" },
+      { "pitch": 36, "steps": "X.........x..... X.....x...x....." }
+    ] },
+  { "id": "halftime-dnb", "name": "halftime dnb", "kit": "dnb", "bpm": 170, "blurb": "fast hats, slow snare: heavy and patient",
+    "lanes": [
+      { "pitch": 42, "steps": "x.x.x.x.x.x.x.x." },
+      { "pitch": 38, "steps": "........X......." },
+      { "pitch": 36, "steps": "X.....x...x..... ..X...x........." }
+    ] },
+  { "id": "dubstep", "name": "dubstep", "kit": "dubstep", "bpm": 140, "blurb": "half-time: one kick, one enormous snare, a floor-tom fill at the end",
+    "lanes": [
+      { "pitch": 49, "steps": "X............... ................ ................ ................" },
+      { "pitch": 46, "steps": "..............x." },
+      { "pitch": 42, "steps": "x.x.x.x.x.x.x..." },
+      { "pitch": 39, "steps": "........X......." },
+      { "pitch": 38, "steps": "........X......." },
+      { "pitch": 41, "steps": "................ ................ ................ ............x.xx" },
+      { "pitch": 36, "steps": "X.........x..... X.........x..... X.........x..... X.....x...x.x..." }
+    ] },
+  { "id": "riddim", "name": "riddim", "kit": "dubstep", "bpm": 140, "blurb": "stripped to the bone so the bass can talk",
+    "lanes": [
+      { "pitch": 42, "steps": "x...x...x...x..." },
+      { "pitch": 38, "steps": "........X......." },
+      { "pitch": 35, "steps": "X............... ................" },
+      { "pitch": 36, "steps": "X.....X........." }
+    ] },
+  { "id": "dembow", "name": "dembow", "kit": "dembow", "bpm": 95, "blurb": "boom, ch-boom, chick: reggaeton's engine",
+    "lanes": [
+      { "pitch": 42, "steps": "x.x.x.x.x.x.x.x." },
+      { "pitch": 65, "steps": "................ ............x.x." },
+      { "pitch": 38, "steps": "...x..x....x..x." },
+      { "pitch": 36, "steps": "X...X...X...X..." }
+    ] },
+  { "id": "perreo", "name": "perreo", "kit": "dembow", "bpm": 100, "blurb": "dembow with rim, clap and timbales filling the holes",
+    "lanes": [
+      { "pitch": 46, "steps": "..x...x...x...x." },
+      { "pitch": 65, "steps": "..........x.x..." },
+      { "pitch": 39, "steps": "......x.......x." },
+      { "pitch": 37, "steps": "...x..x....x..x." },
+      { "pitch": 64, "steps": "x.......x......." },
+      { "pitch": 36, "steps": "X...X...X...X..." }
+    ] },
+  { "id": "afrobeats", "name": "afrobeats", "kit": "afro", "bpm": 105, "swing": 55, "blurb": "shaker 16ths, a 3-3-2 rim and congas answering each other",
+    "lanes": [
+      { "pitch": 70, "steps": "XoxoXoxoXoxoXoxo" },
+      { "pitch": 62, "steps": "......x.......x." },
+      { "pitch": 64, "steps": "...x.......x...." },
+      { "pitch": 39, "steps": "....x.......x..." },
+      { "pitch": 37, "steps": "x..x..x...x..x.." },
+      { "pitch": 36, "steps": "X......x..X....." }
+    ] },
+  { "id": "amapiano", "name": "amapiano", "kit": "afro", "bpm": 113, "blurb": "four on the floor with a log-drum tom dancing around it",
+    "lanes": [
+      { "pitch": 70, "steps": "oxoxoxoxoxoxoxox" },
+      { "pitch": 76, "steps": "..x.......x....." },
+      { "pitch": 39, "steps": "....x.......x..." },
+      { "pitch": 45, "steps": "...x..x...x..x.. x..x....x.x....." },
+      { "pitch": 36, "steps": "X...X...X...X..." }
+    ] },
+
+  { "id": "straight-eights", "name": "straight eighths", "kit": "studio", "bpm": 100, "blurb": "a drummer's basic groove, four bars with a tom fill into the top",
+    "lanes": [
+      { "pitch": 49, "steps": "X............... ................ ................ ................" },
+      { "pitch": 42, "steps": "x.x.x.x.x.x.x.x. x.x.x.x.x.x.x.x. x.x.x.x.x.x.x.x. x.x.x.x........." },
+      { "pitch": 38, "steps": "....X.......X... ....X.......X... ....X.......X... ....X...xx......" },
+      { "pitch": 50, "steps": "................ ................ ................ ..........xx...." },
+      { "pitch": 47, "steps": "................ ................ ................ ............xx.." },
+      { "pitch": 41, "steps": "................ ................ ................ ..............xx" },
+      { "pitch": 36, "steps": "X.......X.x..... X.......X.x..... X.......X.x..... X.......X......." }
+    ] },
+  { "id": "ghost-notes", "name": "ghost notes", "kit": "studio", "bpm": 95, "swing": 54, "blurb": "quiet snare taps between the backbeat: the funk lives there",
+    "lanes": [
+      { "pitch": 42, "steps": "x.x.x.x.x.x.x.x." },
+      { "pitch": 38, "steps": "...oX..o.o..X.o." },
+      { "pitch": 36, "steps": "X......x..X....." }
+    ] },
+  { "id": "ride-sidestick", "name": "ride and side stick", "kit": "studio", "bpm": 120, "blurb": "ride cymbal, side stick, pedal hat: the verse before the band kicks in",
+    "lanes": [
+      { "pitch": 51, "steps": "x.x.x.x.x.x.x.x." },
+      { "pitch": 44, "steps": "....x.......x..." },
+      { "pitch": 37, "steps": "....x.......x..." },
+      { "pitch": 36, "steps": "X.......X......." }
+    ] },
+  { "id": "rock-anthem", "name": "rock anthem", "kit": "rock", "bpm": 128, "blurb": "big backbeat, crash on the one, toms down the kit at the end",
+    "lanes": [
+      { "pitch": 49, "steps": "X............... ................ ................ ................" },
+      { "pitch": 42, "steps": "x.x.x.x.x.x.x.x. x.x.x.x.x.x.x.x. x.x.x.x.x.x.x.x. x.x.x.x........." },
+      { "pitch": 38, "steps": "....X.......X... ....X.......X... ....X.......X... ....X...X......." },
+      { "pitch": 50, "steps": "................ ................ ................ ..........x....." },
+      { "pitch": 47, "steps": "................ ................ ................ ............x..." },
+      { "pitch": 41, "steps": "................ ................ ................ ..............xx" },
+      { "pitch": 36, "steps": "X.......X.X....." }
+    ] },
+  { "id": "punk", "name": "punk", "kit": "rock", "bpm": 180, "blurb": "fast, loud, ride bashed in eighths",
+    "lanes": [
+      { "pitch": 51, "steps": "x.x.x.x.x.x.x.x." },
+      { "pitch": 38, "steps": "....X.......X..." },
+      { "pitch": 36, "steps": "X.x.....X.x....." }
+    ] },
+  { "id": "heavy-half", "name": "heavy half-time", "kit": "rock", "bpm": 80, "blurb": "slow and huge, china on the beats",
+    "lanes": [
+      { "pitch": 52, "steps": "x...x...x...x..." },
+      { "pitch": 38, "steps": "........X......." },
+      { "pitch": 36, "steps": "X.x.......X....." }
+    ] },
+  { "id": "jazz-swing", "name": "jazz swing", "kit": "brushes", "bpm": 140, "blurb": "ding, ding-a-ding on the ride, pedal hat on two and four",
+    "lanes": [
+      { "pitch": 51, "step": 0.3333333333333333, "steps": "x..x.xx..x.x" },
+      { "pitch": 44, "steps": "....x.......x..." },
+      { "pitch": 38, "steps": "........o.....o." },
+      { "pitch": 36, "steps": "o...o...o...o..." }
+    ] },
+  { "id": "brush-ballad", "name": "brush ballad", "kit": "brushes", "bpm": 70, "blurb": "brushes sweeping 16ths, a side stick on the backbeat",
+    "lanes": [
+      { "pitch": 53, "steps": "x..............." },
+      { "pitch": 38, "steps": "oxoxoxoxoxoxoxox" },
+      { "pitch": 37, "steps": "....x.......x..." },
+      { "pitch": 36, "steps": "X.......X......." }
+    ] },
+  { "id": "power-ballad", "name": "power ballad", "kit": "gated-80s", "bpm": 76, "blurb": "a gated snare the size of a stadium, toms rolling into bar one",
+    "lanes": [
+      { "pitch": 49, "steps": "X............... ................" },
+      { "pitch": 42, "steps": "x.x.x.x.x.x.x.x." },
+      { "pitch": 38, "steps": "....X.......X... ....X..........." },
+      { "pitch": 50, "steps": "................ ........x.x....." },
+      { "pitch": 47, "steps": "................ ............x..." },
+      { "pitch": 41, "steps": "................ ..............x." },
+      { "pitch": 36, "steps": "X.......X.x....." }
+    ] },
+
+  { "id": "son-clave", "name": "son clave", "kit": "latin", "bpm": 100, "blurb": "3-2 clave, cowbell, a tumbao on the congas and bongos running",
+    "lanes": [
+      { "pitch": 70, "steps": "XoxoXoxoXoxoXoxo" },
+      { "pitch": 75, "steps": "x.....x.....x... ....x...x......." },
+      { "pitch": 56, "steps": "x...x...x...x..." },
+      { "pitch": 60, "steps": "xooxxooxxooxxoox" },
+      { "pitch": 62, "steps": "..x...x...x....." },
+      { "pitch": 64, "steps": "............x.x." },
+      { "pitch": 36, "steps": "...x......x....." }
+    ] },
+  { "id": "bossa-nova", "name": "bossa nova", "kit": "latin", "bpm": 130, "blurb": "bossa clave and a cabasa, the kick rocking underneath",
+    "lanes": [
+      { "pitch": 69, "steps": "XoxoXoxoXoxoXoxo" },
+      { "pitch": 75, "steps": "x.....x.....x... ....x.....x....." },
+      { "pitch": 36, "steps": "X..x....X..x...." }
+    ] },
+  { "id": "cumbia", "name": "cumbia", "kit": "latin", "bpm": 95, "blurb": "guiro scraping, congas on the back, tambourine shaking the off",
+    "lanes": [
+      { "pitch": 54, "steps": "..x...x...x...x." },
+      { "pitch": 73, "steps": "x.xxx.xxx.xxx.xx" },
+      { "pitch": 62, "steps": "....x.......x..." },
+      { "pitch": 64, "steps": "......x.......x." },
+      { "pitch": 36, "steps": "X.......X......." }
+    ] },
+  { "id": "cascara", "name": "cascara", "kit": "latin", "bpm": 110, "blurb": "timbale shell pattern over 2-3 clave",
+    "lanes": [
+      { "pitch": 65, "steps": "x.x.xx.xx.x.xx.x" },
+      { "pitch": 75, "steps": "....x...x....... x.....x.....x..." },
+      { "pitch": 64, "steps": "............x.x." },
+      { "pitch": 36, "steps": "...x......x....." }
+    ] },
+  { "id": "taiko-procession", "name": "taiko procession", "kit": "taiko", "bpm": 90, "blurb": "big drums marching, woodblock keeping time",
+    "lanes": [
+      { "pitch": 81, "steps": "X..............." },
+      { "pitch": 76, "steps": "x.x.x.x.x.x.x.x." },
+      { "pitch": 50, "steps": "................ ..............xx" },
+      { "pitch": 45, "steps": "......x.......x." },
+      { "pitch": 41, "steps": "....x.......x..." },
+      { "pitch": 36, "steps": "X.......X..X.... X...X...X.X.X.X." }
+    ] },
+  { "id": "ritual", "name": "ritual", "kit": "taiko", "bpm": 70, "blurb": "slow and low, knocks and clave circling the big drum",
+    "lanes": [
+      { "pitch": 81, "steps": "x.......x......." },
+      { "pitch": 75, "steps": "x..x..x.x..x..x." },
+      { "pitch": 77, "steps": "..x...x...x...x." },
+      { "pitch": 36, "steps": "X.....x...X....." }
+    ] },
+
+  { "id": "chillhop", "name": "chillhop", "kit": "lofi-tape", "bpm": 82, "swing": 60, "blurb": "the study-beats loop: crushed and swung, shaker on the off",
+    "lanes": [
+      { "pitch": 70, "steps": "..x...x...x...x." },
+      { "pitch": 42, "steps": "x.x.x.x.x.x.x.x." },
+      { "pitch": 38, "steps": "....X.......X..." },
+      { "pitch": 36, "steps": "X......x..x..... X.......x......." }
+    ] },
+  { "id": "sleepy", "name": "sleepy", "kit": "lofi-tape", "bpm": 72, "swing": 58, "blurb": "barely awake: a rim, a kick, hats falling over",
+    "lanes": [
+      { "pitch": 42, "steps": "x.xox.xox.xox.xo" },
+      { "pitch": 37, "steps": "....x.......x..." },
+      { "pitch": 36, "steps": "X.........x....." }
+    ] },
+  { "id": "dusty-jazz", "name": "dusty jazz loop", "kit": "dusty", "bpm": 86, "swing": 62, "blurb": "a sampled ride and a snap, like a loop lifted off a jazz record",
+    "lanes": [
+      { "pitch": 51, "steps": "x.xxx.xxx.xxx.xx" },
+      { "pitch": 39, "steps": "....x.......x..." },
+      { "pitch": 38, "steps": "....X.......X..o" },
+      { "pitch": 36, "steps": "X......x.x......" }
+    ] },
+  { "id": "head-nodder", "name": "head nodder", "kit": "dusty", "bpm": 92, "swing": 56, "blurb": "two bars of sampler swing with an open hat at the end",
+    "lanes": [
+      { "pitch": 46, "steps": "..............x." },
+      { "pitch": 42, "steps": "x.x.x.x.x.x.x..." },
+      { "pitch": 38, "steps": "....X.......X..." },
+      { "pitch": 36, "steps": "X.....x...x..x.. X.....x........." }
+    ] },
+  { "id": "toy-march", "name": "toy march", "kit": "toy", "bpm": 120, "blurb": "a wind-up soldier: oom-pah kick and snare, a ting every other bar",
+    "lanes": [
+      { "pitch": 81, "steps": "X............... ................" },
+      { "pitch": 72, "steps": "...............x" },
+      { "pitch": 42, "steps": "xoxoxoxoxoxoxoxo" },
+      { "pitch": 38, "steps": "..x...x...x...x." },
+      { "pitch": 36, "steps": "X...X...X...X..." }
+    ] },
+  { "id": "music-box", "name": "music box", "kit": "toy", "bpm": 100, "blurb": "woodblock tune, clave and a tiny ting: a lullaby with a beat",
+    "lanes": [
+      { "pitch": 81, "steps": "......x.......x." },
+      { "pitch": 76, "steps": "x..x..x.x..x..x." },
+      { "pitch": 75, "steps": "....x.......x..." },
+      { "pitch": 36, "steps": "X.......X......." }
+    ] },
+
+  { "id": "factory-floor", "name": "factory floor", "kit": "industrial", "bpm": 120, "blurb": "machines stamping: metal hits, chains, a china every other bar",
+    "lanes": [
+      { "pitch": 52, "steps": "X............... ................" },
+      { "pitch": 67, "steps": "......x.......x." },
+      { "pitch": 68, "steps": "..x.......x....." },
+      { "pitch": 42, "steps": "x.xxx.xxx.xxx.xx" },
+      { "pitch": 38, "steps": "....X.......X..." },
+      { "pitch": 36, "steps": "X...X...X...X..." }
+    ] },
+  { "id": "ebm-march", "name": "ebm march", "kit": "industrial", "bpm": 125, "blurb": "8th-note kick drilling, a clap like a door slamming",
+    "lanes": [
+      { "pitch": 42, "steps": "..x...x...x...x." },
+      { "pitch": 39, "steps": "....X.......X..." },
+      { "pitch": 41, "steps": "................ ..............xx" },
+      { "pitch": 36, "steps": "X.x.X.x.X.x.X.x." }
+    ] },
+  { "id": "kitchen-sink", "name": "kitchen sink", "kit": "junk", "bpm": 96, "swing": 56, "blurb": "a beat made of whatever was lying around: can, knock, shaker",
+    "lanes": [
+      { "pitch": 81, "steps": "X............... ................" },
+      { "pitch": 70, "steps": "oxoxoxoxoxoxoxox" },
+      { "pitch": 73, "steps": "......x........." },
+      { "pitch": 38, "steps": "....X.......X..." },
+      { "pitch": 77, "steps": "..x.....x.x....." },
+      { "pitch": 36, "steps": "X......x..X....." }
+    ] },
+  { "id": "glitch", "name": "glitch", "kit": "glitch", "bpm": 128, "blurb": "blips and broken bits where the hats should be",
+    "lanes": [
+      { "pitch": 71, "steps": "..........x....." },
+      { "pitch": 72, "steps": ".x.............." },
+      { "pitch": 73, "steps": "...x.....x...x.." },
+      { "pitch": 74, "steps": "x.x.xxx..x.x.xx." },
+      { "pitch": 42, "steps": "XoooxoooXoooxooo" },
+      { "pitch": 38, "steps": "....X.......X..." },
+      { "pitch": 36, "steps": "X..x..X...X..x.." }
+    ] },
+  { "id": "stutter", "name": "stutter", "kit": "glitch", "bpm": 140, "blurb": "snares in bursts, hats in 32nds: a beat that skips like a scratched CD",
+    "lanes": [
+      { "pitch": 75, "steps": "x.....x.....x..." },
+      { "pitch": 42, "step": 0.125, "steps": "x.x.x.x.x.x.x.x.xxxxxxxxx.x.x.x." },
+      { "pitch": 38, "steps": "....X..xX...X.xx" },
+      { "pitch": 36, "steps": "X.X.X...X......." }
+    ] },
+  { "id": "hyperpop", "name": "hyperpop", "kit": "hyperpop", "bpm": 160, "blurb": "blown kick, clap and snare together, 32nd hats, lasers",
+    "lanes": [
+      { "pitch": 71, "steps": "...............x" },
+      { "pitch": 72, "steps": "..............x." },
+      { "pitch": 73, "steps": "..x..........x.." },
+      { "pitch": 42, "step": 0.125, "steps": "x.x.x.x.x.x.x.x.x.x.x.x.xxxxxxxx" },
+      { "pitch": 39, "steps": "....X.......X..." },
+      { "pitch": 38, "steps": "....X.......X..." },
+      { "pitch": 35, "steps": "X..............." },
+      { "pitch": 36, "steps": "X.....X...X....." }
+    ] },
+  { "id": "breakcore", "name": "breakcore", "kit": "hyperpop", "bpm": 190, "blurb": "a break chopped to pieces at 190",
+    "lanes": [
+      { "pitch": 49, "steps": "X............... ................" },
+      { "pitch": 73, "steps": "...............x ........x......." },
+      { "pitch": 42, "steps": "xxxxxxxxxxxxxxxx" },
+      { "pitch": 38, "steps": "....X..X.X..X... .X..X..X..X.X.XX" },
+      { "pitch": 36, "steps": "X.X.......X..X.. ..X...X...X....." }
+    ] }
+]

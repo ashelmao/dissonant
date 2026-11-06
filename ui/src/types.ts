@@ -71,6 +71,10 @@ export interface NoteEvent {
   repeats?: number;
   /** Colour group 0–15; the MIDI channel on export. */
   color?: number;
+  /** Id of the note on the same pattern this one slides from (a rope); see `ropes.ts`. */
+  slideFrom?: string;
+  /** The rope's slide time in seconds, 0–2; absent uses the patch's glide. */
+  slideSecs?: number;
   /**
    * The note's pitch contour, as an offset *on top of* `fine`: ticks are measured from the
    * note's start, at most {@link MAX_PITCH_POINTS} of them. Absent on the overwhelming
@@ -1053,6 +1057,14 @@ export type Command =
   | { type: "renamePattern"; id: string; name: string }
   | { type: "setPatternLength"; id: string; ticks: number }
   | { type: "setNotes"; patternId: string; notes: NoteEvent[] }
+  /** Rope `noteId` to `sourceId` (same pattern), replacing any rope it had. Refused when the
+   *  rope would loop back on itself. */
+  | { type: "setRope"; patternId: string; noteId: string; sourceId: string }
+  /** Cut `noteId`'s rope and its slide time; a note with no rope is left alone. */
+  | { type: "clearRope"; patternId: string; noteId: string }
+  /** The rope's slide time in seconds (clamped 0–2), or null for the patch's glide. Send it
+   *  transient while the midpoint is dragged. Refused on a note with no rope. */
+  | { type: "setSlideTime"; patternId: string; noteId: string; secs: number | null }
   | { type: "setChords"; chords: ChordEvent[] }
   | {
       type: "addClip";

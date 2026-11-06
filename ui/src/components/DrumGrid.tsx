@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { barTicks, gridLabel, selectedPattern, selectedTrack, selectedTrackIndex, useStore } from "../store";
-import { padName } from "../drumKit";
+import { matchingKit, padName } from "../drumKit";
 import { NOTE_PROPS, noteProp, TICKS_PER_BEAT, trackColor, type NoteEvent, type NoteProp, uuid } from "../types";
 import {
   clearRow,
@@ -24,6 +24,8 @@ import {
 } from "../noteEditing";
 import { BASE_BEAT_W } from "./ChordLane";
 import { AddPadPicker, SwapPadPicker } from "./AddPadPicker";
+import { KitPicker } from "./KitPicker";
+import { LoopPicker } from "./LoopPicker";
 import { keys } from "../platform";
 
 /** Geometry shared with the CSS: `.drumrow .dname` width, `.drumcells` gap and left padding. */
@@ -559,6 +561,16 @@ export function DrumGrid() {
         <AddPadPicker track={track} className="dname dadd">
           + add sound
         </AddPadPicker>
+        <span className="dpresets">
+          <KitPicker track={track} className="dkits">
+            {matchingKit(track.drumPads)?.name ?? "kits"} ▾
+          </KitPicker>
+          {pattern && (
+            <LoopPicker track={track} pattern={pattern} className="dkits">
+              loops ▾
+            </LoopPicker>
+          )}
+        </span>
       </div>
 
       <div className="steptools" style={{ position: "sticky", left: 0 }}>

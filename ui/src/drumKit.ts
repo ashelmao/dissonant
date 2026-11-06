@@ -1,7 +1,9 @@
 // Pure edits on a drum track's kit (`Track.drumPads`, top to bottom). Every edit returns a new
 // list; the caller dispatches it whole with `setDrumPads`, so the core always sees a full kit.
 
+import kitsJson from "../../crates/dissonant-core/assets/drum_kits.json";
 import { factorySound, isFactory, lookupSound, MAX_DRUM_PADS, type DrumPad, type Sound } from "./sound";
+import type { NoteEvent } from "./types";
 
 /** Free pitches tried first when adding a pad: the General MIDI kit, most common first. */
 const GM_ORDER = [36, 38, 42, 46, 39, 49, 45, 50, 37, 40, 41, 43, 44, 47, 48, 51, 52, 53, 54, 55, 56, 57, 59, 35];
@@ -36,6 +38,10 @@ const GM_ROLES: [RegExp, number[]][] = [
   [/tom/, [45, 43, 41, 47]],
   [/tambourine/, [54]],
   [/bongo/, [60, 61]],
+  [/timbale/, [65, 66]],
+  [/guiro/, [73, 74]],
+  [/cabasa/, [69]],
+  [/triangle/, [81, 80]],
   [/conga.*(lo|low)/, [64]],
   [/conga/, [62, 63]],
   [/clave/, [75]],
@@ -124,4 +130,54 @@ export function kitSounds(pads: DrumPad[], library: Sound[], projectSounds: Soun
 /** A pad's row label: its sound's name, falling back to the id. */
 export function padName(projectSounds: Sound[], pad: DrumPad): string {
   return lookupSound(projectSounds, pad.sound)?.name ?? pad.sound;
+}
+
+// ─── Kit presets ─────────────────────────────────────────────────────────────────────────────
+
+/** A named factory kit. Mirrors `dissonant_core::sound::DrumKit`; the JSON is shared. */
+export interface KitPreset {
+  id: string;
+  name: string;
+  /** Browser grouping: "machines", "hip-hop", "club", … */
+  style: string;
+  blurb: string;
+  /** Top to bottom, like `Track.drumPads`. */
+  pads: DrumPad[];
+}
+
+/**
+ * Every factory kit, in file order. Kits keep the GM pitches (36 kick, 38 snare, 42 / 46 hats,
+ * 49 crash, …), so a song's hits play the matching drum after a swap.
+ */
+export const FACTORY_KITS: KitPreset[] = (kitsJson as { id: string; name: string; style: string; blurb: string; pads: [number, string, number][] }[]).map((k) => ({
+  ...k,
+  pads: k.pads.map(([pitch, sound, choke]) => ({ pitch, sound, choke })),
+}));
+
+/** The factory kit `pads` is, pad for pad and in order; undefined once it's been edited. */
+export function matchingKit(pads: DrumPad[]): KitPreset | undefined {
+  return FACTORY_KITS.find((k) => k.pads.length === pads.length && k.pads.every((p, i) => p.pitch === pads[i].pitch && p.sound === pads[i].sound && p.choke === pads[i].choke));
+}
+
+/** How many of `notes` sit on pitches `pads` has no pad for (they stay, unheard). */
+export function strandedHits(pads: DrumPad[], notes: NoteEvent[]): number {
+  const pitches = new Set(pads.map((p) => p.pitch));
+  return notes.filter((n) => !pitches.has(n.pitch)).length;
+}
+
+/** A one-bar 8th-note taste of a kit, by role: each step tries GM pitches in order. */
+const GROOVE: number[][] = [
+  [36, 35],
+  [42, 44, 70, 69, 54, 75],
+  [38, 39, 40, 37],
+  [42, 44, 70, 69, 54, 75],
+  [36, 35],
+  [36, 35],
+  [38, 39, 40, 37],
+  [46, 54, 73, 42, 44, 70],
+];
+
+/** The pad each step of the preview groove plays; null is a rest where the kit has no such drum. */
+export function kitGroove(pads: DrumPad[]): (DrumPad | null)[] {
+  return GROOVE.map((role) => role.map((pitch) => pads.find((p) => p.pitch === pitch)).find((p) => p) ?? null);
 }

@@ -5,7 +5,7 @@ use crate::audio::{AudioLane, BlockContext};
 use crate::drums::{DrumBank, DrumKit};
 use crate::dsp::{db_to_linear, linear_to_db, pan_gains, Limiter, Reverb, StereoBiquad};
 use crate::effects::NativeEffect;
-use crate::engine::NoteShape;
+use crate::engine::{NoteShape, Slide, VoiceTag};
 use crate::synth::{Bend, PolySynth};
 use dissonant_core::{MasterSettings, SequenceTrack, SynthPatch};
 use dissonant_plugins::PluginAudioUnit;
@@ -67,7 +67,7 @@ impl Instrument {
             // A plugin hears the note's detune — and where its contour starts — as a tuning
             // expression on the note's own id; pan, release and the mod axes have no portable
             // CLAP meaning and stay native-only. A contour that moves is followed by
-            // `Channel::note_on`, which owns the state that takes.
+            // `Channel::note_on_tagged`, which owns the state that takes.
             Instrument::Plugin(p) => {
                 let id = p.note_on(pitch, velocity);
                 let cents = start_cents(shape);
@@ -76,6 +76,31 @@ impl Instrument {
                 }
             }
             Instrument::Silent => {}
+        }
+    }
+
+    /// A sequenced note, released by [`Instrument::note_off_tagged`] with the same tag. Only
+    /// the built-in synth knows about tags and slides: a drum hit is a one-shot, and a plugin
+    /// is addressed by pitch, so a slide note on a plugin track plays as an ordinary note.
+    pub fn note_on_tagged(
+        &mut self,
+        pitch: u8,
+        velocity: u8,
+        shape: NoteShape,
+        tag: VoiceTag,
+        slide: Option<Slide>,
+    ) {
+        match self {
+            Instrument::Synth(s) => s.note_on_tagged(pitch, velocity, shape, tag, slide),
+            other => other.note_on(pitch, velocity, shape),
+        }
+    }
+
+    /// End the sequenced note `tag`, which a plugin knows only as `pitch`.
+    pub fn note_off_tagged(&mut self, pitch: u8, tag: VoiceTag) {
+        match self {
+            Instrument::Synth(s) => s.note_off_tagged(tag),
+            other => other.note_off(pitch),
         }
     }
 
@@ -423,16 +448,23 @@ impl Channel {
         c
     }
 
-    /// Strike a scheduled note. The same as [`Instrument::note_on`] except on a hosted
+    /// Strike a scheduled note. The same as [`Instrument::note_on_tagged`] except on a hosted
     /// instrument, where a note whose pitch moves is also followed so its contour reaches the
     /// plugin as tuning expressions while it sounds.
-    pub(crate) fn note_on(&mut self, pitch: u8, velocity: u8, shape: NoteShape) {
+    pub(crate) fn note_on_tagged(
+        &mut self,
+        pitch: u8,
+        velocity: u8,
+        shape: NoteShape,
+        tag: VoiceTag,
+        slide: Option<Slide>,
+    ) {
         match &mut self.instrument {
             Instrument::Plugin(p) if shape.bend.active() => {
                 let id = p.note_on(pitch, velocity);
                 self.bends.follow(p, id, pitch, shape);
             }
-            instrument => instrument.note_on(pitch, velocity, shape),
+            instrument => instrument.note_on_tagged(pitch, velocity, shape, tag, slide),
         }
     }
 

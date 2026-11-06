@@ -404,7 +404,7 @@ fn embedded_sounds_and_custom_drum_pads_round_trip() {
     let drums = model.tracks.iter().position(|t| t.is_drum).unwrap();
     let lead = SynthPatch {
         level: 0.5,
-        mono: true,
+        voice: VoiceMode::Legato,
         glide: 0.25,
         ..SynthPatch::default()
     };
@@ -453,6 +453,34 @@ fn embedded_sounds_and_custom_drum_pads_round_trip() {
     // And the copy in the file is what plays, on a machine whose library has never seen it.
     assert_eq!(decoded.resolve_synth("u-lead"), lead);
     assert_eq!(decoded.resolve_drum("u-boom"), boom);
+}
+
+/// Before voice modes a patch said `"mono": true`. An embedded copy in an old project opens as
+/// Legato (one connected voice, no automatic glide) and is saved back with `voice` only.
+#[test]
+fn an_embedded_mono_patch_opens_as_legato() {
+    let json = r#"{
+      "schemaVersion": 10,
+      "tracks": [
+        { "id": "11111111-1111-1111-1111-111111111111", "name": "bass", "voice": "u-bass" },
+        { "id": "22222222-2222-2222-2222-222222222222", "name": "keys", "voice": "u-keys" }
+      ],
+      "sounds": [
+        { "id": "u-bass", "name": "bass", "category": "bass",
+          "patch": { "kind": "synth", "mono": true, "glide": 0.05 } },
+        { "id": "u-keys", "name": "keys", "category": "keys",
+          "patch": { "kind": "synth", "mono": false } }
+      ]
+    }"#;
+    let m = ProjectModel::from_json(json).unwrap();
+    let bass = m.resolve_synth("u-bass");
+    assert_eq!(bass.voice, VoiceMode::Legato);
+    assert_eq!(bass.glide, 0.05, "glide stays, as the default slide time");
+    assert_eq!(bass.legacy_mono, None, "the legacy key is folded away");
+    assert_eq!(m.resolve_synth("u-keys").voice, VoiceMode::Poly);
+    let saved = m.to_json().unwrap();
+    assert!(!saved.contains("\"mono\""), "the legacy key is never written back");
+    assert!(saved.contains("\"voice\": \"legato\""));
 }
 
 #[test]
@@ -1392,4 +1420,70 @@ fn loading_tidies_automation_and_drops_orphaned_lanes() {
         shape,
         vec![(0, 0.25, Curve::Step), (16 * BEAT, 0.6, Curve::Ramp)]
     );
+}
+
+/// A rope and its slide time survive a save, and a project with no ropes writes no rope keys,
+/// so files from before ropes existed are byte-for-byte what this version writes back.
+#[test]
+fn ropes_round_trip_and_are_absent_when_unset() {
+    let mut model = ProjectModel::starter();
+    let plain = model.to_json().unwrap();
+    assert!(!plain.contains("slideFrom") && !plain.contains("slideSecs"), "{plain}");
+
+    let a = NoteEvent::new(0, BEAT, 60);
+    let mut b = NoteEvent::new(BEAT, BEAT, 67);
+    b.slide_from = Some(a.id);
+    b.slide_secs = Some(0.25);
+    let mut c = NoteEvent::new(2 * BEAT, BEAT, 64);
+    c.slide_from = Some(b.id);
+    model.patterns[0].notes = vec![a.clone(), b.clone(), c.clone()];
+
+    let json = model.to_json().unwrap();
+    assert!(json.contains(&format!("\"slideFrom\": \"{}\"", a.id)), "{json}");
+    assert!(json.contains("\"slideSecs\": 0.25"), "{json}");
+    // `c` uses the patch's glide, so only one note writes a time.
+    assert_eq!(json.matches("slideSecs").count(), 1);
+    let decoded = ProjectModel::from_json(&json).unwrap();
+    assert_eq!(decoded, model);
+    assert_eq!(decoded.patterns[0].notes[2].slide_from, Some(b.id));
+    assert_eq!(decoded.patterns[0].notes[2].slide_secs, None);
+}
+
+/// A hand-edited file can name a source that isn't there, loop, or ask for a silly time: the
+/// load keeps what makes sense and cuts the rest.
+#[test]
+fn loading_cuts_bad_ropes_and_clamps_slide_times() {
+    let track = "11111111-1111-1111-1111-111111111111";
+    let (a, b, c, d) = (
+        "a0000000-0000-4000-8000-000000000000",
+        "b0000000-0000-4000-8000-000000000000",
+        "c0000000-0000-4000-8000-000000000000",
+        "d0000000-0000-4000-8000-000000000000",
+    );
+    let gone = "e0000000-0000-4000-8000-000000000000";
+    let json = format!(
+        r#"{{
+          "schemaVersion": {SCHEMA_VERSION},
+          "tracks": [ {{ "id": "{track}", "name": "lead" }} ],
+          "patterns": [ {{
+            "id": "22222222-2222-2222-2222-222222222222", "trackId": "{track}", "name": "p",
+            "notes": [
+              {{ "id": "{a}", "startTick": 0, "lengthTicks": 960, "pitch": 60, "slideFrom": "{b}" }},
+              {{ "id": "{b}", "startTick": 960, "lengthTicks": 960, "pitch": 62, "slideFrom": "{a}", "slideSecs": 9.0 }},
+              {{ "id": "{c}", "startTick": 1920, "lengthTicks": 960, "pitch": 64, "slideFrom": "{gone}", "slideSecs": 0.5 }},
+              {{ "id": "{d}", "startTick": 2880, "lengthTicks": 960, "pitch": 65, "slideSecs": -1.0 }}
+            ]
+          }} ]
+        }}"#
+    );
+    let decoded = ProjectModel::from_json(&json).unwrap();
+    let notes = &decoded.patterns[0].notes;
+    let by = |id: &str| notes.iter().find(|n| n.id.to_string() == id).unwrap();
+    // The loop is cut at its earliest note; the later one keeps its rope and its time, clamped.
+    assert_eq!(by(a).slide_from, None);
+    assert_eq!(by(b).slide_from, Some(by(a).id));
+    assert_eq!(by(b).slide_secs, Some(MAX_SLIDE_SECS));
+    // A missing source takes the rope's time with it, and a time with no rope means nothing.
+    assert_eq!((by(c).slide_from, by(c).slide_secs), (None, None));
+    assert_eq!(by(d).slide_secs, None);
 }

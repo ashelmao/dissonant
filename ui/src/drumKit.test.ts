@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { addPad, gmPitchesFor, kitSounds, movePad, nextFreePitch, padName, pitchProblem, removePad, replacePad } from "./drumKit";
-import { DEFAULT_DRUM_PATCH, defaultKit, factorySound, MAX_DRUM_PADS, type DrumPad, type Sound } from "./sound";
+import { addPad, FACTORY_KITS, gmPitchesFor, kitGroove, kitSounds, matchingKit, movePad, nextFreePitch, padName, pitchProblem, removePad, replacePad, strandedHits } from "./drumKit";
+import { DEFAULT_DRUM_PATCH, defaultKit, factorySound, MAX_DRUM_PADS, validKit, type DrumPad, type Sound } from "./sound";
+import type { NoteEvent } from "./types";
 
 const userDrum = (id: string, name = id): Sound => ({ id, name, category: "mine", patch: { kind: "drum", ...DEFAULT_DRUM_PATCH } });
 const pad = (pitch: number, sound = "kick", choke = 0): DrumPad => ({ pitch, sound, choke });
@@ -128,5 +129,42 @@ describe("padName", () => {
     expect(padName([], pad(36, "kick"))).toBe("kick");
     expect(padName([userDrum("u-x", "big boom")], pad(36, "u-x"))).toBe("big boom");
     expect(padName([], pad(36, "u-missing"))).toBe("u-missing");
+  });
+});
+
+describe("factory kits", () => {
+  it("load from the shared JSON as valid kits of factory drums", () => {
+    expect(FACTORY_KITS.length).toBeGreaterThanOrEqual(36);
+    for (const k of FACTORY_KITS) {
+      expect(validKit(k.pads), k.id).toBe(true);
+      for (const p of k.pads) expect(factorySound(p.sound)?.patch.kind, `${k.id}: ${p.sound}`).toBe("drum");
+    }
+  });
+  it("recognise an untouched kit, and stop once a pad changes", () => {
+    expect(matchingKit(defaultKit())?.id).toBe("starter");
+    const k808 = FACTORY_KITS.find((k) => k.id === "808")!;
+    expect(matchingKit(k808.pads.map((p) => ({ ...p })))?.id).toBe("808");
+    expect(matchingKit(replacePad(k808.pads, 0, { sound: "crash" })!)).toBeUndefined();
+    expect(matchingKit(movePad(k808.pads, 0, 1)!)).toBeUndefined();
+  });
+});
+
+describe("strandedHits", () => {
+  const hit = (pitch: number) => ({ pitch }) as NoteEvent;
+  it("counts the hits on pitches the kit has no pad for", () => {
+    expect(strandedHits(defaultKit(), [hit(36), hit(38), hit(42)])).toBe(0);
+    expect(strandedHits(defaultKit(), [hit(36), hit(56), hit(56), hit(75)])).toBe(3);
+    expect(strandedHits(defaultKit(), [])).toBe(0);
+  });
+});
+
+describe("kitGroove", () => {
+  it("plays kick, hat, snare by GM pitch", () => {
+    expect(kitGroove(defaultKit()).map((p) => p?.sound)).toEqual(["kick", "hat", "snare", "hat", "kick", "kick", "snare", "open-hat"]);
+  });
+  it("falls back to whatever fills the role, and rests where nothing does", () => {
+    const kit = [pad(36, "taiko"), pad(39, "snap"), pad(70, "shaker")];
+    expect(kitGroove(kit).map((p) => p?.sound)).toEqual(["taiko", "shaker", "snap", "shaker", "taiko", "taiko", "snap", "shaker"]);
+    expect(kitGroove([pad(38, "snare")]).map((p) => p?.sound ?? null)).toEqual([null, null, "snare", null, null, null, "snare", null]);
   });
 });
