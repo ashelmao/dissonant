@@ -1,3 +1,5 @@
+import { reportCursor } from "../collab";
+import { PeerCursors } from "./PeerCursors";
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { barTicks, beatsPerBar, dbText, useStore } from "../store";
 import type { DrumPad } from "../sound";
@@ -147,6 +149,24 @@ export function Arrangement() {
       if (y < bottom) return i;
     }
     return model.tracks.length;
+  };
+
+  /** Lane-space y of a track's row, or null for a track that isn't here. */
+  const trackTop = (trackId: string) => {
+    let top = 0;
+    for (const t of model.tracks) {
+      if (t.id === trackId) return top;
+      top += ROW_H + (t.id === autoShown?.trackId ? AUTO_H : 0);
+    }
+    return null;
+  };
+
+  /** Tell everyone where the pointer is, in terms that mean the same at their zoom. */
+  const reportSongCursor = (e: React.PointerEvent) => {
+    const p = lanePoint(e);
+    const track = model.tracks[trackAtY(p.y)];
+    const top = track ? trackTop(track.id) : null;
+    reportCursor(!track || top === null || p.x < 0 ? null : { tick: p.x / pxPerTick, trackId: track.id, lane: Math.min(1, (p.y - top) / ROW_H) });
   };
 
   // ── Drop target for patterns dragged out of the tree ───────────────────────────────────
@@ -845,7 +865,27 @@ export function Arrangement() {
 
         <TempoLane headW={HEAD_W} timelineW={timelineW} pxPerBeat={pxPerBeat} bpb={bpb} />
 
-        <div className="lanes" ref={lanesRef} onPointerMove={onPointerMove} onPointerUp={onPointerUp} onPointerCancel={onPointerCancel}>
+        <div
+          className="lanes"
+          ref={lanesRef}
+          style={{ position: "relative" }}
+          onPointerMove={(e) => {
+            reportSongCursor(e);
+            onPointerMove(e);
+          }}
+          onPointerLeave={() => reportCursor(null)}
+          onPointerUp={onPointerUp}
+          onPointerCancel={onPointerCancel}
+        >
+          <PeerCursors
+            pick={(l) => (l.screen === "song" ? l.cursor : undefined)}
+            place={(c) => {
+              const top = trackTop(c.trackId);
+              return top === null ? null : { x: HEAD_W + c.tick * pxPerTick, y: top + c.lane * ROW_H };
+            }}
+            scroller={scrollerRef}
+            inset={{ left: HEAD_W }}
+          />
           {model.tracks.map((track, ti) => {
             const color = trackColor(track, ti);
             const own = (c: Clip) => trackOfPattern.get(c.patternId) === track.id;
@@ -879,7 +919,7 @@ export function Arrangement() {
                         return (
                           <div
                             key={c.id}
-                            className={`clip audio${c.muted ? " muted" : ""}`}
+                            className={`clip audio${c.muted ? " muted" : ""}${s.snapshot?.missingAudio?.includes(c.sourceId) ? " missing" : ""}`}
                             style={{ left: c.startTick * pxPerTick, width: w, height: CLIP_H, borderColor: color }}
                             title={`${source?.name ?? "missing audio"} · ${c.lengthSeconds.toFixed(1)}s — drag a top corner to fade · double-click to open it on the rec page`}
                             onDoubleClick={() => (s.selectTrack(track.id), s.selectAudioClip(c.id), s.setScreen("rec"))}

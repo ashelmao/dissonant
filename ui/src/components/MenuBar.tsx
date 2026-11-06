@@ -3,6 +3,7 @@ import { selectedPattern, selectedTrack, useStore } from "../store";
 import { fileNameOf, TICKS_PER_BEAT } from "../types";
 import { duplicateBySpan, glueNotes, moveNotes, splitNotes, toggleMute } from "../noteEditing";
 import { keys } from "../platform";
+import { PresenceBar } from "./PresenceBar";
 
 type Item = { label: string; sc?: string; sub?: string; action?: () => void; disabled?: boolean; sep?: false } | { sep: true };
 
@@ -42,6 +43,8 @@ export function MenuBar() {
       { label: "New project", sc: `${mod}N`, action: () => s.newProject() },
       { label: "New from a vibe or template…", action: () => s.openNewProject(true) },
       { label: "Save as template…", action: () => s.saveAsTemplate() },
+      { sep: true },
+      { label: s.session.role === "solo" ? "Share or join a session…" : "Session…", action: () => s.openShare(true) },
       { sep: true },
       { label: "Open…", sc: `${mod}O`, action: () => s.openProject() },
       ...recentItems,
@@ -176,6 +179,7 @@ export function MenuBar() {
       ))}
       <span className="spacer" />
       <div className="meta">
+        <PresenceBar />
         <span style={{ color: "var(--text-2)" }}>
           {fileName}
           {snapshot.dirty ? " •" : ""}

@@ -1,6 +1,7 @@
 import { useMemo } from "react";
 import { create } from "zustand";
 import { getBridge } from "./bridge";
+import { forgetPresence, receivePresence, reportView, setPresenceSender, SOLO, type PeerLocation, type SessionState } from "./collab";
 import { detectionSummary } from "./detection";
 import type {
   AmpRig,
@@ -95,6 +96,16 @@ export type PatternDropHandler = (patternId: string, clientX: number, clientY: n
 
 interface State {
   snapshot: Snapshot | null;
+  /** The shared session this project is in. */
+  session: SessionState;
+  shareOpen: boolean;
+  openShare(open: boolean): void;
+  startSharing(name: string, color: string): Promise<void>;
+  stopSharing(): Promise<void>;
+  resetInvite(): Promise<void>;
+  removePeer(peer: string): Promise<void>;
+  joinSession(code: string, name: string, color: string): Promise<void>;
+  leaveSession(): Promise<void>;
   /** Invariant: the selected pattern (if any) belongs to the selected track. */
   selectedTrackId: string | null;
   selectedPatternId: string | null;
@@ -591,7 +602,50 @@ export const useStore = create<State>((set, get) => {
     return found ? found.name : "insert";
   };
 
+  /** Whether the person ever got the project in this session, to word how it ended. */
+  let sessionHadProject = false;
+  /** The end of this session has been dealt with. Set up again by starting or joining one. */
+  let sessionEndSeen = false;
+
+  const applySession = (session: SessionState) => {
+    const was = get().session;
+    if (session.live || session.reconnecting) sessionHadProject = true;
+    set({ session });
+    forgetPresence(session.peers.map((p) => p.id));
+    // Back from a session with the same project open: the first time through, a guest's
+    // window has never been told where it is.
+    if (session.role !== "solo" && was.role === "solo") {
+      void getBridge().then((b) => setPresenceSender((location) => b.sendPresence(location)));
+      reportView(viewOf());
+    } else if (session.role === "solo" && was.role !== "solo") {
+      setPresenceSender(null);
+    }
+    if (session.role === "guest" && session.live && !was.live && was.role === "guest") {
+      set({ shareOpen: false });
+      get().showToast("you're in. edits go to everyone, and playing is just for you.");
+    }
+  };
+
+  const inSession = () => {
+    if (get().session.role === "solo") return false;
+    get().showToast("end the session first: this would replace the project for everyone in it.", true);
+    return true;
+  };
+
+  /** Where this person is, for everyone else's presence bar and cursors. */
+  const viewOf = (): PeerLocation => {
+    const { screen, selectedPatternId } = get();
+    if (screen === "pattern") return selectedPatternId ? { screen, patternId: selectedPatternId } : { screen: "setup" };
+    return { screen };
+  };
+
+  /** The revision the gesture in progress started from. See `dispatch`. */
+  let editBase: number | null = null;
+
   const applySnapshot = (snapshot: Snapshot) => {
+    // An edit's answer can be overtaken by a newer update from somebody else.
+    const shown = get().snapshot?.revision;
+    if (shown !== undefined && snapshot.revision !== undefined && snapshot.revision < shown) return;
     const m = snapshot.model;
     const { selectedTrackId, selectedPatternId, selectedClipIds, ghostPatternId } = get();
     // Opening, undoing and the brace drag itself all arrive as snapshots, so the engine is
@@ -675,6 +729,51 @@ export const useStore = create<State>((set, get) => {
 
   return {
     snapshot: null,
+    session: SOLO,
+    shareOpen: false,
+    openShare(open) {
+      set({ shareOpen: open });
+    },
+    async startSharing(name, color) {
+      const b = await getBridge();
+      sessionEndSeen = false;
+      try {
+        applySession(await b.shareStart(name, color));
+      } catch (e) {
+        get().showToast(String(e), true);
+      }
+    },
+    async stopSharing() {
+      const b = await getBridge();
+      applySession(await b.shareStop());
+      set({ shareOpen: false });
+    },
+    async resetInvite() {
+      const b = await getBridge();
+      applySession(await b.shareResetLink());
+    },
+    async removePeer(peer) {
+      const b = await getBridge();
+      await b.removePeer(peer);
+    },
+    async joinSession(code, name, color) {
+      const b = await getBridge();
+      if (!(await get().confirmDiscard("joining a session"))) return;
+      sessionHadProject = false;
+      sessionEndSeen = false;
+      try {
+        applySession(await b.joinSession(code, name, color));
+      } catch (e) {
+        get().showToast(String(e), true);
+      }
+    },
+    async leaveSession() {
+      const b = await getBridge();
+      applySnapshot(await b.leaveSession());
+      applySession(await b.getSession());
+      set({ shareOpen: false });
+      get().showToast("left the session. what you were looking at is still open here: save it to keep it.");
+    },
     library: [],
     selectedTrackId: null,
     selectedPatternId: null,
@@ -776,6 +875,28 @@ export const useStore = create<State>((set, get) => {
         }),
       );
       b.onDocument((snap) => applySnapshot(snap));
+      b.onSession(applySession);
+      useStore.subscribe((now, was) => {
+        if (now.screen !== was.screen || now.selectedPatternId !== was.selectedPatternId) reportView(viewOf());
+      });
+      b.onPeerPresence(receivePresence);
+      b.onSessionEnded((reason) => {
+        if (sessionEndSeen) return;
+        sessionEndSeen = true;
+        void b.getSession().then(applySession);
+        set({ shareOpen: false });
+        void get().ask({
+          title: sessionHadProject ? "the session ended" : "couldn't join",
+          message: sessionHadProject ? `${reason} what you were looking at is still open here as an untitled project: save it to keep it.` : reason,
+          buttons: [{ label: "ok", value: "ok", kind: "primary" }],
+        });
+      });
+      // A snapshot's revision says what an edit was built from. A drag is built from what it
+      // started on, however long it takes, so the revision is held from press to release. This
+      // listener runs before any editor's, and releasing is put off until they have all run.
+      window.addEventListener("pointerdown", () => (editBase = get().snapshot?.revision ?? null), true);
+      window.addEventListener("pointerup", () => setTimeout(() => (editBase = null), 0), true);
+      window.addEventListener("pointercancel", () => setTimeout(() => (editBase = null), 0), true);
       b.onMidiActivity(() => set({ midiActivityAt: performance.now() }));
       // Something the player needs to know about and did not ask for: a note the recorder
       // could not place, say. Shown as a warning, because it is one.
@@ -834,9 +955,11 @@ export const useStore = create<State>((set, get) => {
     },
 
     async dispatch(command, transient = false, label) {
+      // Read before anything is awaited: this is the edit's own moment.
+      const base = editBase ?? get().snapshot?.revision;
       const b = await getBridge();
       try {
-        applySnapshot(await b.apply(command, transient, label));
+        applySnapshot(await b.apply(command, transient, label, base));
       } catch (e) {
         get().showToast(String(e), true);
       }
@@ -1141,6 +1264,7 @@ export const useStore = create<State>((set, get) => {
     },
 
     async newProject() {
+      if (inSession()) return;
       const b = await getBridge();
       if (!(await get().confirmDiscard("creating a new project"))) return;
       // No explicit choice: the backend follows the "new project opens" setting.
@@ -1148,6 +1272,7 @@ export const useStore = create<State>((set, get) => {
     },
 
     async openProject() {
+      if (inSession()) return;
       const b = await getBridge();
       if (!(await get().confirmDiscard("opening another project"))) return;
       const path = await b.pickOpenPath();
@@ -1163,6 +1288,7 @@ export const useStore = create<State>((set, get) => {
     },
 
     async openPath(path) {
+      if (inSession()) return;
       const b = await getBridge();
       if (path === get().snapshot?.path && !get().snapshot?.dirty) return;
       if (!(await get().confirmDiscard(`opening “${fileNameOf(path)}”`)))
@@ -1297,6 +1423,7 @@ export const useStore = create<State>((set, get) => {
       }
     },
     async newFromVibe(id) {
+      if (inSession()) return;
       const b = await getBridge();
       if (!(await get().confirmDiscard("creating a new project"))) return;
       set({ newProjectOpen: false, newProjectAtLaunch: false });
@@ -1351,6 +1478,7 @@ export const useStore = create<State>((set, get) => {
       void get().refreshTemplates();
     },
     async newFromTemplate(name) {
+      if (inSession()) return;
       const b = await getBridge();
       // At launch the open project already is a fresh starter: picking it just gets to work.
       const snap0 = get().snapshot;
@@ -1434,6 +1562,20 @@ export const useStore = create<State>((set, get) => {
     async requestClose() {
       const b = await getBridge();
       const snap = get().snapshot;
+      const { role, peers } = get().session;
+      if (role === "host" && peers.length > 1) {
+        const others = peers.length - 1;
+        const go = await get().ask({
+          title: "end the session?",
+          message: `closing ends the session for ${others} ${others === 1 ? "person" : "people"}. they keep a copy of what they can see.`,
+          buttons: [
+            { label: "end it and close", value: "go", kind: "danger" },
+            { label: "cancel", value: "cancel", kind: "quiet" },
+          ],
+          cancelValue: "cancel",
+        });
+        if (go !== "go") return;
+      }
       if (!snap?.dirty) return b.quit();
       const v = await get().ask({
         title: "Save before closing?",

@@ -2,6 +2,7 @@
 // browser (`pnpm --dir ui dev`) it runs an in-memory mock so the interface can be designed and
 // exercised without audio. Keep the mock's command semantics aligned with dissonant-core.
 
+import { SOLO, type PeerLocation, type PeerPresence, type SessionState } from "./collab";
 import type {
   AmpRig,
   AudioClip,
@@ -96,7 +97,20 @@ export interface Bridge {
     command: Command,
     transient?: boolean,
     label?: string,
+    baseRevision?: number,
   ): Promise<Snapshot>;
+  shareStart(name: string, color: string): Promise<SessionState>;
+  shareStop(): Promise<SessionState>;
+  shareResetLink(): Promise<SessionState>;
+  removePeer(peer: string): Promise<void>;
+  joinSession(code: string, name: string, color: string): Promise<SessionState>;
+  leaveSession(): Promise<Snapshot>;
+  getSession(): Promise<SessionState>;
+  sendPresence(location: PeerLocation): void;
+  onSession(cb: (s: SessionState) => void): () => void;
+  onPeerPresence(cb: (p: PeerPresence) => void): () => void;
+  /** The session ended from the far side; the reason is for the person. */
+  onSessionEnded(cb: (reason: string) => void): () => void;
   commitGesture(): Promise<Snapshot>;
   undo(): Promise<Snapshot>;
   redo(): Promise<Snapshot>;
@@ -342,8 +356,19 @@ async function tauriBridge(): Promise<Bridge> {
   return {
     isTauri: true,
     getState: () => invoke<Snapshot>("get_state"),
-    apply: (command, transient = false, label) =>
-      invoke<Snapshot>("apply", { command, transient, label: label ?? null }),
+    apply: (command, transient = false, label, baseRevision) =>
+      invoke<Snapshot>("apply", { command, transient, label: label ?? null, baseRevision: baseRevision ?? null }),
+    shareStart: (name, color) => invoke<SessionState>("share_start", { name, color }),
+    shareStop: () => invoke<SessionState>("share_stop"),
+    shareResetLink: () => invoke<SessionState>("share_reset_link"),
+    removePeer: (peer) => invoke<void>("remove_peer", { peer }),
+    joinSession: (code, name, color) => invoke<SessionState>("join_session", { code, name, color }),
+    leaveSession: () => invoke<Snapshot>("leave_session"),
+    getSession: () => invoke<SessionState>("get_session"),
+    sendPresence: (location) => void invoke("send_presence", { location }),
+    onSession: (cb) => subscribe<SessionState>("session", cb),
+    onPeerPresence: (cb) => subscribe<PeerPresence>("peer-presence", cb),
+    onSessionEnded: (cb) => subscribe<string>("session-ended", cb),
     commitGesture: () => invoke<Snapshot>("commit_gesture"),
     undo: () => invoke<Snapshot>("undo"),
     redo: () => invoke<Snapshot>("redo"),
@@ -3313,10 +3338,97 @@ function mockBridge(): Bridge {
     return fresh;
   };
 
+  // A pretend session for working on the UI in a browser: one person who wanders around whatever
+  // you are looking at and now and then writes a note. Nothing like it runs in the real app.
+  const sessionListeners = new Set<(s: SessionState) => void>();
+  const presenceListeners = new Set<(p: PeerPresence) => void>();
+  const endedListeners = new Set<(reason: string) => void>();
+  let session: SessionState = SOLO;
+  let fakePeer: ReturnType<typeof setInterval> | null = null;
+  let youAre: PeerLocation = { screen: "setup" };
+  const setSession = (next: SessionState) => {
+    session = next;
+    for (const cb of sessionListeners) cb(next);
+    return next;
+  };
+  const startFakePeer = (host: boolean) => {
+    const id = "fake-peer";
+    let t = 0;
+    fakePeer = setInterval(() => {
+      t += 1;
+      const wave = (period: number) => (Math.sin(t / period) + 1) / 2;
+      let location: PeerLocation = youAre;
+      if (youAre.screen === "pattern") {
+        location = { screen: "pattern", patternId: youAre.patternId, cursor: { tick: wave(40) * 3840, pitch: 60 + Math.round(wave(23) * 12), frac: 0.5 } };
+      } else if (youAre.screen === "song") {
+        location = { screen: "song", cursor: { tick: wave(40) * 30000, trackId: model.tracks[0].id, lane: wave(23) } };
+      }
+      for (const cb of presenceListeners) cb({ peer: id, location });
+      if (youAre.screen === "pattern" && t % 150 === 0) {
+        const p = model.patterns.find((x) => youAre.screen === "pattern" && x.id === youAre.patternId);
+        if (p) {
+          const notes = [...p.notes, { id: uuid(), startTick: Math.round(wave(40) * 3840), lengthTicks: 240, pitch: 60 + Math.round(wave(23) * 12), velocity: 100 }];
+          void applyCommand({ type: "setNotes", patternId: p.id, notes }).then((s) => {
+            for (const cb of docListeners) cb(s);
+          });
+        }
+      }
+    }, 33);
+    const peer = { id, name: "robin", color: "#f0a6ca", isHost: !host };
+    return peer;
+  };
+  const endFakePeer = () => {
+    if (fakePeer !== null) clearInterval(fakePeer);
+    fakePeer = null;
+  };
+
   return {
     isTauri: false,
     getState: async () => snapshot(),
     apply: applyCommand,
+    shareStart: async (name, color) => {
+      const you = { id: "you", name, color, isHost: true };
+      setSession({ ...SOLO, role: "host", live: true, you: you.id, code: "dissonant-pretendinvitecode", peers: [you] });
+      setTimeout(() => setSession({ ...session, peers: [you, startFakePeer(true)] }), 600);
+      return session;
+    },
+    shareStop: async () => {
+      endFakePeer();
+      return setSession(SOLO);
+    },
+    shareResetLink: async () => setSession({ ...session, code: `dissonant-pretendinvitecode${Date.now()}` }),
+    removePeer: async () => {
+      endFakePeer();
+      setSession({ ...session, peers: session.peers.filter((p) => p.id !== "fake-peer") });
+    },
+    joinSession: async (code, name, color) => {
+      if (!code.startsWith("dissonant-")) throw new Error("that doesn't look like a dissonant invite.");
+      const you = { id: "you", name, color, isHost: false };
+      setSession({ ...SOLO, role: "guest", you: you.id, peers: [] });
+      setTimeout(() => setSession({ ...session, live: true, path: "direct", peers: [startFakePeer(false), you] }), 600);
+      return session;
+    },
+    leaveSession: async () => {
+      endFakePeer();
+      setSession(SOLO);
+      return snapshot();
+    },
+    getSession: async () => session,
+    sendPresence: (location) => {
+      youAre = location;
+    },
+    onSession: (cb) => {
+      sessionListeners.add(cb);
+      return () => sessionListeners.delete(cb);
+    },
+    onPeerPresence: (cb) => {
+      presenceListeners.add(cb);
+      return () => presenceListeners.delete(cb);
+    },
+    onSessionEnded: (cb) => {
+      endedListeners.add(cb);
+      return () => endedListeners.delete(cb);
+    },
     commitGesture: async () => {
       commitGesture();
       return snapshot();

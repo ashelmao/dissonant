@@ -3,6 +3,7 @@
 //! undo/redo in one place and re-feeds the engine a fresh [`Sequence`] after every change.
 
 pub mod audio_files;
+pub mod collab;
 pub mod library;
 pub mod plugins;
 pub mod recording;
@@ -96,6 +97,8 @@ struct Recorder {
 
 pub struct AppState {
     doc: Mutex<Document>,
+    /// The shared session this project is in, if any.
+    collab: collab::Collab,
     audio: Mutex<Option<AudioDevice>>,
     audio_error: Mutex<Option<String>>,
     playback: Mutex<PlaybackContext>,
@@ -153,6 +156,11 @@ pub struct AppState {
 #[serde(rename_all = "camelCase")]
 pub struct Snapshot {
     pub model: ProjectModel,
+    /// Goes up with every change. The UI sends back the one it built an edit from.
+    pub revision: u64,
+    /// Sources the project uses that aren't on this machine, because they were recorded on
+    /// someone else's in a session.
+    pub missing_audio: Vec<Uuid>,
     pub can_undo: bool,
     pub can_redo: bool,
     pub dirty: bool,
@@ -311,6 +319,7 @@ impl AppState {
             input: Mutex::new(None),
             input_error: Mutex::new(None),
             takes: Mutex::new(None),
+            collab: collab::Collab::default(),
             audio_cache: Mutex::new(HashMap::new()),
             peak_cache: Mutex::new(HashMap::new()),
             armed_audio: Mutex::new((None, false)),
@@ -365,11 +374,18 @@ impl AppState {
 
     pub fn snapshot(&self) -> Snapshot {
         let doc = self.doc.lock().unwrap();
+        let missing_audio = {
+            let cache = self.audio_cache.lock().unwrap();
+            doc.model().audio_sources.iter().map(|s| s.id).filter(|id| !cache.contains_key(id)).collect()
+        };
         Snapshot {
             model: doc.model().clone(),
+            revision: doc.revision(),
+            missing_audio,
             can_undo: doc.can_undo(),
             can_redo: doc.can_redo(),
-            dirty: doc.is_dirty(),
+            // A guest has nothing of its own to lose while the host holds the project.
+            dirty: doc.is_dirty() && !self.collab.is_guest(),
             path: doc.path.as_ref().map(|p| p.display().to_string()),
             undo_label: doc.undo_label().map(str::to_string),
             redo_label: doc.redo_label().map(str::to_string),
@@ -564,6 +580,10 @@ impl AppState {
 
     /// Write an autosave if the document changed since the last one. Returns the path written.
     fn autosave(&self) -> Option<PathBuf> {
+        // The project is the host's to keep safe.
+        if self.collab.is_guest() {
+            return None;
+        }
         let (json, path, revision) = {
             let doc = self.doc.lock().unwrap();
             if !doc.is_dirty() || doc.revision() == self.autosaved_revision.load(Ordering::Relaxed) {
@@ -669,6 +689,11 @@ impl AppState {
                 doc.replace(model, path);
             }
         }
+        self.reset_engine_to_document();
+    }
+
+    /// Point the engine at a document that was just replaced wholesale.
+    fn reset_engine_to_document(&self) {
         {
             let mut ctx = self.playback.lock().unwrap();
             ctx.pattern_id = None;
@@ -1045,7 +1070,13 @@ fn get_state(state: State<'_, AppState>) -> Snapshot {
 }
 
 #[tauri::command]
-fn apply(state: State<'_, AppState>, command: Command, transient: Option<bool>, label: Option<String>) -> Result<Snapshot, String> {
+fn apply(
+    state: State<'_, AppState>,
+    command: Command,
+    transient: Option<bool>,
+    label: Option<String>,
+    base_revision: Option<u64>,
+) -> Result<Snapshot, String> {
     // Only `AddAudioTake` can introduce a source; everything else leaves the pool alone, and
     // re-reading the store on every knob drag would be absurd.
     let touches_audio = matches!(command, Command::AddAudioTake { .. });
@@ -1060,12 +1091,7 @@ fn apply(state: State<'_, AppState>, command: Command, transient: Option<bool>, 
             | Command::SetInsertParam { .. }
             | Command::DeleteTrack { .. }
     );
-    state
-        .doc
-        .lock()
-        .unwrap()
-        .apply_labeled(command, transient.unwrap_or(false), label)
-        .map_err(|e| e.to_string())?;
+    state.submit(command, transient.unwrap_or(false), label, base_revision)?;
     state.sync_engine();
     if touches_audio {
         state.sync_audio_pool();
@@ -1082,9 +1108,17 @@ fn commit_gesture(state: State<'_, AppState>) -> Snapshot {
     state.snapshot()
 }
 
+/// In a session an undo can run into somebody else's work, and doing nothing without a word
+/// looks like a broken key.
+fn step_outcome(app: &AppHandle, outcome: dissonant_core::StepOutcome) {
+    if outcome == dissonant_core::StepOutcome::Blocked {
+        let _ = app.emit("notice", "somebody else has built on that, so it can't be taken back");
+    }
+}
+
 #[tauri::command]
-fn undo(state: State<'_, AppState>) -> Snapshot {
-    state.doc.lock().unwrap().undo();
+fn undo(app: AppHandle, state: State<'_, AppState>) -> Snapshot {
+    step_outcome(&app, state.step(true));
     state.sync_engine();
     state.sync_plugins();
     // Undo can bring a take back or take one away, so the pool is re-derived rather than
@@ -1094,8 +1128,8 @@ fn undo(state: State<'_, AppState>) -> Snapshot {
 }
 
 #[tauri::command]
-fn redo(state: State<'_, AppState>) -> Snapshot {
-    state.doc.lock().unwrap().redo();
+fn redo(app: AppHandle, state: State<'_, AppState>) -> Snapshot {
+    step_outcome(&app, state.step(false));
     state.sync_engine();
     state.sync_plugins();
     state.sync_audio_pool();
@@ -1106,6 +1140,9 @@ fn redo(state: State<'_, AppState>) -> Snapshot {
 /// length, starter vs empty). An explicit `starter` overrides the setting.
 #[tauri::command]
 fn new_project(state: State<'_, AppState>, starter: Option<bool>) -> Snapshot {
+    if state.collab.active() {
+        return state.snapshot();
+    }
     let e = state.settings().editing;
     let starter = starter.unwrap_or(e.new_project == NewProjectKind::Starter);
     let bar = bar_ticks(e.default_time_signature);
@@ -1125,6 +1162,7 @@ fn new_project(state: State<'_, AppState>, starter: Option<bool>) -> Snapshot {
 
 #[tauri::command]
 fn open_project(state: State<'_, AppState>, path: String) -> Result<Snapshot, String> {
+    state.refuse_in_session()?;
     let json = std::fs::read_to_string(&path).map_err(|e| format!("could not read {path}: {e}"))?;
     let model = ProjectModel::from_json(&json).map_err(open_error)?;
     let file = PathBuf::from(&path);
@@ -1142,15 +1180,41 @@ fn save_project(state: State<'_, AppState>, path: Option<String>) -> Result<Snap
             doc.path.clone().ok_or_else(|| "no file path yet — use Save As".to_string())?
         }
     };
+    // A guest is keeping a copy, not taking the project over: the session goes on as it was.
+    if state.collab.is_guest() {
+        let json = state.doc.lock().unwrap().model().to_json().map_err(|e| e.to_string())?;
+        write_project_atomically(&target, &json).map_err(|e| format!("could not write {}: {e}", target.display()))?;
+        return Ok(state.snapshot());
+    }
     state.save_to(&target)?;
     Ok(state.snapshot())
 }
 
 // ─── Window, recent files, recovery ─────────────────────────────────────────────────────────
 
+/// Debug builds only: run the JavaScript file at `DISSONANT_DEV_SCRIPT` in the main window. Two
+/// copies of the app can then be driven through a whole session from outside, which is the only
+/// way to test what lies between a click and the other person's screen.
+fn run_dev_script(app: &AppHandle) {
+    #[cfg(debug_assertions)]
+    if let Some(path) = std::env::var_os("DISSONANT_DEV_SCRIPT") {
+        let app = app.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(3));
+            let script = std::fs::read_to_string(path).unwrap_or_default();
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.eval(&script);
+            }
+        });
+    }
+    #[cfg(not(debug_assertions))]
+    let _ = app;
+}
+
 /// Close the app for real (the close handler asks first while the document is dirty).
 #[tauri::command]
 fn quit(app: AppHandle, state: State<'_, AppState>) {
+    state.close_session();
     state.force_close.store(true, Ordering::SeqCst);
     state.clear_autosave();
     app.exit(0);
@@ -1174,6 +1238,7 @@ fn recovery_candidates(state: State<'_, AppState>) -> Vec<RecoveryCandidate> {
 /// Load an autosave as the current (dirty) document, bound to its original path if it had one.
 #[tauri::command]
 fn restore_autosave(state: State<'_, AppState>, autosave_path: String) -> Result<Snapshot, String> {
+    state.refuse_in_session()?;
     let json = std::fs::read_to_string(&autosave_path).map_err(|e| format!("could not read autosave: {e}"))?;
     let file: AutosaveFile = serde_json::from_str(&json).map_err(|e| format!("not an autosave: {e}"))?;
     let model = ProjectModel::from_value(file.model).map_err(open_error)?;
@@ -1437,7 +1502,13 @@ impl Take {
     /// undo step until [`Take::finish`] closes the take. `slot` is the window within which a
     /// repeat of the same pitch counts as a double trigger rather than a second layer.
     pub fn write(&mut self, doc: &mut Document, pattern_id: Uuid, note: NoteEvent, slot: i64) -> bool {
-        let Some(pattern) = doc.model().pattern(&pattern_id) else { return false };
+        let Some(command) = self.plan(doc.model(), pattern_id, note, slot) else { return false };
+        doc.apply_labeled(command, true, Some("record".into())).is_ok()
+    }
+
+    /// The edit that writes `note`, for whoever is going to apply it.
+    pub fn plan(&mut self, model: &ProjectModel, pattern_id: Uuid, note: NoteEvent, slot: i64) -> Option<Command> {
+        let pattern = model.pattern(&pattern_id)?;
         let mut notes = pattern.notes.clone();
         // Only this pass's own notes are swallowed: an earlier pass is another overdub layer.
         notes.retain(|n| {
@@ -1445,7 +1516,7 @@ impl Take {
         });
         self.written.insert(note.id);
         notes.push(note);
-        doc.apply_labeled(Command::SetNotes { pattern_id, notes }, true, Some("record".into())).is_ok()
+        Some(Command::SetNotes { pattern_id, notes })
     }
 
     /// Close the take: what it wrote becomes one undo step, and the next pass starts clean.
@@ -1518,11 +1589,13 @@ impl AppState {
         // played: close enough to be the same key, struck twice.
         let slot = (quantize.unwrap_or(TICKS_PER_BEAT / 32) / 2).max(1);
         let mut rec = self.recorder.lock().unwrap();
-        let mut doc = self.doc.lock().unwrap();
-        if rec.take.write(&mut doc, pattern_id, note, slot) {
-            Recorded::Written
-        } else {
-            Recorded::Nowhere
+        let command = {
+            let doc = self.doc.lock().unwrap();
+            rec.take.plan(doc.model(), pattern_id, note, slot)
+        };
+        match command.map(|c| self.submit(c, true, Some("record".into()), None)) {
+            Some(Ok(())) => Recorded::Written,
+            _ => Recorded::Nowhere,
         }
     }
 
@@ -1963,16 +2036,12 @@ fn import_midi(state: State<'_, AppState>, path: String) -> Result<Snapshot, Str
     let bar = bar_ticks(state.doc.lock().unwrap().model().time_signature);
     let imported = midi_file::import(&bytes, bar).map_err(|e| e.to_string())?;
     let count = imported.tracks.len();
-    state
-        .doc
-        .lock()
-        .unwrap()
-        .apply_labeled(
-            Command::ImportTracks { tracks: imported.tracks, length_ticks: imported.length_ticks },
-            false,
-            Some(format!("import {count} MIDI track{}", if count == 1 { "" } else { "s" })),
-        )
-        .map_err(|e| e.to_string())?;
+    state.submit(
+        Command::ImportTracks { tracks: imported.tracks, length_ticks: imported.length_ticks },
+        false,
+        Some(format!("import {count} MIDI track{}", if count == 1 { "" } else { "s" })),
+        None,
+    )?;
     state.sync_engine();
     Ok(state.snapshot())
 }
@@ -2037,6 +2106,7 @@ fn delete_template(state: State<'_, AppState>, name: String) -> Result<(), Strin
 /// snapshot), but the document gets no path so Save asks where.
 #[tauri::command]
 fn new_from_template(state: State<'_, AppState>, name: String) -> Result<Snapshot, String> {
+    state.refuse_in_session()?;
     let dir = state.templates_dir().ok_or("no app data dir")?;
     let json = std::fs::read_to_string(dir.join(format!("{name}.dissonant"))).map_err(|e| format!("could not read template: {e}"))?;
     let model = ProjectModel::from_json(&json).map_err(open_error)?;
@@ -2079,6 +2149,7 @@ fn list_vibes() -> Vec<dissonant_core::VibeInfo> {
 /// song length setting says.
 #[tauri::command]
 fn new_from_vibe(state: State<'_, AppState>, id: String) -> Result<Snapshot, String> {
+    state.refuse_in_session()?;
     let song_bars = state.settings().editing.default_song_bars.max(1);
     let model = ProjectModel::from_vibe(&id, song_bars).ok_or_else(|| format!("no vibe called {id}"))?;
     state.load_model(model, None, false);
@@ -2259,6 +2330,7 @@ fn set_audio_arm(state: State<'_, AppState>, track_id: Option<Uuid>, monitor: bo
 /// once it is actually playing, so a count-in is excluded without anyone having to subtract it.
 #[tauri::command]
 fn start_audio_record(state: State<'_, AppState>) -> Result<(), String> {
+    state.refuse_guest_audio()?;
     let (armed, _) = *state.armed_audio.lock().unwrap();
     let track_id = armed.ok_or("arm an audio track first")?;
     if !state.doc.lock().unwrap().model().track(&track_id).is_some_and(|t| t.is_audio) {
@@ -2393,16 +2465,7 @@ fn stop_audio_record(state: State<'_, AppState>) -> Result<Snapshot, String> {
     } else {
         Command::AddAudioTake { track_id, source, clip }
     };
-    state
-        .doc
-        .lock()
-        .unwrap()
-        .apply_labeled(
-            command,
-            false,
-            Some(if punched { "punch in".into() } else { "record take".into() }),
-        )
-        .map_err(|e| e.to_string())?;
+    state.submit(command, false, Some(if punched { "punch in".into() } else { "record take".into() }), None)?;
     state.sync_engine();
     state.sync_audio_pool();
     Ok(state.snapshot())
@@ -2421,6 +2484,7 @@ async fn import_audio(
     track_id: Option<Uuid>,
     start_tick: Option<i64>,
 ) -> Result<Snapshot, String> {
+    state.refuse_guest_audio()?;
     if state.importing.swap(true, Ordering::SeqCst) {
         return Err("an import is already running".into());
     }
@@ -2482,12 +2546,7 @@ async fn import_audio_inner(
         Some(id) if state.doc.lock().unwrap().model().track(&id).is_some_and(|t| t.is_audio) => id,
         _ => {
             let stem = source_path_stem(&path);
-            state
-                .doc
-                .lock()
-                .unwrap()
-                .apply_labeled(Command::AddAudioTrack { name: stem }, false, Some("import audio".into()))
-                .map_err(|e| e.to_string())?;
+            state.submit(Command::AddAudioTrack { name: stem }, false, Some("import audio".into()), None)?;
             state
                 .doc
                 .lock()
@@ -2515,16 +2574,7 @@ async fn import_audio_inner(
         channels: audio.channels,
     };
     let clip = dissonant_core::AudioClip::new(track_id, source_id, start_tick.max(0), seconds);
-    state
-        .doc
-        .lock()
-        .unwrap()
-        .apply_labeled(
-            Command::AddAudioTake { track_id, source, clip },
-            false,
-            Some("import audio".into()),
-        )
-        .map_err(|e| e.to_string())?;
+    state.submit(Command::AddAudioTake { track_id, source, clip }, false, Some("import audio".into()), None)?;
     state.sync_engine();
     state.sync_audio_pool();
     Ok(state.snapshot())
@@ -2597,21 +2647,21 @@ async fn detect_audio_clip_inner(state: &State<'_, AppState>, clip_id: Uuid) -> 
 
     let (notes, chords, refused) = (t.notes.len(), t.detection.chords.len(), t.refused);
     let label = if notes > 0 { "detect notes" } else { "detect chords" };
+    let before = state.doc.lock().unwrap().model().tracks.len();
+    state.submit(
+        Command::AddTranscription {
+            name: format!("{} notes", source_path_stem(&source.name)),
+            start_tick,
+            length_ticks: t.length_ticks,
+            notes: t.notes,
+            detection: t.detection,
+        },
+        false,
+        Some(label.into()),
+        None,
+    )?;
     let track_id = {
-        let mut doc = state.doc.lock().unwrap();
-        let before = doc.model().tracks.len();
-        doc.apply_labeled(
-            Command::AddTranscription {
-                name: format!("{} notes", source_path_stem(&source.name)),
-                start_tick,
-                length_ticks: t.length_ticks,
-                notes: t.notes,
-                detection: t.detection,
-            },
-            false,
-            Some(label.into()),
-        )
-        .map_err(|e| e.to_string())?;
+        let doc = state.doc.lock().unwrap();
         let m = doc.model();
         (m.tracks.len() > before).then(|| m.tracks.last().map(|t| t.id)).flatten()
     };
@@ -2706,7 +2756,7 @@ fn set_track_plugin(app: AppHandle, state: State<'_, AppState>, track_id: Uuid, 
         state.plugin_host.close(track_id);
         state.send(EngineCommand::ClearInstrument { track_id });
         state.loaded_plugin_uids.lock().unwrap().remove(&track_id);
-        state.doc.lock().unwrap().apply(Command::SetTrackPlugin { id: track_id, plugin: None }, false).map_err(|e| e.to_string())?;
+        state.submit(Command::SetTrackPlugin { id: track_id, plugin: None }, false, None, None)?;
         // Its editor is now looking at a plugin that is not there any more.
         if let Some(w) = app.get_webview_window(&plugin_window_label(track_id)) {
             let _ = w.close();
@@ -2727,12 +2777,7 @@ fn set_track_plugin(app: AppHandle, state: State<'_, AppState>, track_id: Uuid, 
     });
     state.loaded_plugin_uids.lock().unwrap().insert(track_id, uid.clone());
     let plugin = TrackPlugin { uid, name, state: None };
-    state
-        .doc
-        .lock()
-        .unwrap()
-        .apply(Command::SetTrackPlugin { id: track_id, plugin: Some(plugin) }, false)
-        .map_err(|e| e.to_string())?;
+    state.submit(Command::SetTrackPlugin { id: track_id, plugin: Some(plugin) }, false, None, None)?;
     Ok(state.snapshot())
 }
 
@@ -2768,12 +2813,7 @@ fn add_insert(
             .map(|d| d.name)
             .ok_or("no such plugin")?,
     };
-    state
-        .doc
-        .lock()
-        .unwrap()
-        .apply_labeled(Command::AddInsert { target, uid, name, index }, false, label)
-        .map_err(|e| e.to_string())?;
+    state.submit(Command::AddInsert { target, uid, name, index }, false, label, None)?;
     state.sync_inserts(false);
     Ok(state.snapshot())
 }
@@ -2785,12 +2825,7 @@ fn remove_insert(
     insert_id: Uuid,
     label: Option<String>,
 ) -> Result<Snapshot, String> {
-    state
-        .doc
-        .lock()
-        .unwrap()
-        .apply_labeled(Command::RemoveInsert { target, insert_id }, false, label)
-        .map_err(|e| e.to_string())?;
+    state.submit(Command::RemoveInsert { target, insert_id }, false, label, None)?;
     state.sync_inserts(false);
     Ok(state.snapshot())
 }
@@ -2803,12 +2838,7 @@ fn move_insert(
     to_index: usize,
     label: Option<String>,
 ) -> Result<Snapshot, String> {
-    state
-        .doc
-        .lock()
-        .unwrap()
-        .apply_labeled(Command::MoveInsert { target, insert_id, to_index }, false, label)
-        .map_err(|e| e.to_string())?;
+    state.submit(Command::MoveInsert { target, insert_id, to_index }, false, label, None)?;
     state.sync_inserts(false);
     Ok(state.snapshot())
 }
@@ -2821,12 +2851,7 @@ fn set_insert_enabled(
     on: bool,
     label: Option<String>,
 ) -> Result<Snapshot, String> {
-    state
-        .doc
-        .lock()
-        .unwrap()
-        .apply_labeled(Command::SetInsertEnabled { target, insert_id, on }, false, label)
-        .map_err(|e| e.to_string())?;
+    state.submit(Command::SetInsertEnabled { target, insert_id, on }, false, label, None)?;
     state.sync_inserts(false);
     Ok(state.snapshot())
 }
@@ -2900,12 +2925,7 @@ fn set_insert_param(
         };
         Command::SetInsertState { target, insert_id, state: b64_encode(&bytes) }
     };
-    state
-        .doc
-        .lock()
-        .unwrap()
-        .apply_labeled(command, false, Some(format!("{name} settings")))
-        .map_err(|e| e.to_string())?;
+    state.submit(command, false, Some(format!("{name} settings")), None)?;
     let snapshot = state.snapshot();
     // Mirrors `set_plugin_param`: the edit can come from a window that is not the one holding
     // the undo history, so everyone is told.
@@ -3014,12 +3034,7 @@ fn set_plugin_param(
         // record, so the move is not undoable. Saying so beats inventing a blob.
         return Ok(None);
     };
-    state
-        .doc
-        .lock()
-        .unwrap()
-        .apply(Command::SetPluginState { id: track_id, state: b64_encode(&bytes) }, false)
-        .map_err(|e| e.to_string())?;
+    state.submit(Command::SetPluginState { id: track_id, state: b64_encode(&bytes) }, false, None, None)?;
     let snapshot = state.snapshot();
     // This edit usually comes from the plugin's own window. Only the caller gets the return
     // value, so without the event the main window's undo history would silently fall behind.
@@ -3203,7 +3218,7 @@ fn spawn_autosaver(app: AppHandle) {
 }
 
 pub fn run() {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info,iroh=warn,noq=warn,tracing::span=warn")).init();
 
     tauri::Builder::default()
         // Reopen where it was last closed, on whatever monitor that was. Without this the OS
@@ -3214,7 +3229,13 @@ pub fn run() {
         .manage(AppState::new())
         .setup(|app| {
             let state = app.state::<AppState>();
-            match app.path().app_data_dir() {
+            // Two copies on one machine each need their own settings and audio, or they would
+            // write over each other: that is how a session gets tried out on one computer.
+            let data_dir = match std::env::var_os("DISSONANT_DATA_DIR") {
+                Some(dir) => Ok(PathBuf::from(dir)),
+                None => app.path().app_data_dir(),
+            };
+            match data_dir {
                 Ok(dir) => {
                     let _ = std::fs::create_dir_all(&dir);
                     *state.settings.lock().unwrap() = Settings::load(&dir.join("settings.json"));
@@ -3239,6 +3260,7 @@ pub fn run() {
             spawn_playhead_emitter(app.handle().clone());
             spawn_audio_watchdog(app.handle().clone());
             spawn_autosaver(app.handle().clone());
+            run_dev_script(app.handle());
             Ok(())
         })
         .on_window_event(|window, event| match event {
@@ -3248,12 +3270,14 @@ pub fn run() {
             // put the save/discard prompt in front of the main window, which then called `quit`.
             WindowEvent::CloseRequested { api, .. } if !is_plugin_window(window.label()) => {
                 let state = window.state::<AppState>();
-                let dirty = state.doc.lock().unwrap().is_dirty();
-                if dirty && !state.force_close.load(Ordering::SeqCst) {
+                let dirty = state.doc.lock().unwrap().is_dirty() && !state.collab.is_guest();
+                let hosting = state.collab.active() && !state.collab.is_guest();
+                if (dirty || hosting) && !state.force_close.load(Ordering::SeqCst) {
                     // Keep the window; the UI asks save / discard / cancel and calls `quit`.
                     api.prevent_close();
                     let _ = window.emit("close-requested", ());
                 } else {
+                    state.close_session();
                     state.clear_autosave();
                     // The editors are views onto a project that is going away.
                     close_plugin_windows(window.app_handle());
@@ -3282,6 +3306,14 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             get_state,
+            collab::share_start,
+            collab::share_stop,
+            collab::share_reset_link,
+            collab::remove_peer,
+            collab::join_session,
+            collab::leave_session,
+            collab::get_session,
+            collab::send_presence,
             apply,
             commit_gesture,
             undo,

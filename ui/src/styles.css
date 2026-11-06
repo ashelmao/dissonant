@@ -4514,3 +4514,205 @@ button.linkish {
   white-space: nowrap;
   text-align: right;
 }
+
+/* ─── Shared sessions ─────────────────────────────────────────────────────────────────────── */
+.peercursors {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 0;
+  height: 0;
+  pointer-events: none;
+  z-index: 8;
+}
+.peercursor {
+  position: absolute;
+  left: 0;
+  top: 0;
+  will-change: transform;
+}
+.peercursor svg {
+  display: block;
+}
+.peercursor span {
+  position: absolute;
+  left: 10px;
+  top: 12px;
+  padding: 1px 5px;
+  border-radius: 2px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  line-height: 14px;
+  color: var(--bg-0);
+  white-space: nowrap;
+}
+.sharebtn {
+  height: 20px;
+  padding: 0 9px;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--text-2);
+  background: var(--bg-control);
+  border: 1px solid var(--line-3);
+  border-radius: 2px;
+  cursor: pointer;
+}
+.sharebtn:hover {
+  color: var(--text-0);
+  border-color: var(--line-strong);
+}
+.sharebtn.on {
+  color: var(--text-1);
+  background: var(--bg-2-sel);
+}
+.presence {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.presence .reconnecting {
+  color: var(--text-2);
+}
+.person {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 0;
+  height: 20px;
+  background: none;
+  border: 0;
+  color: var(--text-4);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  cursor: pointer;
+}
+.person:hover {
+  color: var(--text-1);
+}
+.person i {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  font-style: normal;
+  font-size: 9.5px;
+  color: var(--bg-0);
+}
+.modal.sharedlg {
+  width: 400px;
+  gap: 10px;
+}
+.sharetabs {
+  display: flex;
+  gap: 4px;
+}
+.sharetabs button {
+  flex: 1;
+  height: 24px;
+  font-size: 11px;
+  color: var(--text-3);
+  background: var(--bg-control);
+  border: 1px solid var(--line-2);
+  border-radius: 2px;
+  cursor: pointer;
+}
+.sharetabs button.on {
+  color: var(--text-0);
+  background: var(--bg-2-sel);
+  border-color: var(--line-strong);
+}
+.sharefield {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 8px;
+}
+.sharefield > span {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-4);
+}
+.sharefield input {
+  height: 24px;
+  font-size: 11px;
+}
+.sharedlg textarea {
+  width: 100%;
+  resize: none;
+  padding: 5px 6px;
+  font-size: 10px;
+  line-height: 1.35;
+  color: var(--text-1);
+  background: var(--bg-0b);
+  border: 1px solid var(--line-2);
+  border-radius: 2px;
+  word-break: break-all;
+  box-sizing: border-box;
+}
+.sharedlg .mbody {
+  margin-top: 8px;
+}
+.swatches {
+  display: flex;
+  gap: 5px;
+}
+.swatches button {
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: 2px solid transparent;
+  border-radius: 50%;
+  cursor: pointer;
+}
+.swatches button.on {
+  border-color: var(--text-0);
+}
+.sharerow {
+  display: flex;
+  gap: 6px;
+  margin-top: 6px;
+}
+.sharerow button {
+  height: 24px;
+  padding: 0 10px;
+  font-size: 11px;
+}
+.sharepeople {
+  list-style: none;
+  margin: 10px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.sharepeople li {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 11px;
+  color: var(--text-2);
+}
+.sharepeople li i {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+}
+.sharepeople li span {
+  flex: 1;
+}
+.clip.audio.missing {
+  background: repeating-linear-gradient(135deg, var(--bg-2) 0 6px, var(--bg-0b) 6px 12px);
+}
+.clip.audio.missing .name::after {
+  content: " · not on this machine";
+  color: var(--text-4);
+}
+.recguest {
+  padding: 6px 10px;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--text-3);
+  border-bottom: 1px solid var(--line-1);
+}

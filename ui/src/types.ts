@@ -758,6 +758,10 @@ export function keyAt(m: ProjectModel, tick: number): KeyState {
 
 export interface Snapshot {
   model: ProjectModel;
+  /** Goes up with every change; sent back with an edit to say what it was built from. */
+  revision?: number;
+  /** Sources the project uses that aren't on this machine. */
+  missingAudio?: string[];
   canUndo: boolean;
   canRedo: boolean;
   dirty: boolean;

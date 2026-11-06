@@ -184,6 +184,7 @@ export function RecPage() {
   const audio = useStore((s) => s.audio);
   const inputDevices = useStore((s) => s.inputDevices);
   const armedId = useStore((s) => s.armedAudioTrackId);
+  const guest = useStore((s) => s.session.role === "guest");
   const setArm = useStore((s) => s.setArm);
   const monitor = useStore((s) => s.monitor);
   const toggleMonitor = useStore((s) => s.toggleMonitor);
@@ -226,6 +227,7 @@ export function RecPage() {
   return (
     <>
       <div className="side guitar" style={{ width: sideW }}>
+        {guest && <div className="recguest">recording is the host's for now: a take made here wouldn't reach them.</div>}
         <div className="section">
           <div className="shead">
             <span>audio tracks</span>

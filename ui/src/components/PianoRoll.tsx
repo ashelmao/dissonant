@@ -1,3 +1,5 @@
+import { nearestPitch, reportCursor, type PeerLocation } from "../collab";
+import { PeerCursors } from "./PeerCursors";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { barTicks, beatsPerBar, effectiveKey, gridLabel, selectedPattern, selectedTrack, selectedTrackIndex, usePatternChords, useStore } from "../store";
 import { chordAt, explainNote, midiName, noteTier, tierMap } from "../theory";
@@ -216,6 +218,10 @@ const sameRopeHover = (a: RopeHover, b: RopeHover) =>
  *    Drawn on the roll's own scale, so a handle one row up is a semitone sharp.
  * Tiering is visual only — any note can be placed in any tier.
  */
+function patternCursor(patternId: string | undefined) {
+  return (location: PeerLocation) => (location.screen === "pattern" && location.patternId === patternId ? location.cursor : undefined);
+}
+
 export function PianoRoll() {
   const pattern = useStore(selectedPattern);
   const track = useStore(selectedTrack);
@@ -1315,6 +1321,11 @@ export function PianoRoll() {
   const onPointerMove = (e: React.PointerEvent) => {
     const canvas = canvasRef.current!;
     const { x, y } = local(e, canvas);
+    {
+      const row = (y - RULER_H) / ROW_H;
+      const pitch = visiblePitches[Math.floor(row)];
+      reportCursor(pitch === undefined || x < GUTTER ? null : { tick: tickForX(x), pitch, frac: row - Math.floor(row) });
+    }
     if (loopDrag.current) {
       const tk = Math.max(0, Math.min(totalTicks, Math.round(tickForX(x) / TICKS_PER_BEAT) * TICKS_PER_BEAT));
       const a = loopDrag.current.anchor;
@@ -1762,6 +1773,7 @@ export function PianoRoll() {
           }}
           onPointerCancel={endDrag}
           onPointerLeave={() => {
+            reportCursor(null);
             if (dragRef.current) return;
             lastPointer.current = null;
             setHover(null);
@@ -1769,6 +1781,15 @@ export function PianoRoll() {
             setEdgeHot(null);
           }}
           onContextMenu={(e) => e.preventDefault()}
+        />
+        <PeerCursors
+          pick={patternCursor(pattern?.id)}
+          place={(c) => {
+            const pitch = rowOf.has(c.pitch) ? c.pitch : nearestPitch(c.pitch, visiblePitches);
+            return pitch === null ? null : { x: GUTTER + c.tick * pxPerTick, y: yForPitch(pitch) + c.frac * ROW_H };
+          }}
+          scroller={scrollRef}
+          inset={{ left: GUTTER, top: RULER_H }}
         />
       </div>
       {notes.length === 0 && (

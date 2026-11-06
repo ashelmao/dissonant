@@ -1,3 +1,5 @@
+import { reportCursor } from "../collab";
+import { PeerCursors } from "./PeerCursors";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { barTicks, gridLabel, selectedPattern, selectedTrack, selectedTrackIndex, useStore } from "../store";
 import { matchingKit, padName } from "../drumKit";
@@ -260,6 +262,18 @@ export function DrumGrid() {
 
   const padPitches = track.drumPads.map((p) => p.pitch);
 
+  /** Tell everyone where the pointer is: which pad's row, and how far along the pattern. */
+  const reportDrumCursor = (e: React.PointerEvent) => {
+    for (const pitch of padPitches) {
+      const r = rowEls.current.get(pitch)?.getBoundingClientRect();
+      if (!r || e.clientY < r.top || e.clientY >= r.bottom) continue;
+      const x = e.clientX - r.left - GUTTER - CELL_PAD;
+      reportCursor(x < 0 ? null : { tick: (x / pitchW) * stepTicks, pitch, frac: (e.clientY - r.top) / r.height });
+      return;
+    }
+    reportCursor(null);
+  };
+
   /** Pointer rectangle (client px) → the hits it covers, row by row. */
   const hitsUnder = (x0: number, y0: number, x1: number, y1: number): Set<string> => {
     const top = Math.min(y0, y1);
@@ -442,10 +456,25 @@ export function DrumGrid() {
       tabIndex={0}
       style={{ position: "relative", outline: "none" }}
       onPointerUp={commit}
-      onPointerLeave={commit}
-      onPointerMove={dragMarquee}
+      onPointerLeave={() => {
+        reportCursor(null);
+        commit();
+      }}
+      onPointerMove={(e) => {
+        reportDrumCursor(e);
+        dragMarquee(e);
+      }}
       onKeyDown={onKeyDown}
     >
+      <PeerCursors
+        pick={(l) => (l.screen === "pattern" && l.patternId === pattern.id ? l.cursor : undefined)}
+        place={(c) => {
+          const row = rowEls.current.get(c.pitch);
+          return row ? { x: GUTTER + CELL_PAD + (c.tick / stepTicks) * pitchW, y: row.offsetTop + c.frac * row.offsetHeight } : null;
+        }}
+        scroller={gridRef}
+        inset={{ left: GUTTER }}
+      />
       {marqueeBox && (
         <div
           style={{

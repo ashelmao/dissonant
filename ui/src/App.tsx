@@ -15,6 +15,7 @@ import { PluginBrowserWindow } from "./components/PluginBrowser";
 import { ExportDialog, ExportProgressBar } from "./components/ExportDialog";
 import { NewProjectScreen } from "./components/NewProjectScreen";
 import { RecPage } from "./components/RecPage";
+import { ShareDialog } from "./components/ShareDialog";
 import { selectedPattern, useStore } from "./store";
 import { useLiveKeyboard } from "./liveKeyboard";
 import { splitNotes } from "./noteEditing";
@@ -164,6 +165,7 @@ export default function App() {
       <ExportDialog />
       <NewProjectScreen />
       <ExportProgressBar />
+      <ShareDialog />
       <Dialog />
     </div>
   );
