@@ -1,9 +1,20 @@
 import { useState } from "react";
 import { Knob, lin, log } from "./Knob";
 import { useStore } from "../store";
-import type { AmpHead, AmpRig, Cabinet, EqModel, Pedal, PedalKind, Track } from "../types";
+import type {
+  AmpHead,
+  AmpModel,
+  AmpRig,
+  AmpSwitchKey,
+  Cabinet,
+  EqModel,
+  Pedal,
+  PedalKind,
+  Track,
+} from "../types";
 import {
   AMP_MODELS,
+  AMP_SWITCH_MODELS,
   CAB_LABELS,
   CAB_MODELS,
   EQ_LABELS,
@@ -96,14 +107,53 @@ export const PEDAL_LABELS: Record<PedalKind, string> = {
   delay: "delay",
 };
 
+/** What one circuit switch is called on the panel, and what throwing it does. Which amps offer
+ *  it is `AMP_SWITCH_MODELS`, next to the rest of the model mirror; this is the wording. */
+export interface AmpSwitch {
+  key: AmpSwitchKey;
+  label: string;
+  hint: string;
+}
+
+export const AMP_SWITCHES: AmpSwitch[] = [
+  {
+    key: "brightCap",
+    label: "bright",
+    hint: "treble bypass across the gain pot: most of the voice down low, nothing wide open",
+  },
+  {
+    key: "halfPower",
+    label: "half power",
+    hint: "half the output tubes: break-up and sag at a volume the room can stand",
+  },
+  {
+    key: "cathodeFollower",
+    label: "follower",
+    hint: "the tone stack driven from a cathode follower, which squashes and conducts first",
+  },
+];
+
+/** The switches this model has, in panel order. Empty for the amps that have none — those show
+ *  no switch row at all rather than three dead toggles. */
+export function ampSwitches(model: AmpModel): AmpSwitch[] {
+  return AMP_SWITCHES.filter((s) => AMP_SWITCH_MODELS[s.key].includes(model));
+}
+
 /** One entry of the model menu. A rig is chosen whole — amp, tone stack, cabinet and mic are
  *  separate controls, but nobody starts from four independent guesses. Owned here rather than in
  *  the core: these are presentation, not state the engine needs to know about. */
 export interface AmpPreset {
   name: string;
-  amp: AmpHead;
+  /** The knob row only. Wheeling in another amp leaves its switches where a shipped amp has
+   *  them, which is off — throwing one is the player's decision, not the preset's. */
+  amp: Omit<AmpHead, AmpSwitchKey>;
   eq: EqModel;
   cab: Cabinet;
+}
+
+/** The head a preset builds: its knobs, and every switch in the off position. */
+export function presetHead(p: AmpPreset): AmpHead {
+  return { ...p.amp, brightCap: false, halfPower: false, cathodeFollower: false };
 }
 
 export const AMP_PRESETS: AmpPreset[] = [
@@ -189,16 +239,18 @@ export function AmpRack({ track }: { track: Track }) {
   const preset = matchingPreset(rig);
   /** The macro: picking a model swaps the whole front end at once, in one undo step, the way
    *  wheeling in another amp would. */
-  const pickPreset = (p: AmpPreset) => patch({ amp: p.amp, eq: p.eq, cab: p.cab });
+  const pickPreset = (p: AmpPreset) => patch({ amp: presetHead(p), eq: p.eq, cab: p.cab });
   /** A direct feed never reaches a speaker, so the mic in front of one has nothing to hear. */
   const direct = rig.cab.model === "direct";
+  /** Only the switches this amp's circuit has. A modern stack shows none. */
+  const switches = ampSwitches(rig.amp.model);
 
-  const ampKnob = (label: string, field: keyof AmpRig["amp"]) => (
+  const ampKnob = (label: string, field: Exclude<keyof AmpHead, "model" | AmpSwitchKey>) => (
     <Knob
       key={label}
       label={label}
-      value={knob10.to(rig.amp[field] as number)}
-      display={oneDecimal(rig.amp[field] as number)}
+      value={knob10.to(rig.amp[field])}
+      display={oneDecimal(rig.amp[field])}
       color={DRIVE_COLOR}
       defaultValue={0.5}
       onChange={(n) => patch({ amp: { ...rig.amp, [field]: knob10.from(n) } }, true)}
@@ -349,6 +401,23 @@ export function AmpRack({ track }: { track: Track }) {
                 ))}
               </div>
             </div>
+            {switches.length > 0 && (
+              <div className="segline">
+                <span className="cap">circuit</span>
+                <div className="seg">
+                  {switches.map((s) => (
+                    <div
+                      key={s.key}
+                      className={rig.amp[s.key] ? "on" : ""}
+                      title={s.hint}
+                      onClick={() => patch({ amp: { ...rig.amp, [s.key]: !rig.amp[s.key] } })}
+                    >
+                      {s.label}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
             <div className="knobrow">
               {ampKnob("gain", "gain")}
               {ampKnob("bass", "bass")}

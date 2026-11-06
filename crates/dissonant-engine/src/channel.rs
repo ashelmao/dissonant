@@ -6,7 +6,7 @@ use crate::drums::{DrumBank, DrumKit};
 use crate::dsp::{db_to_linear, linear_to_db, pan_gains, Limiter, Reverb, StereoBiquad};
 use crate::effects::NativeEffect;
 use crate::engine::{NoteShape, Slide, VoiceTag};
-use crate::synth::PolySynth;
+use crate::synth::{Bend, PolySynth};
 use dissonant_core::{MasterSettings, SequenceTrack, SynthPatch};
 use dissonant_plugins::PluginAudioUnit;
 use uuid::Uuid;
@@ -64,8 +64,17 @@ impl Instrument {
         match self {
             Instrument::Synth(s) => s.note_on(pitch, velocity, shape),
             Instrument::Drums(d) => d.note_on(pitch, velocity, shape),
-            // A plugin owns its own expression: MIDI is all the contract there is.
-            Instrument::Plugin(p) => p.note_on(pitch, velocity),
+            // A plugin hears the note's detune — and where its contour starts — as a tuning
+            // expression on the note's own id; pan, release and the mod axes have no portable
+            // CLAP meaning and stay native-only. A contour that moves is followed by
+            // `Channel::note_on_tagged`, which owns the state that takes.
+            Instrument::Plugin(p) => {
+                let id = p.note_on(pitch, velocity);
+                let cents = start_cents(shape);
+                if cents != 0.0 {
+                    p.note_tuning(0, id, pitch, f64::from(cents) / 100.0);
+                }
+            }
             Instrument::Silent => {}
         }
     }
@@ -132,6 +141,130 @@ impl Instrument {
             Instrument::Drums(d) => d.render_add(out_l, out_r),
             // A plugin goes through `Channel::render_add`'s own path.
             Instrument::Plugin(_) | Instrument::Silent => {}
+        }
+    }
+}
+
+/// Cents a note sounds at on its first sample: its detune plus wherever its contour stands,
+/// which is mid-bend when a seek lands inside the note.
+fn start_cents(shape: NoteShape) -> f32 {
+    let mut bend = shape.bend;
+    shape.fine as f32 + bend.next_cents()
+}
+
+/// Bent notes one plugin channel follows at once. Matches the scale of a polyphonic part rather
+/// than a pad wash; a note struck while all are taken starts at its contour's opening value and
+/// holds it, which is what a plugin heard before contours reached plugins at all.
+const MAX_BENT_NOTES: usize = 16;
+
+/// Fewest samples between two tuning values sent for one moving note: about 1.5 ms at 44.1 kHz,
+/// a 690 Hz control rate.
+///
+/// The native voice steps its bend every sample; a plugin cannot be told that often, because
+/// every value is an event in a queue sized once when the plugin was opened. Plugins already
+/// smooth expressions over a millisecond or so to avoid zipper noise, so updates much faster
+/// than this would be smoothed away anyway, and slower ones would let a fast whole-tone pull
+/// audibly staircase. At this rate sixteen notes bending through a 2048-frame block stay well
+/// inside the host's event budget.
+const TUNING_INTERVAL: u32 = 64;
+
+/// Smallest move worth a new value: a cent is well under what anyone hears, and a slow drift
+/// would otherwise cost an event every interval for no audible change.
+const TUNING_STEP_CENTS: f32 = 1.0;
+
+/// One bent note a plugin is sounding, and how much of its contour the plugin has been told.
+#[derive(Debug, Clone, Copy)]
+struct BentNote {
+    id: u32,
+    pitch: u8,
+    fine: f32,
+    bend: Bend,
+    /// Cents at the sample about to be rendered, read one sample ahead so the follower can see
+    /// the note arrive somewhere and stay — the moment a step lands or a ramp reaches its
+    /// point — and send that exact value on that exact sample.
+    ahead: f32,
+    /// Cents at the previous sample.
+    prev: f32,
+    /// The last value the plugin was told; 0 before the first, since a fresh note is in tune.
+    sent: f32,
+    /// Samples since `sent` went out.
+    since: u32,
+}
+
+/// The per-note pitch envelope, delivered to a hosted instrument as
+/// `CLAP_NOTE_EXPRESSION_TUNING` events.
+///
+/// Lives on the [`Channel`] rather than inside the plugin unit because the contour is the
+/// engine's [`Bend`], resolved onto the sample clock exactly as the native voice resolves it,
+/// and the plugin crate knows nothing about either. A note is followed while the plugin still
+/// holds it under its id; once released its pitch stays where it was, since the envelope is
+/// written against the note's length and has nothing left to say about its tail.
+///
+/// The rate limit is in the sending, not the reading: the contour is still walked every
+/// sample, so a value goes out on the sample it is reached, never quantised to a grid. A
+/// moving note sends at most one value per [`TUNING_INTERVAL`] and only once it has moved a
+/// [`TUNING_STEP_CENTS`]; on top of that, every point the contour arrives at goes out exactly,
+/// on its own sample, so a step lands where it was drawn and a ramp ends on its point rather
+/// than up to an interval short of it. Those arrivals are bounded by the sixteen points a note
+/// can carry, which keeps the whole stream bounded.
+#[derive(Debug)]
+struct PluginBends {
+    /// Pre-sized to [`MAX_BENT_NOTES`] so following a note never allocates.
+    notes: Vec<BentNote>,
+}
+
+impl PluginBends {
+    fn new() -> Self {
+        PluginBends {
+            notes: Vec::with_capacity(MAX_BENT_NOTES),
+        }
+    }
+
+    /// Start following a note just struck on `unit` under `id`. Its first value goes out on
+    /// the note-on's own sample, ahead of any audio, by the first [`advance`](Self::advance).
+    fn follow(&mut self, unit: &mut PluginAudioUnit, id: u32, pitch: u8, shape: NoteShape) {
+        self.notes.retain(|n| unit.holds(n.id, n.pitch));
+        if self.notes.len() == MAX_BENT_NOTES {
+            let cents = start_cents(shape);
+            if cents != 0.0 {
+                unit.note_tuning(0, id, pitch, f64::from(cents) / 100.0);
+            }
+            return;
+        }
+        let mut bend = shape.bend;
+        let fine = shape.fine as f32;
+        let ahead = fine + bend.next_cents();
+        self.notes.push(BentNote {
+            id,
+            pitch,
+            fine,
+            bend,
+            ahead,
+            prev: 0.0,
+            sent: 0.0,
+            since: TUNING_INTERVAL,
+        });
+    }
+
+    /// Walk every followed note through the next `frames` samples, queueing the values the
+    /// plugin needs at their offsets into the render that follows.
+    fn advance(&mut self, unit: &mut PluginAudioUnit, frames: usize) {
+        self.notes.retain(|n| unit.holds(n.id, n.pitch));
+        for n in &mut self.notes {
+            for i in 0..frames {
+                let v = n.ahead;
+                n.ahead = n.fine + n.bend.next_cents();
+                // Arrived and staying. `v != prev` is the arrival itself; a hold whose value
+                // was refused earlier is retried no faster than the moving case.
+                let lands = n.ahead == v && v != n.sent && (v != n.prev || n.since >= TUNING_INTERVAL);
+                let due = n.since >= TUNING_INTERVAL && (v - n.sent).abs() >= TUNING_STEP_CENTS;
+                if (lands || due) && unit.note_tuning(i as u32, n.id, n.pitch, f64::from(v) / 100.0) {
+                    n.sent = v;
+                    n.since = 0;
+                }
+                n.prev = v;
+                n.since = n.since.saturating_add(1);
+            }
         }
     }
 }
@@ -254,6 +387,9 @@ pub struct ChannelAuto {
 #[derive(Debug)]
 pub struct Channel {
     pub instrument: Instrument,
+    /// Bent notes the hosted instrument is sounding, followed here because only the engine
+    /// knows their contours. Empty, and never touched, on any other instrument.
+    bends: PluginBends,
     /// The patch the synth was last given, to skip `set_patch` when nothing changed.
     synth: SynthPatch,
     is_drum: bool,
@@ -288,6 +424,7 @@ impl Channel {
     pub fn new(track: &SequenceTrack, sample_rate: f32, drums: Option<&DrumBank>) -> Self {
         let mut c = Channel {
             instrument: Instrument::for_track(track, sample_rate, drums),
+            bends: PluginBends::new(),
             synth: track.synth,
             is_drum: track.is_drum,
             is_audio: track.is_audio,
@@ -309,6 +446,26 @@ impl Channel {
         };
         c.apply(track, drums);
         c
+    }
+
+    /// Strike a scheduled note. The same as [`Instrument::note_on_tagged`] except on a hosted
+    /// instrument, where a note whose pitch moves is also followed so its contour reaches the
+    /// plugin as tuning expressions while it sounds.
+    pub(crate) fn note_on_tagged(
+        &mut self,
+        pitch: u8,
+        velocity: u8,
+        shape: NoteShape,
+        tag: VoiceTag,
+        slide: Option<Slide>,
+    ) {
+        match &mut self.instrument {
+            Instrument::Plugin(p) if shape.bend.active() => {
+                let id = p.note_on(pitch, velocity);
+                self.bends.follow(p, id, pitch, shape);
+            }
+            instrument => instrument.note_on_tagged(pitch, velocity, shape, tag, slide),
+        }
     }
 
     /// Update params from the track. A changed synth patch is applied live (held notes keep
@@ -423,6 +580,8 @@ impl Channel {
             // A plugin produces its own stereo image, so panning scales the two sides it gives
             // us rather than placing a mono source. The channel's tone filter is left for the
             // built-in voices.
+            // Contours first: their values land inside the very frames about to be rendered.
+            self.bends.advance(plugin, frames);
             plugin.render_add(&mut self.stereo.0[..frames], &mut self.stereo.1[..frames]);
             self.strip(frames, mix_l, mix_r, ctx.beat_seconds);
             return;

@@ -5,7 +5,7 @@
 use dissonant_core::document::{Command, InsertTarget, TrackParam};
 use dissonant_core::{
     AmpModel, AudioClip, AutoTarget, CabModel, Cabinet, Curve, DrumPad, EqModel, Insert,
-    MasterParam, MicModel, Pedal, TrackPlugin,
+    MasterParam, MicModel, Pedal, PitchPoint, TrackPlugin,
 };
 use serde_json::json;
 use uuid::Uuid;
@@ -349,6 +349,14 @@ fn every_command_variant_round_trips_from_the_ui_payload() {
                 "shiftTicks": -120, "repeats": 3, "color": 5,
                 "slideFrom": source_id, "slideSecs": 0.25
             },
+            {
+                "id": Uuid::new_v4(), "startTick": 2_400, "lengthTicks": 960, "pitch": 67, "velocity": 100,
+                "fine": 10,
+                "pitchEnvelope": [
+                    {"tick": 0, "cents": 0.0, "curve": "step"},
+                    {"tick": 480, "cents": 200.0, "curve": "ramp"},
+                ]
+            },
         ],
     }));
     match notes {
@@ -357,7 +365,7 @@ fn every_command_variant_round_trips_from_the_ui_payload() {
             notes,
         } => {
             assert_eq!(p, pattern_id);
-            assert_eq!(notes.len(), 2);
+            assert_eq!(notes.len(), 3);
             assert_eq!(notes[0].start_tick, 1_440);
             assert_eq!(notes[0].length_ticks, 240);
             assert_eq!(notes[0].pitch, 60);
@@ -388,6 +396,16 @@ fn every_command_variant_round_trips_from_the_ui_payload() {
             assert_eq!((notes[0].slide_from, notes[0].slide_secs), (None, None));
             assert_eq!(notes[1].slide_from, Some(source_id));
             assert_eq!(notes[1].slide_secs, Some(0.25));
+            // The pitch envelope is an offset on top of `fine`, which stays as written.
+            assert!(notes[0].pitch_envelope.is_empty());
+            assert_eq!(notes[2].fine, 10);
+            assert_eq!(
+                notes[2].pitch_envelope,
+                vec![
+                    PitchPoint::new(0, 0.0, Curve::Step),
+                    PitchPoint::new(480, 200.0, Curve::Ramp),
+                ]
+            );
         }
         other => panic!("expected SetNotes, got {other:?}"),
     }
@@ -493,6 +511,16 @@ fn every_command_variant_round_trips_from_the_ui_payload() {
     assert_eq!(
         parse(json!({"type": "setLoopRegion", "region": null})),
         Command::SetLoopRegion { region: None }
+    );
+    assert_eq!(
+        parse(json!({"type": "setPunchRegion", "region": [15_360, 19_200]})),
+        Command::SetPunchRegion {
+            region: Some((15_360, 19_200))
+        }
+    );
+    assert_eq!(
+        parse(json!({"type": "setPunchRegion", "region": null})),
+        Command::SetPunchRegion { region: None }
     );
     match parse(json!({
         "type": "importTracks",
@@ -717,6 +745,68 @@ fn every_command_variant_round_trips_from_the_ui_payload() {
         other => panic!("expected AddAudioTake, got {other:?}"),
     }
 
+    match parse(json!({
+        "type": "punchAudioTake", "trackId": track_id,
+        "source": {"id": source_id, "name": "take 1", "frames": 48000, "sampleRate": 48000, "channels": 1},
+        "clip": clip_json,
+        "crossfadeSeconds": 0.015,
+    })) {
+        Command::PunchAudioTake {
+            track_id: t,
+            source,
+            clip,
+            crossfade_seconds,
+        } => {
+            assert_eq!((t, source.id), (track_id, source_id));
+            assert_eq!(clip, expected_clip);
+            assert_eq!(crossfade_seconds, 0.015);
+        }
+        other => panic!("expected PunchAudioTake, got {other:?}"),
+    }
+
+    // ---- DI detection: a transcription, and the detected lane's accept / dismiss
+
+    let chord_id = Uuid::new_v4();
+    match parse(json!({
+        "type": "addTranscription", "name": "take 3 notes", "startTick": 3_840, "lengthTicks": 7_680,
+        "notes": [{"id": id, "startTick": 0, "lengthTicks": 480, "pitch": 57, "velocity": 96,
+                   "pitchEnvelope": [{"tick": 0, "cents": 0.0, "curve": "ramp"}, {"tick": 240, "cents": 200.0, "curve": "ramp"}]}],
+        "detection": {
+            "clipId": clip_id,
+            "chords": [{"id": chord_id, "startTick": 3_840, "lengthTicks": 1_920, "pitchClasses": [0, 4, 7],
+                        "name": "C", "confidence": 0.875}],
+            "chroma": [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0],
+        },
+    })) {
+        Command::AddTranscription {
+            name,
+            start_tick,
+            length_ticks,
+            notes,
+            detection,
+        } => {
+            assert_eq!((name.as_str(), start_tick, length_ticks), ("take 3 notes", 3_840, 7_680));
+            assert_eq!(notes.len(), 1);
+            assert_eq!(notes[0].pitch_envelope[1], PitchPoint::new(240, 200.0, Curve::Ramp));
+            assert_eq!(detection.clip_id, clip_id);
+            let c = &detection.chords[0];
+            assert_eq!(
+                (c.id, c.start_tick, c.length_ticks, c.pitch_classes.clone(), c.name.as_deref(), c.confidence),
+                (chord_id, 3_840, 1_920, vec![0, 4, 7], Some("C"), 0.875)
+            );
+            assert_eq!(detection.chroma[4], 1.0);
+        }
+        other => panic!("expected AddTranscription, got {other:?}"),
+    }
+    assert_eq!(
+        parse(json!({"type": "acceptDetectedChord", "id": chord_id})),
+        Command::AcceptDetectedChord { id: chord_id }
+    );
+    assert_eq!(
+        parse(json!({"type": "dismissDetectedChord", "id": chord_id})),
+        Command::DismissDetectedChord { id: chord_id }
+    );
+
     // The rig is one whole record per edit, and `pedals` is an internally tagged union — the
     // part most likely to drift between `ui/src/types.ts` and here.
     match parse(json!({
@@ -731,7 +821,8 @@ fn every_command_variant_round_trips_from_the_ui_payload() {
                 {"kind": "wah", "on": false, "sensitivity": 5.0, "range": 6.0},
                 {"kind": "delay", "on": true, "timeMs": 350.0, "feedback": 3.0, "mix": 2.0},
             ],
-            "amp": {"model": "lead", "gain": 8.0, "bass": 5.0, "mid": 4.0, "treble": 6.0, "presence": 5.0, "master": 5.0},
+            "amp": {"model": "lead", "gain": 8.0, "bass": 5.0, "mid": 4.0, "treble": 6.0, "presence": 5.0, "master": 5.0,
+                    "brightCap": false, "halfPower": false, "cathodeFollower": true},
             "eq": "britishBright",
             "cab": {"model": "fourByTwelve", "micModel": "ribbon", "posX": 7.0, "posZ": 1.5},
             "rack": {"reverb": 2.0, "decay": 5.0, "outputDb": -1.5},
@@ -742,6 +833,14 @@ fn every_command_variant_round_trips_from_the_ui_payload() {
             assert_eq!(amp.input_db, 3.0);
             assert_eq!(amp.amp.model, AmpModel::Lead);
             assert_eq!(amp.eq, EqModel::BritishBright);
+            assert_eq!(
+                (
+                    amp.amp.bright_cap,
+                    amp.amp.half_power,
+                    amp.amp.cathode_follower
+                ),
+                (false, false, true)
+            );
             assert_eq!(amp.cab.model, CabModel::FourByTwelve);
             assert_eq!(amp.cab.mic_model, MicModel::Ribbon);
             assert_eq!((amp.cab.pos_x, amp.cab.pos_z), (7.0, 1.5));
@@ -797,6 +896,11 @@ fn every_command_variant_round_trips_from_the_ui_payload() {
             assert_eq!(
                 (amp.cab.pos_x, amp.cab.pos_z),
                 (Cabinet::default().pos_x, Cabinet::default().pos_z)
+            );
+            // The same holds for the circuit switches: a rig that predates them opens with
+            // every one off rather than refusing to parse.
+            assert!(
+                !amp.amp.bright_cap && !amp.amp.half_power && !amp.amp.cathode_follower
             );
         }
         other => panic!("expected SetTrackAmp, got {other:?}"),

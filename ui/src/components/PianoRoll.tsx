@@ -1,23 +1,28 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { barTicks, beatsPerBar, effectiveKey, gridLabel, selectedPattern, selectedTrack, selectedTrackIndex, usePatternChords, useStore } from "../store";
-import { chordAt, explainNote, midiName, tierMap } from "../theory";
+import { chordAt, explainNote, midiName, noteTier, tierMap } from "../theory";
 import {
+  addPitchPoint,
   copyNotes,
   duplicateBySpan,
   duplicateNotes,
   glueNotes,
   magnetPitch,
+  movePitchPoint,
   moveNotes,
   stampChord,
   noteAt,
   notesInRect,
   nudgeNoteProp,
   pasteNotes,
+  pitchPointAt,
+  pitchPolyline,
   placeNote,
   quantizeNoteProp,
   rampNoteProp,
   noteValueLabel,
   removeNotes,
+  removePitchPoint,
   resizeEdge,
   selectionBounds,
   setNoteProp,
@@ -26,6 +31,7 @@ import {
   splitNotes,
   stepSelection,
   tileGhost,
+  togglePitchCurve,
   toggleMute,
   type NoteEdge,
 } from "../noteEditing";
@@ -89,6 +95,14 @@ const BLACK = new Set([1, 3, 6, 8, 10]);
 const NOTE_VALUE_TICKS = [TICKS_PER_BEAT / 8, TICKS_PER_BEAT / 4, TICKS_PER_BEAT / 2, TICKS_PER_BEAT, 2 * TICKS_PER_BEAT, 4 * TICKS_PER_BEAT];
 /** Horizontal travel that moves one rung of `NOTE_VALUE_TICKS`. */
 const VALUE_STEP_PX = 26;
+/** Pitch-contour handles: drawn this big, grabbed from this far. */
+const BEND_HANDLE_PX = 3;
+const BEND_HIT_PX = 7;
+/**
+ * Cents a bend drag lands on: five is the envelope's own decimation tolerance, which is the
+ * finest move that survives a round trip through detection anyway. ⇧ goes to the cent.
+ */
+const BEND_STEP_CENTS = 5;
 
 /**
  * The property lane's drawn scale: its floor sits 4px above the lane's bottom edge (the lane
@@ -162,6 +176,7 @@ type Drag =
   | { kind: "erase"; base: NoteEvent[] }
   | { kind: "marquee"; x0: number; y0: number; x1: number; y1: number; baseSelection: Set<string> }
   | { kind: "lane"; ids: Set<string>; prop: NoteProp; anchorId: string; startY: number; base: NoteEvent[] }
+  | { kind: "bend"; id: string; index: number; originX: number; originY: number; base: NoteEvent[] }
   | { kind: "rope"; sourceId: string; over: string | null }
   | { kind: "slide"; noteId: string; startX: number; startSecs: number; last: number | null };
 
@@ -196,6 +211,9 @@ const sameRopeHover = (a: RopeHover, b: RopeHover) =>
  *  - keys: ⌫ delete · ⌘A/⌘C/⌘X/⌘V/⌘D · ⇧⌘E split at playhead · ⌘J glue · ⌘B duplicate one
  *    loop later · 0 mute · arrows nudge (⇧ = octave / bar, ⌥ = fine) · [ ] the lane's
  *    property · esc
+ *  - pitch bend, inside the note's own body: double-click a note adds a contour point,
+ *    drag a handle to move it (⇧ fine), ⌥-click flips glide/jump, right-click removes.
+ *    Drawn on the roll's own scale, so a handle one row up is a semitone sharp.
  * Tiering is visual only — any note can be placed in any tier.
  */
 export function PianoRoll() {
@@ -260,6 +278,9 @@ export function PianoRoll() {
   const scrollRef = useRef<HTMLDivElement>(null);
   const [selection, setSelection] = useState<Set<string>>(new Set());
   const dragRef = useRef<Drag | null>(null);
+  // The note the last click created, so the second click of a double-click on empty grid
+  // does not also drop a bend point on it.
+  const justPlaced = useRef<string | null>(null);
   const [preview, setPreview] = useState<NoteEvent[] | null>(null);
   const [hover, setHover] = useState<{ tick: number; pitch: number } | null>(null);
   const [scrollLeft, setScrollLeft] = useState(0);
@@ -538,7 +559,7 @@ export function PianoRoll() {
     const velocityAlpha = (v: number) => 0.45 + 0.55 * (v / 127);
     for (const n of shown) {
       if (!rowOf.has(n.pitch)) continue;
-      const t = tierMap(n.startTick, chords, key)[n.pitch % 12];
+      const { tier: t, moving } = noteTier(n, chords, key);
       const sel = selection.has(n.id);
       const y = yForPitch(n.pitch);
       const w = Math.max(3, n.lengthTicks * pxPerTick - 1);
@@ -617,11 +638,69 @@ export function PianoRoll() {
       ctx.lineWidth = 1;
       roundRect(ctx, x + 0.5, y + 0.5, w - 1, h - 1, 2);
       ctx.stroke();
+      // Moving mark: a bent note is coloured where it starts, so a folded top-right corner
+      // says the rest of it goes elsewhere. A shape, not a hue (the Three-Tier Doctrine), clear
+      // of the tension dot, the hatch and the keep outline, and sized off the row so it
+      // still reads on the smallest rows. Static: nothing here animates.
+      if (moving) {
+        const s = Math.max(3, Math.min(6, h * 0.6, w * 0.4));
+        // Dark on every fill, selected ones included: those are tinted toward white.
+        ctx.fillStyle = "rgba(4,20,13,.85)";
+        ctx.beginPath();
+        ctx.moveTo(x + w - s, y);
+        ctx.lineTo(x + w, y);
+        ctx.lineTo(x + w, y + s);
+        ctx.closePath();
+        ctx.fill();
+      }
       if (sel) {
         ctx.strokeStyle = "rgba(255,255,255,.4)";
         roundRect(ctx, x - 0.5, y - 0.5, w + 1, h + 1, 3);
         ctx.stroke();
       }
+    }
+
+    // Pitch envelopes, in one clipped pass over the notes that have one so a contour draws
+    // over its neighbours instead of under the next note in the loop. The vertical scale is
+    // the roll's own — one row is a semitone — so a bend reads as the pitch it reaches
+    // rather than as an abstract lane that happens to live inside the note.
+    const bent = shown.filter((n) => n.pitchEnvelope?.length && rowOf.has(n.pitch));
+    if (bent.length) {
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(GUTTER, RULER_H, gridW, gridH);
+      ctx.clip();
+      for (const n of bent) {
+        const ox = GUTTER + Math.max(0, n.startTick + (n.shiftTicks ?? 0)) * pxPerTick;
+        const oy = yForPitch(n.pitch) + (ROW_H - 1) / 2;
+        const line = pitchPolyline(n.pitchEnvelope ?? [], n.lengthTicks);
+        ctx.strokeStyle = selection.has(n.id) ? "#ffffff" : "rgba(10,12,18,.8)";
+        ctx.lineWidth = 1.5;
+        ctx.lineJoin = "round";
+        ctx.beginPath();
+        line.forEach((p, i) => {
+          const px = ox + p.tick * pxPerTick;
+          const py = oy - (p.cents / 100) * ROW_H;
+          if (i === 0) ctx.moveTo(px, py);
+          else ctx.lineTo(px, py);
+        });
+        ctx.stroke();
+        ctx.fillStyle = selection.has(n.id) ? "#ffffff" : "#0a0c12";
+        for (const p of n.pitchEnvelope ?? []) {
+          ctx.beginPath();
+          ctx.arc(ox + p.tick * pxPerTick, oy - (p.cents / 100) * ROW_H, BEND_HANDLE_PX, 0, Math.PI * 2);
+          ctx.fill();
+          // A step point is ringed, so "jumps here" is visible without reading the line.
+          if (p.curve === "step") {
+            ctx.strokeStyle = "#ff9d2a";
+            ctx.lineWidth = 1;
+            ctx.stroke();
+            ctx.strokeStyle = selection.has(n.id) ? "#ffffff" : "rgba(10,12,18,.8)";
+            ctx.lineWidth = 1.5;
+          }
+        }
+      }
+      ctx.restore();
     }
 
     // The lit edge: the one under the pointer, or every edge a resize is dragging.
@@ -996,6 +1075,30 @@ export function PianoRoll() {
     setSelectedRope(id);
   };
 
+  /**
+   * Where a note's contour is drawn: the x of its first tick and the y of zero cents. A
+   * shifted note bends from where it sounds, which is where it is drawn.
+   */
+  const bendOrigin = (n: NoteEvent) => ({
+    x: GUTTER + Math.max(0, n.startTick + (n.shiftTicks ?? 0)) * pxPerTick,
+    y: yForPitch(n.pitch) + (ROW_H - 1) / 2,
+  });
+
+  /**
+   * The contour handle under the pointer. Searched across every bent note rather than only
+   * the one the cursor is over, because a handle sits where its *pitch* is: a whole-tone
+   * bend puts it two rows above the note it belongs to.
+   */
+  const bendHandleAt = (x: number, y: number): { note: NoteEvent; index: number } | null => {
+    for (const n of shown) {
+      if (!n.pitchEnvelope?.length || !rowOf.has(n.pitch)) continue;
+      const o = bendOrigin(n);
+      const index = pitchPointAt(n, (x - o.x) / pxPerTick, ((o.y - y) / ROW_H) * 100, { pxPerTick, pxPerCent: ROW_H / 100 }, BEND_HIT_PX);
+      if (index !== null) return { note: n, index };
+    }
+    return null;
+  };
+
   const onPointerDown = (e: React.PointerEvent) => {
     const canvas = canvasRef.current!;
     scrollRef.current?.focus();
@@ -1047,6 +1150,24 @@ export function PianoRoll() {
     if (!hit && (tick < 0 || tick >= totalTicks || pitch < LOW || pitch > HIGH)) return;
     canvas.setPointerCapture(e.pointerId);
 
+    // A contour handle wins over the note under it: it is the smaller target and the one the
+    // pointer is visibly on. Removing and re-curving are instant; dragging previews.
+    const handle = e.button === 0 || e.button === 2 ? bendHandleAt(x, y) : null;
+    if (handle) {
+      if (e.button === 2) {
+        commit(removePitchPoint(notes, handle.note.id, handle.index), "remove bend point");
+        return;
+      }
+      if (e.altKey) {
+        commit(togglePitchCurve(notes, handle.note.id, handle.index), "curve bend point");
+        return;
+      }
+      const o = bendOrigin(handle.note);
+      dragRef.current = { kind: "bend", id: handle.note.id, index: handle.index, originX: o.x, originY: o.y, base: notes };
+      setPreview(notes);
+      return;
+    }
+
     if (e.button === 2) {
       const n = noteAt(notes, tick, pitch);
       const base = n ? removeNotes(notes, new Set([n.id])) : notes;
@@ -1056,6 +1177,7 @@ export function PianoRoll() {
     }
     if (e.button !== 0) return;
 
+    justPlaced.current = null;
     if (hit) {
       if (e.shiftKey) {
         // Click toggles the selection; drag steps the note's length through the note values,
@@ -1103,6 +1225,7 @@ export function PianoRoll() {
       const placed = placeNote(notes, tick, pitch, noteLength, noteLength, defaultVelocity);
       const base = placed ? [...notes, placed] : notes;
       if (placed) auditionPlace(pitch, placed.velocity, placed.lengthTicks);
+      justPlaced.current = placed?.id ?? null;
       dragRef.current = { kind: "paint", base };
       setPreview(base);
       return;
@@ -1127,6 +1250,7 @@ export function PianoRoll() {
       return;
     }
     auditionPlace(target, placed.velocity, placed.lengthTicks);
+    justPlaced.current = placed.id;
     const base = [...notes, placed];
     const ids = new Set([placed.id]);
     setSelection(ids);
@@ -1321,13 +1445,23 @@ export function PianoRoll() {
         if (pattern) void dispatch({ type: "setSlideTime", patternId: pattern.id, noteId: d.noteId, secs }, true, "change slide time");
         break;
       }
+      case "bend": {
+        // Free in time (a bend lands where the player bent it, not on the grid) and on the
+        // five-cent ladder in pitch, which is the envelope's own resolution. ⇧ goes finer.
+        const cents = ((d.originY - y) / ROW_H) * 100;
+        const step = e.shiftKey ? 1 : BEND_STEP_CENTS;
+        setPreview(movePitchPoint(d.base, d.id, d.index, (x - d.originX) / pxPerTick, Math.round(cents / step) * step));
+        break;
+      }
       case "lane":
       case "ramp":
         break;
     }
   };
 
-  // Double-click a key: select every note at that pitch (⌘: the pitch class in every octave).
+  // Double-click a key selects every note at that pitch (⌘: the pitch class in every
+  // octave); double-click a note body adds a point to its pitch contour, the way the
+  // automation lanes add theirs.
   const onDoubleClick = (e: React.MouseEvent) => {
     const canvas = canvasRef.current!;
     const rect = canvas.getBoundingClientRect();
@@ -1335,10 +1469,21 @@ export function PianoRoll() {
     const y = e.clientY - rect.top;
     if (rulerY(y) < RULER_H) return;
     if (x >= GUTTER) {
+      const rt = ropeTarget(x, y, ropeHover.note);
       // On a rope's midpoint: drop its own slide time and go back to the sound's glide.
-      const r = ropeAt(ropes, x, y, true);
-      const n = r?.handle ? notes.find((m) => m.id === r.id) : undefined;
-      if (n?.slideSecs !== undefined && pattern) void dispatch({ type: "setSlideTime", patternId: pattern.id, noteId: n.id, secs: null }, false, "reset slide time");
+      if (rt?.rope?.handle) {
+        const n = notes.find((m) => m.id === rt.rope!.id);
+        if (n?.slideSecs !== undefined && pattern) void dispatch({ type: "setSlideTime", patternId: pattern.id, noteId: n.id, secs: null }, false, "reset slide time");
+        return;
+      }
+      if (rt) return;
+      const hit = hitTest(x, y);
+      // The first click of the double-click placed this note; adding a bend point to a note
+      // that did not exist a moment ago is not what the gesture meant.
+      if (!hit || hit.note.id === justPlaced.current) return;
+      const o = bendOrigin(hit.note);
+      const cents = Math.round((((o.y - y) / ROW_H) * 100) / BEND_STEP_CENTS) * BEND_STEP_CENTS;
+      commit(addPitchPoint(notes, hit.note.id, (x - o.x) / pxPerTick, cents), "add bend point");
       return;
     }
     const pitch = pitchForY(y);
@@ -1692,6 +1837,8 @@ function dragLabel(d: Drag, before: NoteEvent[], after: NoteEvent[]): string {
       return `set note ${NOTE_PROPS[d.prop].label}`;
     case "ramp":
       return `ramp note ${NOTE_PROPS[d.prop].label}`;
+    case "bend":
+      return "move bend point";
     case "marquee":
       return "edit notes";
     case "rope":

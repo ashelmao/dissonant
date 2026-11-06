@@ -181,7 +181,7 @@ describe("openPattern and the playback context", () => {
     expect(st().ghostLevel).toBe(0);
   });
 
-  it("SETUP, SONG and the guitar screen all play the song", async () => {
+  it("SETUP, SONG and the rec page all play the song", async () => {
     st().setScreen("pattern");
     await settle();
     expect(lastContext()?.[0]).toBe("pattern");
@@ -190,7 +190,7 @@ describe("openPattern and the playback context", () => {
     expect(lastContext()?.[0]).toBe("song");
     const calls = context.mock.calls.length;
     st().setScreen("setup");
-    st().setScreen("guitar");
+    st().setScreen("rec");
     await settle();
     // Same engine mode: no new context needed.
     expect(context.mock.calls.length).toBe(calls);
@@ -259,5 +259,53 @@ describe("zoom memory", () => {
     const reloaded = await import("./store");
     expect(reloaded.storedZoom("setup")).toBeNull();
     expect(reloaded.useStore.getState().zoom).toBe(3);
+  });
+});
+
+
+describe("the REC page's track", () => {
+  it("follows the arm over the selection", async () => {
+    // The starter project may have no audio tracks at all, so make the pair the rule needs.
+    while (model().tracks.filter((t) => t.isAudio).length < 2) await st().addAudioTrack();
+    const tracks = model().tracks.filter((t) => t.isAudio);
+    // A new audio track arms itself, which is the behaviour under test: clear it first.
+    await st().setArm(null);
+    st().selectTrack(tracks[0].id);
+    expect(S.recTrack(st())?.id).toBe(tracks[0].id);
+    await st().setArm(tracks[1].id);
+    // Armed wins: a take lands on the armed track, so that is the one the page shows.
+    expect(S.recTrack(st())?.id).toBe(tracks[1].id);
+    await st().setArm(null);
+    expect(S.recTrack(st())?.id).toBe(tracks[0].id);
+  });
+});
+
+describe("the tuner", () => {
+  it("closes itself when the screen changes, so nothing is left muted", async () => {
+    S.useStore.setState({ screen: "rec" });
+    await st().toggleTuner();
+    expect(st().tunerOpen).toBe(true);
+    st().setScreen("song");
+    await settle();
+    expect(st().tunerOpen).toBe(false);
+  });
+
+  it("closes itself when the transport starts", async () => {
+    S.useStore.setState({ screen: "rec" });
+    await st().toggleTuner();
+    expect(st().tunerOpen).toBe(true);
+    st().play();
+    await settle();
+    expect(st().tunerOpen).toBe(false);
+  });
+
+  it("forgets its reading on both edges", async () => {
+    S.useStore.setState({ screen: "rec", tunerHz: 110, tunerClarity: 0.9 });
+    await st().toggleTuner();
+    expect(st().tunerHz).toBeNull();
+    S.useStore.setState({ tunerHz: 110, tunerClarity: 0.9 });
+    await st().toggleTuner();
+    expect(st().tunerHz).toBeNull();
+    expect(st().tunerClarity).toBe(0);
   });
 });

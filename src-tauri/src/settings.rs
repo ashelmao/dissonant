@@ -3,6 +3,7 @@
 
 use dissonant_core::{beats_to_ticks, TimeSignature, TICKS_PER_BEAT};
 use serde::{Deserialize, Deserializer, Serialize};
+use std::collections::BTreeMap;
 use std::path::Path;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
@@ -14,6 +15,7 @@ pub struct Settings {
     pub export: ExportSettings,
     pub appearance: AppearanceSettings,
     pub metronome: MetronomeSettings,
+    pub tuner: TunerSettings,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -54,6 +56,31 @@ pub struct AudioSettings {
     pub input_device: Option<String>,
     /// Which of the input device's channels the guitar is plugged into.
     pub input_channel: u16,
+    /// Manual latency trim per input device, in ms, keyed by device name.
+    ///
+    /// Keyed by name rather than kept as one number because the right value is a property of
+    /// the interface and its driver, not of the project: plugging the laptop's own mic in
+    /// after an audio interface must not inherit the interface's trim. Devices the user has
+    /// never trimmed are simply absent and read as 0.
+    pub input_trims: BTreeMap<String, f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct TunerSettings {
+    /// What A4 is worth, in Hz. 440 unless you play with people who do not.
+    pub a4_hz: f64,
+    /// Which named tuning the readout names its strings from; see `ui/src/tuner.ts`.
+    pub tuning: String,
+}
+
+impl Default for TunerSettings {
+    fn default() -> Self {
+        TunerSettings {
+            a4_hz: 440.0,
+            tuning: "standard".into(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -319,6 +346,20 @@ impl Settings {
         // No interface exposes more than this, and a wild value would silently fall back to
         // the last channel rather than telling the user anything.
         a.input_channel = a.input_channel.min(63);
+        // A trim is the player's own measurement, so it is kept whatever it says — but a
+        // nonsense one would move every take by half a bar, and the window either side of the
+        // measured latency is the only range a real interface can hide in.
+        a.input_trims
+            .retain(|name, ms| !name.is_empty() && ms.is_finite() && (-50.0..=200.0).contains(&*ms));
+        let t = &mut self.tuner;
+        if !t.a4_hz.is_finite() {
+            t.a4_hz = 440.0;
+        }
+        // Wide enough for baroque pitch at one end and the sharp orchestras at the other.
+        t.a4_hz = t.a4_hz.clamp(390.0, 460.0);
+        if t.tuning.trim().is_empty() {
+            t.tuning = "standard".into();
+        }
         let m = &mut self.midi;
         if let Some(c) = m.channel {
             if !(1..=16).contains(&c) {
@@ -393,6 +434,29 @@ mod tests {
         assert_eq!(s.export.bit_depth, 16);
         assert_eq!(s.audio.buffer_size, None);
         assert_eq!(s.appearance.tier_colors.tension, "#ff9d2a");
+    }
+
+    /// The per-device trim and the tuner are the newest sections, so an older settings file
+    /// has neither — and a hand-edited one can have nonsense in both.
+    #[test]
+    fn trims_and_the_tuner_default_and_clamp() {
+        let old: Settings = serde_json::from_str(r#"{"audio":{"inputChannel":1}}"#).unwrap();
+        assert!(old.audio.input_trims.is_empty());
+        assert_eq!(old.tuner.a4_hz, 440.0);
+        assert_eq!(old.tuner.tuning, "standard");
+
+        let mut s = Settings::default();
+        s.audio.input_trims.insert("good interface".into(), 7.5);
+        s.audio.input_trims.insert("absurd".into(), 5_000.0);
+        s.audio.input_trims.insert("not a number".into(), f64::NAN);
+        s.audio.input_trims.insert(String::new(), 3.0);
+        s.tuner.a4_hz = 9_000.0;
+        s.tuner.tuning = "  ".into();
+        let s = s.sanitized();
+        assert_eq!(s.audio.input_trims.get("good interface"), Some(&7.5));
+        assert_eq!(s.audio.input_trims.len(), 1, "only the measurable trim survives");
+        assert_eq!(s.tuner.a4_hz, 460.0);
+        assert_eq!(s.tuner.tuning, "standard");
     }
 
     /// Settings written before the tick migration stored grids in beats. They have to come

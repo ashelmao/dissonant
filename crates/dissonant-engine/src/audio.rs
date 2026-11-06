@@ -261,17 +261,28 @@ fn mix_clip(
 }
 
 /// The clip's fade envelope `into` seconds from its start.
+///
+/// Equal power rather than linear: a punch seam is two clips overlapping, one fading out while
+/// the other fades in, and a pair of linear ramps dips ~3 dB in the middle of the join. With
+/// `sin`/`cos` the two squared gains sum to one, so a crossfade between takes of the same
+/// material holds its level. A lone fade sounds the same either way to within the curve.
 #[inline]
 fn fade_gain(clip: &SequenceAudioClip, into: f64) -> f32 {
     let mut g = 1.0f64;
     if clip.fade_in_seconds > 0.0 && into < clip.fade_in_seconds {
-        g *= (into / clip.fade_in_seconds).clamp(0.0, 1.0);
+        g *= equal_power(into / clip.fade_in_seconds);
     }
     let from_end = clip.length_seconds - into;
     if clip.fade_out_seconds > 0.0 && from_end < clip.fade_out_seconds {
-        g *= (from_end / clip.fade_out_seconds).clamp(0.0, 1.0);
+        g *= equal_power(from_end / clip.fade_out_seconds);
     }
     g as f32
+}
+
+/// `sin(t · π/2)`: the rising half of an equal-power pair, so that `f(t)² + f(1 - t)² == 1`.
+#[inline]
+fn equal_power(t: f64) -> f64 {
+    (t.clamp(0.0, 1.0) * std::f64::consts::FRAC_PI_2).sin()
 }
 
 /// Catmull-Rom through `p1`/`p2`, using `p0`/`p3` for the slopes.

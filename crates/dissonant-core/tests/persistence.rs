@@ -72,6 +72,66 @@ fn audio_tracks_clips_and_rigs_round_trip() {
 }
 
 #[test]
+fn amp_switches_round_trip_and_only_on_the_amps_that_have_them() {
+    // Circuit switches are per model: a tweed offers a bright cap and half power, a modern stack
+    // offers neither. A saved file that claims one the circuit never had opens with it off,
+    // rather than sounding like something other than the amp it names.
+    let head_of = |model: ProjectModel| {
+        model
+            .tracks
+            .iter()
+            .find(|t| t.is_audio)
+            .and_then(|t| t.amp.as_ref())
+            .expect("an audio track carries a rig")
+            .amp
+    };
+    let saved = |model: AmpModel, bright: bool, half: bool, follower: bool| {
+        let mut m = ProjectModel::starter();
+        let mut guitar = Track::audio("guitar");
+        let rig = guitar
+            .amp
+            .as_mut()
+            .expect("an audio track is created with a rig");
+        rig.amp.model = model;
+        rig.amp.bright_cap = bright;
+        rig.amp.half_power = half;
+        rig.amp.cathode_follower = follower;
+        m.tracks.push(guitar);
+        head_of(ProjectModel::from_json(&m.to_json().unwrap()).unwrap())
+    };
+
+    let tweed = saved(AmpModel::Clean, true, true, true);
+    assert_eq!(
+        (tweed.bright_cap, tweed.half_power, tweed.cathode_follower),
+        (true, true, false),
+        "a tweed kept its bright cap and half power, and must not have grown a follower"
+    );
+    let modern = saved(AmpModel::Lead, true, true, true);
+    assert_eq!(
+        (modern.bright_cap, modern.half_power, modern.cathode_follower),
+        (false, false, true),
+        "a modern head took switches its circuit does not have"
+    );
+    let fuzz = saved(AmpModel::Fuzz, true, true, true);
+    assert!(
+        !fuzz.bright_cap && !fuzz.half_power && !fuzz.cathode_follower,
+        "the fuzz voicing has no switches at all"
+    );
+
+    // And a head written before the switches existed opens with every one of them off, so an
+    // old project still sounds like itself.
+    let old: AmpHead = serde_json::from_str(
+        r#"{"model":"clean","gain":4.0,"bass":5.0,"mid":6.0,"treble":6.0,"presence":4.0,
+            "master":6.0}"#,
+    )
+    .expect("a head saved before the switches still parses");
+    assert!(
+        !old.bright_cap && !old.half_power && !old.cathode_follower,
+        "a file that predates the switches must open with them off"
+    );
+}
+
+#[test]
 fn a_project_with_no_audio_writes_no_audio_keys() {
     // Opening and re-saving an old project must not grow it with empty collections.
     let json = ProjectModel::starter().to_json().unwrap();

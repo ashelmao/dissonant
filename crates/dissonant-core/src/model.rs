@@ -12,6 +12,7 @@
 //! patterns that hold every track's notes and their own chords; [`ProjectModel::migrated_v10`]
 //! splits each into one pattern per track and lifts its chords onto the song.
 
+use crate::automation::Curve;
 use crate::effects::{NativeKind, ParamMap};
 use crate::ticks::{beats_to_ticks, TICKS_PER_BEAT};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -130,6 +131,114 @@ fn migrate_tick(tick: &mut i64, legacy: &mut Option<f64>) {
     }
 }
 
+/// Most chord candidates one analysis may leave in the detected lane. A take is minutes long
+/// at most and a chord lasts a strum or more, so this is never reached by real playing; it
+/// bounds what a hand-edited file can make the lane draw.
+pub const MAX_DETECTED_CHORDS: usize = 512;
+
+/// A chord heard in a recorded DI, waiting in the detected lane. Nothing reads it but the lane:
+/// it only reaches the song's progression when the player accepts it, so a wrong guess over a
+/// section nobody played costs a click, not a rewritten harmony.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DetectedChord {
+    #[serde(default = "Uuid::new_v4")]
+    pub id: Uuid,
+    /// Song ticks, like the progression it may join.
+    #[serde(default)]
+    pub start_tick: i64,
+    #[serde(default)]
+    pub length_ticks: i64,
+    /// Root first, as the chord track stores them.
+    pub pitch_classes: Vec<i32>,
+    #[serde(default)]
+    pub name: Option<String>,
+    /// 0…1: how closely the heard chroma matched this chord's template. Shown, never used to
+    /// accept anything on the player's behalf.
+    #[serde(default)]
+    pub confidence: f32,
+}
+
+impl DetectedChord {
+    pub fn end_tick(&self) -> i64 {
+        self.start_tick + self.length_ticks
+    }
+
+    /// The chord as it lands on the progression: same span, same notes, same id, so the lane
+    /// and the progression agree about which block came from where.
+    pub fn to_chord(&self) -> ChordEvent {
+        let mut c = ChordEvent::new(
+            self.start_tick,
+            self.length_ticks,
+            self.pitch_classes.clone(),
+            self.name.clone(),
+        );
+        c.id = self.id;
+        c
+    }
+}
+
+/// What one analysis of one audio clip found besides notes: chord candidates over the regions
+/// it refused as polyphonic, and the pitch-class weight of those regions for key detection.
+///
+/// Keyed by the clip, so analysing the same take again replaces its candidates instead of
+/// stacking a second copy of every chord. A detection whose clip is gone is dropped on load.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClipDetection {
+    pub clip_id: Uuid,
+    #[serde(default)]
+    pub chords: Vec<DetectedChord>,
+    /// Per pitch class (0 = C), in note equivalents: each strum adds roughly one per string it
+    /// rang, so it sums with a histogram of placed notes on the same scale. That is what lets
+    /// [`crate::KeyDetector::detect_with_chroma`] weigh a strummed riff against written notes.
+    #[serde(default)]
+    pub chroma: [f32; 12],
+}
+
+impl ClipDetection {
+    /// Chords sorted, cut so none overlap, each with a real span, normalized pitch classes and
+    /// a confidence in 0…1, at most [`MAX_DETECTED_CHORDS`]; chroma finite and non-negative.
+    pub fn sanitized(mut self) -> Self {
+        let mut chords: Vec<DetectedChord> = std::mem::take(&mut self.chords)
+            .into_iter()
+            .filter(|c| c.start_tick >= 0 && c.length_ticks > 0)
+            .map(|mut c| {
+                let mut pcs: Vec<i32> = Vec::with_capacity(c.pitch_classes.len());
+                for pc in c.pitch_classes.iter().map(|&p| crate::theory::normalize(p)) {
+                    if !pcs.contains(&pc) {
+                        pcs.push(pc);
+                    }
+                }
+                c.pitch_classes = pcs;
+                c.confidence = if c.confidence.is_finite() {
+                    c.confidence.clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                c
+            })
+            .filter(|c| !c.pitch_classes.is_empty())
+            .collect();
+        chords.sort_by_key(|c| c.start_tick);
+        let starts: Vec<i64> = chords.iter().map(|c| c.start_tick).collect();
+        for (i, c) in chords.iter_mut().enumerate() {
+            if let Some(&next) = starts.get(i + 1) {
+                c.length_ticks = c.length_ticks.min(next - c.start_tick);
+            }
+        }
+        chords.retain(|c| c.length_ticks > 0);
+        chords.truncate(MAX_DETECTED_CHORDS);
+        self.chords = chords;
+        for v in &mut self.chroma {
+            if !v.is_finite() || *v < 0.0 {
+                *v = 0.0;
+            }
+        }
+        self
+    }
+}
+
 fn default_velocity() -> i32 {
     100
 }
@@ -167,6 +276,143 @@ pub const MAX_SLIDE_SECS: f32 = 2.0;
 /// than this.
 pub const MIN_NOTE_TICKS: i64 = TICKS_PER_BEAT / 16;
 
+/// Most points one note's pitch envelope may carry. A bend, a slide or a vibrato cycle inside
+/// one note needs a handful; sixteen is generous for all three and keeps the envelope small
+/// enough to ride to the audio thread by value, which is the only reason there is a cap.
+pub const MAX_PITCH_POINTS: usize = 16;
+
+/// Decimation tolerance for a dense pitch contour, in cents. Five cents is under what a
+/// listener hears as out of tune on a moving note and under what a pitch detector resolves
+/// reliably, so throwing away everything inside it costs nothing audible.
+pub const PITCH_DECIMATE_CENTS: f32 = 5.0;
+
+/// One point on a note's pitch envelope: `cents` away from the note's own pitch, reached
+/// `tick` after the note starts.
+///
+/// The reading rule is the automation lane's ([`Curve`]) with one deliberate difference: an
+/// envelope with no point at tick 0 is *zero* before its first point, not that point's value.
+/// A lane overrides a control, so holding the first value backwards is right there; an
+/// envelope offsets a note, and a note that has not bent yet is simply in tune.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PitchPoint {
+    /// Ticks after the note's start. Never negative.
+    #[serde(default)]
+    pub tick: i64,
+    /// Offset from the note's pitch *and* its `fine`, in cents, ±[`MAX_FINE_CENTS`].
+    #[serde(default)]
+    pub cents: f32,
+    #[serde(default)]
+    pub curve: Curve,
+}
+
+impl PitchPoint {
+    pub fn new(tick: i64, cents: f32, curve: Curve) -> Self {
+        PitchPoint { tick, cents, curve }
+    }
+}
+
+/// Sort by tick, drop junk, clamp into range and fit under [`MAX_PITCH_POINTS`].
+///
+/// Over the cap the envelope is decimated rather than truncated: chopping the tail off a bend
+/// would silently delete the part of the gesture that moves furthest, while decimation keeps
+/// the shape and spends its budget where the contour actually turns.
+pub fn tidy_pitch_envelope(mut points: Vec<PitchPoint>) -> Vec<PitchPoint> {
+    points.retain(|p| p.tick >= 0 && p.cents.is_finite());
+    for p in &mut points {
+        p.cents = p.cents.clamp(-MAX_FINE_CENTS as f32, MAX_FINE_CENTS as f32);
+    }
+    points.sort_by_key(|p| p.tick);
+    // `dedup_by` keeps the first of a run; the later point is the one the writer meant, so
+    // walk it backwards to keep that one instead — the same trick `AutomationLane::tidy` uses.
+    points.reverse();
+    points.dedup_by_key(|p| p.tick);
+    points.reverse();
+    if points.len() > MAX_PITCH_POINTS {
+        let dense: Vec<(i64, f32)> = points.iter().map(|p| (p.tick, p.cents)).collect();
+        points = decimate_pitch_envelope(&dense, PITCH_DECIMATE_CENTS);
+    }
+    points
+}
+
+/// Ramer–Douglas–Peucker over a dense `(tick, cents)` contour, into at most
+/// [`MAX_PITCH_POINTS`] ramp points.
+///
+/// This is what pitch detection hands a per-note bend through: a detector emits one reading
+/// per analysis hop, which is hundreds of points for one note, and the file format stores the
+/// handful that describe the same line to within `tolerance_cents`.
+///
+/// Deviation is measured *vertically*, in cents, not perpendicular to the chord as textbook
+/// RDP does over a map: ticks and cents share no unit, and the error that matters is how far
+/// out of tune the simplified line is at a given moment. Both ends are always kept, so the
+/// decimated contour starts and finishes where the played one did. The classic recursion is
+/// written as a worklist that always splits the segment with the largest deviation, which is
+/// the same result and lets the cap stop it early with the most significant points chosen.
+pub fn decimate_pitch_envelope(dense: &[(i64, f32)], tolerance_cents: f32) -> Vec<PitchPoint> {
+    let point = |&(tick, cents): &(i64, f32)| PitchPoint::new(tick, cents, Curve::Ramp);
+    if dense.len() <= 2 {
+        return dense.iter().map(point).collect();
+    }
+    let tolerance = tolerance_cents.max(0.0);
+    // Worst deviation inside `(i, j)` exclusive, as (index, deviation).
+    let worst = |i: usize, j: usize| -> (usize, f32) {
+        let (x0, y0) = dense[i];
+        let (x1, y1) = dense[j];
+        let run = (x1 - x0) as f32;
+        let mut best = (i, -1.0f32);
+        for (k, &(x, y)) in dense.iter().enumerate().take(j).skip(i + 1) {
+            // A zero-length run means every point between the ends shares their tick; the
+            // chord is then the flat line through the first end.
+            let line = if run == 0.0 {
+                y0
+            } else {
+                y0 + (y1 - y0) * ((x - x0) as f32 / run)
+            };
+            let d = (y - line).abs();
+            if d > best.1 {
+                best = (k, d);
+            }
+        }
+        best
+    };
+
+    // One segment still open for splitting: its ends, the index inside it that lies furthest
+    // from the chord between them, and how far that is.
+    struct Seg {
+        i: usize,
+        j: usize,
+        split: usize,
+        dev: f32,
+    }
+    let seg = |i: usize, j: usize| {
+        let (split, dev) = worst(i, j);
+        Seg { i, j, split, dev }
+    };
+
+    let last = dense.len() - 1;
+    let mut kept = vec![0usize, last];
+    let mut open = vec![seg(0, last)];
+    while kept.len() < MAX_PITCH_POINTS {
+        let Some(slot) = (0..open.len()).max_by(|&a, &b| open[a].dev.total_cmp(&open[b].dev))
+        else {
+            break;
+        };
+        if open[slot].dev <= tolerance {
+            break;
+        }
+        let Seg { i, j, split, .. } = open.swap_remove(slot);
+        kept.push(split);
+        if split > i + 1 {
+            open.push(seg(i, split));
+        }
+        if j > split + 1 {
+            open.push(seg(split, j));
+        }
+    }
+    kept.sort_unstable();
+    kept.iter().map(|&i| point(&dense[i])).collect()
+}
+
 /// One note in the piano roll. `pitch` is a MIDI note number (0–127), `velocity` 1–127.
 ///
 /// The properties below the first five are per-note performance controls modelled on FL
@@ -203,6 +449,13 @@ pub struct NoteEvent {
     /// Detune in cents, ±[`MAX_FINE_CENTS`]. Drives the drum grid's step pitch as well.
     #[serde(default, skip_serializing_if = "is_zero_i32")]
     pub fine: i32,
+    /// The note's pitch contour, as an offset *on top of* `fine`: at most
+    /// [`MAX_PITCH_POINTS`] points, each a tick after the note's start and a cents offset.
+    /// Empty — the overwhelming majority — means the note holds `pitch + fine` throughout,
+    /// exactly as every note did before bends existed, and costs nothing in the file or on
+    /// the audio thread.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pitch_envelope: Vec<PitchPoint>,
     /// Filter cutoff for this note: 0.5 is the track's tone, below closes, above opens.
     #[serde(default = "half", skip_serializing_if = "is_half")]
     pub mod_x: f32,
@@ -253,6 +506,7 @@ impl NoteEvent {
             pan: 0.5,
             release: 0.5,
             fine: 0,
+            pitch_envelope: Vec::new(),
             mod_x: 0.5,
             mod_y: 0.5,
             shift_ticks: 0,
@@ -299,6 +553,7 @@ impl NoteEvent {
             .slide_secs
             .filter(|s| s.is_finite())
             .map(|s| s.clamp(0.0, MAX_SLIDE_SECS));
+        self.pitch_envelope = tidy_pitch_envelope(std::mem::take(&mut self.pitch_envelope));
         self
     }
 
@@ -645,6 +900,9 @@ impl AudioSource {
 pub const MAX_FADE_SECONDS: f64 = 5.0;
 /// Loudest a clip may be boosted, linear.
 pub const MAX_CLIP_GAIN: f64 = 4.0;
+/// The crossfade a punch lays over each of its two seams, in seconds. 15 ms is long enough to
+/// hide the join between two takes and short enough that nothing audible is doubled.
+pub const DEFAULT_PUNCH_CROSSFADE_SECONDS: f64 = 0.015;
 
 /// A piece of an [`AudioSource`] on an audio track's timeline. Audio never warps: it is
 /// anchored at a beat and then plays for a length in seconds, so a tempo change moves where
@@ -1024,6 +1282,16 @@ pub struct AmpHead {
     pub treble: f64,
     pub presence: f64,
     pub master: f64,
+    /// The treble bypass across the gain pot. Only meaningful on the models whose circuit has
+    /// one — see [`AmpModel::has_bright_cap`]; [`AmpRig::sanitized`] switches it off elsewhere
+    /// rather than let a hand-edited file give a modern head a part it never shipped with.
+    pub bright_cap: bool,
+    /// Half the output tubes. Less headroom and a supply that gives up sooner, which is why
+    /// people reach for it: the amp breaks up at a volume the room can stand.
+    pub half_power: bool,
+    /// Drive the tone stack from a cathode follower instead of straight off a plate. The
+    /// follower squashes and conducts on its own account, before the stack ever sees the signal.
+    pub cathode_follower: bool,
 }
 
 impl Default for AmpHead {
@@ -1036,6 +1304,9 @@ impl Default for AmpHead {
             treble: 6.0,
             presence: 5.0,
             master: 5.0,
+            bright_cap: false,
+            half_power: false,
+            cathode_follower: false,
         }
     }
 }
@@ -1058,6 +1329,27 @@ impl AmpModel {
         AmpModel::Lead,
         AmpModel::Fuzz,
     ];
+
+    /// A bright cap sits across the gain pot of amps built when players wanted the top back at
+    /// low volume. A modern high-gain head deliberately has none: at that gain it would be
+    /// unusable, so the switch is not offered rather than offered and pointless.
+    pub fn has_bright_cap(self) -> bool {
+        matches!(self, AmpModel::Clean | AmpModel::Crunch)
+    }
+
+    /// Pulling half the output tubes is a combo trick: it is how you get a small amp's break-up
+    /// out of a loud one. The big heads in this list either never had the switch or do not need
+    /// it, since they break up long before the power stage does.
+    pub fn has_half_power(self) -> bool {
+        matches!(self, AmpModel::Clean)
+    }
+
+    /// The cathode follower driving the tone stack is the British circuit, and it is most of why
+    /// those amps feel springy rather than stiff. The American combo drives its stack off a
+    /// plate, and the fuzz voicing is not that circuit at all.
+    pub fn has_cathode_follower(self) -> bool {
+        matches!(self, AmpModel::Crunch | AmpModel::Lead)
+    }
 }
 
 /// Which passive tone-stack topology sits between the preamp and the power amp. These are
@@ -1211,6 +1503,11 @@ impl AmpRig {
         self.amp.treble = knob(self.amp.treble)?;
         self.amp.presence = knob(self.amp.presence)?;
         self.amp.master = knob(self.amp.master)?;
+        // A switch the circuit never had is not a switch. Turning it off here rather than
+        // ignoring it downstream keeps the saved file and the sound telling the same story.
+        self.amp.bright_cap &= self.amp.model.has_bright_cap();
+        self.amp.half_power &= self.amp.model.has_half_power();
+        self.amp.cathode_follower &= self.amp.model.has_cathode_follower();
         self.cab.pos_x = knob(self.cab.pos_x)?;
         self.cab.pos_z = knob(self.cab.pos_z)?;
         self.rack.reverb = knob(self.rack.reverb)?;
@@ -1736,6 +2033,14 @@ pub struct ProjectModel {
     /// `None` keeps a project without a loop byte-identical, so the schema does not move.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub loop_region: Option<(i64, i64)>,
+    /// The punch range in song ticks, `(in, out)` with `out > in`; `None` means nothing is
+    /// armed. It sits beside the loop brace for the same reason — it marks a place in the
+    /// music ("fix this bar") that has to survive the session — and the two are deliberately
+    /// separate ranges: looping is blocked while a punch is armed, so a single range standing
+    /// for both would make comping an accident waiting to happen. Same serde deal as
+    /// `loop_region`: older files open, and a project with no punch is byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub punch_region: Option<(i64, i64)>,
     /// The master effect chain, in order, ahead of the master bus processing.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub master_inserts: Vec<Insert>,
@@ -1751,6 +2056,11 @@ pub struct ProjectModel {
     /// Copies of the non-factory sounds the tracks use, so the project plays anywhere.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sounds: Vec<crate::sound::Sound>,
+    /// What DI analysis heard besides notes, one entry per analysed audio clip: chord
+    /// candidates for the detected lane and chroma for key detection. Absent when empty, so a
+    /// project that never ran detection is byte-identical to one saved before it existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub detections: Vec<ClipDetection>,
     /// Schema ≤ 8 only; folded into `swing_grid_ticks` by [`ProjectModel::normalized`].
     #[serde(default, rename = "swingGrid", skip_serializing)]
     pub legacy_swing_grid: Option<f64>,
@@ -1872,9 +2182,11 @@ impl ProjectModel {
             chords: Default::default(),
             song_length_ticks: default_song_length(),
             loop_region: None,
+            punch_region: None,
             master_inserts: vec![],
             automation: vec![],
             sounds: vec![],
+            detections: vec![],
             legacy_swing_grid: None,
         }
     }
@@ -1983,8 +2295,8 @@ impl ProjectModel {
     }
 
     /// Hold the song's hard end: clips starting at or after it go, clips crossing it are cut,
-    /// and the loop brace is pulled back inside (a brace left hanging past the end would loop
-    /// over silence).
+    /// and the loop brace and punch range are pulled back inside (either one left hanging past
+    /// the end would name silence).
     pub(crate) fn fit_clips_to_song(&mut self) {
         let end = self.song_length_ticks;
         self.clips.retain(|c| c.start_tick < end);
@@ -1994,6 +2306,7 @@ impl ProjectModel {
             }
         }
         self.loop_region = self.loop_region.and_then(|(s, e)| clamp_loop(s, e, end));
+        self.punch_region = self.punch_region.and_then(|(s, e)| clamp_loop(s, e, end));
     }
 
     /// Where a section stops, or `None` when nothing bounds it: with no explicit extent and no
@@ -2185,6 +2498,20 @@ impl ProjectModel {
             .filter_map(AudioClip::sanitized)
             .collect();
         self.audio_clips.sort_by_key(|c| c.start_tick);
+        // Detection results of a take that is gone describe nothing on the song any more; one
+        // entry per clip, so a hand-merged file cannot draw two lanes' worth for one take.
+        let clip_ids: Vec<Uuid> = self.audio_clips.iter().map(|c| c.id).collect();
+        let mut detected: Vec<Uuid> = Vec::new();
+        self.detections = std::mem::take(&mut self.detections)
+            .into_iter()
+            .filter(|d| clip_ids.contains(&d.clip_id))
+            .filter(|d| {
+                let fresh = !detected.contains(&d.clip_id);
+                detected.push(d.clip_id);
+                fresh
+            })
+            .map(ClipDetection::sanitized)
+            .collect();
         // A negative extent is nonsense; 0 is the implicit one, so that is where it lands.
         for s in &mut self.sections {
             s.length_ticks = s.length_ticks.max(0);

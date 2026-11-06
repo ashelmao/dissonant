@@ -7,7 +7,8 @@ use crate::channel::{
 };
 use crate::drums::{DrumBank, DrumKit, RenderedDrum};
 use crate::dsp::pan_gains;
-use crate::synth::PolySynth;
+use crate::synth::{Bend, PolySynth};
+use crate::tuner::PitchTracker;
 use dissonant_core::{
     factory_sound, swing_warp_ticks, AutomationCurve, InsertTarget, MasterSettings, NoteEvent,
     NoteRope, Sequence, SequenceTrack, SoundPatch, SynthPatch, Tempo, TempoMap, TrackAutomation,
@@ -59,6 +60,12 @@ pub struct Shared {
     count_in: AtomicU32,
     /// Peak of the live input over the last block, as f32 bits.
     input_peak: AtomicU32,
+    /// The highest the input has reached since the last `ClearInputPeak`, as f32 bits. A peak
+    /// that only lasted a block is still the peak the gain has to leave room for.
+    input_peak_hold: AtomicU32,
+    /// Latched the same way: the input hit full scale, so it clipped before the rig ever saw
+    /// it. Cleared only by `ClearInputPeak`.
+    input_over: AtomicBool,
     /// Input samples still in hand after the last block — latency the player feels.
     input_backlog: AtomicU32,
     /// Blocks in which the input ring ran dry since the stream started.
@@ -69,6 +76,10 @@ pub struct Shared {
     record_start_tick: AtomicU64,
     /// Frames captured into the current take.
     record_frames: AtomicU64,
+    /// The tuner's last reading in Hz, as f32 bits; 0 when it has heard nothing periodic.
+    tuner_hz: AtomicU32,
+    /// How periodic that reading was, 0…1, as f32 bits.
+    tuner_clarity: AtomicU32,
     /// The preview channel's mono output as f32 bits, a ring indexed by `scope_written`.
     scope: [AtomicU32; SCOPE_RING],
     /// Samples ever written to `scope`.
@@ -90,10 +101,14 @@ impl Default for Shared {
             xruns: AtomicU32::new(0),
             count_in: AtomicU32::new(0),
             input_peak: AtomicU32::new(0),
+            input_peak_hold: AtomicU32::new(0),
+            input_over: AtomicBool::new(false),
             input_underruns: AtomicU32::new(0),
             recording: AtomicBool::new(false),
             record_start_tick: AtomicU64::new(0),
             record_frames: AtomicU64::new(0),
+            tuner_hz: AtomicU32::new(0),
+            tuner_clarity: AtomicU32::new(0),
             scope: std::array::from_fn(|_| AtomicU32::new(0)),
             scope_written: AtomicUsize::new(0),
         }
@@ -155,6 +170,15 @@ impl Shared {
     pub fn input_underruns(&self) -> u32 {
         self.input_underruns.load(Ordering::Relaxed)
     }
+    /// The highest the input has reached since the last clear — the meter's hold marker.
+    pub fn input_peak_hold(&self) -> f32 {
+        f32::from_bits(self.input_peak_hold.load(Ordering::Relaxed))
+    }
+    /// Latched since the last clear: the input hit full scale before the rig, so the only fix
+    /// is the interface's own gain.
+    pub fn input_over(&self) -> bool {
+        self.input_over.load(Ordering::Relaxed)
+    }
     /// Input frames still queued after the last block. With the device block size this is the
     /// whole monitoring delay.
     pub fn input_backlog(&self) -> u32 {
@@ -170,6 +194,13 @@ impl Shared {
             f64::from_bits(self.record_start_tick.load(Ordering::Relaxed)),
             self.record_frames.load(Ordering::Relaxed),
         )
+    }
+
+    /// The tuner's last reading: frequency in Hz and how periodic the window was. `None` until
+    /// the tuner is open and hearing something with a pitch.
+    pub fn tuner_reading(&self) -> Option<(f32, f32)> {
+        let hz = f32::from_bits(self.tuner_hz.load(Ordering::Relaxed));
+        (hz > 0.0).then(|| (hz, f32::from_bits(self.tuner_clarity.load(Ordering::Relaxed))))
     }
 
     /// Audio thread: append a block of the preview channel's output to the scope ring.
@@ -240,6 +271,14 @@ pub enum EngineCommand {
         end: f64,
     },
     ClearLoop,
+    /// Arm a punch over `[start, end)` in ticks: capture is held until the transport reaches
+    /// `start` and dropped again at `end`. Looping is suppressed for as long as one is armed —
+    /// a loop would record the same bars twice, which is comping, which punch is not.
+    SetPunch {
+        start: f64,
+        end: f64,
+    },
+    ClearPunch,
     /// A held note from a controller / typing keyboard. Released by `NoteOff`.
     NoteOn {
         track_id: Uuid,
@@ -282,6 +321,12 @@ pub enum EngineCommand {
     /// Reset the latched over-the-ceiling flag in `Shared` — the user acknowledging the clip
     /// indicator, not a mix change.
     ClearClip,
+    /// Reset the input meter's peak hold and its clip latch.
+    ClearInputPeak,
+    /// Open or close the tuner. While it is open the engine's output is silenced — you tune
+    /// against the strings, not through whatever the rig was doing — and the live input is run
+    /// through pitch detection on every block the transport is stopped for.
+    SetTuner(bool),
     /// Click on every beat (accented on the bar) while playing; `volume` 0…1.
     SetMetronome {
         on: bool,
@@ -387,8 +432,12 @@ struct Click {
 /// editor to whichever voice plays it. Pitch, velocity and timing are the event's own fields;
 /// these five are the ones a voice has to be told about.
 ///
-/// `Copy` and five words wide: it rides inside the scheduler's event enum, which is pushed by
-/// value on the audio thread and must never allocate.
+/// `Copy` and allocation-free: it rides inside the scheduler's event enum, which is pushed by
+/// value on the audio thread. `bend` is what makes it wide — a note's whole pitch contour,
+/// inlined at its hard cap rather than borrowed, because the audio thread must not follow a
+/// pointer into a [`Sequence`] that an edit may swap out from under a sounding note.
+///
+/// [`Sequence`]: dissonant_core::sequence::Sequence
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct NoteShape {
     /// 0 hard left … 0.5 centre … 1 hard right.
@@ -401,6 +450,8 @@ pub struct NoteShape {
     pub mod_x: f32,
     /// Filter resonance; 0.5 is flat.
     pub mod_y: f32,
+    /// The note's pitch contour on top of `fine`, already resolved onto the sample clock.
+    pub bend: Bend,
 }
 
 impl NoteShape {
@@ -413,9 +464,12 @@ impl NoteShape {
             fine: 0,
             mod_x: 0.5,
             mod_y: 0.5,
+            bend: Bend::NONE,
         }
     }
 
+    /// The note's expression with no contour. The two schedulers below add the bend, since
+    /// resolving it needs the tempo map and the sample rate that only they hold.
     pub fn from_note(note: &NoteEvent) -> Self {
         NoteShape {
             pan: note.pan,
@@ -423,7 +477,14 @@ impl NoteShape {
             fine: note.fine,
             mod_x: note.mod_x,
             mod_y: note.mod_y,
+            bend: Bend::NONE,
         }
+    }
+
+    /// The same expression carrying a resolved pitch contour.
+    pub fn bent(mut self, bend: Bend) -> Self {
+        self.bend = bend;
+        self
     }
 }
 
@@ -570,12 +631,33 @@ fn key_starts_between(
         })
 }
 
+/// A note's pitch envelope resolved onto the sample clock for the strike that sounds at song
+/// tick `at`, with the playhead standing at `now` (`now > at` only when a seek lands inside
+/// the note, and the bend is then picked up mid-flight rather than restarted).
+///
+/// Envelope ticks are relative to the strike and go through the tempo map, so a bend drawn
+/// across a tempo ramp still lands where it was drawn.
+fn note_bend(note: &NoteEvent, map: &TempoMap, at: f64, now: f64, sr: f64) -> Bend {
+    if note.pitch_envelope.is_empty() {
+        return Bend::NONE;
+    }
+    let t0 = map.seconds_at_tick(at);
+    Bend::new(
+        &note.pitch_envelope,
+        |tick| (map.seconds_at_tick(at + tick as f64) - t0) * sr,
+        ((map.seconds_at_tick(now) - t0) * sr).max(0.0) as u32,
+    )
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Event {
     offset: usize,
     kind: EventKind,
 }
 
+/// `NoteOn` carries a whole [`NoteShape`] (its bend included) and dwarfs the other variants.
+/// Boxing it would put an allocation on the audio thread for every note, so the size stays.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum EventKind {
     NoteOn {
@@ -656,6 +738,8 @@ pub struct Engine {
     looping: bool,
     /// Loop sub-range in ticks.
     loop_region: Option<(f64, f64)>,
+    /// Armed punch range in ticks. Blocks looping and gates capture while it is set.
+    punch: Option<(f64, f64)>,
     /// Playhead in ticks; fractional between blocks.
     position: f64,
     tempo: Tempo,
@@ -694,6 +778,11 @@ pub struct Engine {
     input: Option<rtrb::Consumer<f32>>,
     /// Where recorded samples go to be written to disk. `None` offline.
     capture: Option<rtrb::Producer<f32>>,
+    /// The tuner strip is open: silence the output and keep detection running.
+    tuner_open: bool,
+    /// Pitch detection over the live input. Allocated with the engine rather than when the
+    /// tuner opens, because opening it happens on the audio thread.
+    tuner: PitchTracker,
     /// The SOUND page's instrument: outside the track list, audible with the transport
     /// stopped, and untouched by mute / solo.
     preview: Option<Instrument>,
@@ -733,6 +822,7 @@ impl Engine {
             playing: false,
             looping: true,
             loop_region: None,
+            punch: None,
             position: 0.0,
             tempo: Tempo::default(),
             mix_l: vec![0.0; 8192],
@@ -757,6 +847,8 @@ impl Engine {
             clean_blocks: 0,
             input: None,
             capture: None,
+            tuner_open: false,
+            tuner: PitchTracker::new(sample_rate),
             preview: None,
             preview_closing: false,
             preview_buf: (vec![0.0; 8192], vec![0.0; 8192]),
@@ -862,7 +954,7 @@ impl Engine {
                 self.release_all();
                 self.position = tick.max(0.0);
                 let (start, end) = self.loop_bounds();
-                if self.looping && self.position >= end {
+                if self.loop_active() && self.position >= end {
                     self.position = start;
                 }
                 self.resume_notes = true;
@@ -876,6 +968,10 @@ impl Engine {
                 }
             }
             EngineCommand::ClearLoop => self.loop_region = None,
+            EngineCommand::SetPunch { start, end } => {
+                self.punch = (end > start && start >= 0.0).then_some((start, end));
+            }
+            EngineCommand::ClearPunch => self.punch = None,
             EngineCommand::NoteOn {
                 track_id,
                 pitch,
@@ -957,6 +1053,22 @@ impl Engine {
             }
             EngineCommand::TestTone => self.test_tone = ((self.sample_rate * 0.6) as usize, 0.0),
             EngineCommand::ClearClip => self.shared.master_over.store(false, Ordering::Relaxed),
+            EngineCommand::ClearInputPeak => {
+                self.shared
+                    .input_peak_hold
+                    .store(0f32.to_bits(), Ordering::Relaxed);
+                self.shared.input_over.store(false, Ordering::Relaxed);
+            }
+            EngineCommand::SetTuner(on) => {
+                self.tuner_open = on;
+                // Start from nothing either way: a reading left over from the last time the
+                // tuner was open would show up under the next string for a hop or two.
+                self.tuner.reset();
+                self.shared.tuner_hz.store(0f32.to_bits(), Ordering::Relaxed);
+                self.shared
+                    .tuner_clarity
+                    .store(0f32.to_bits(), Ordering::Relaxed);
+            }
             EngineCommand::SetInstrument {
                 track_id,
                 instrument,
@@ -1068,6 +1180,13 @@ impl Engine {
             Some((s, e)) if e > s => (s.max(0.0).min(len), e.min(len).max(s.max(0.0))),
             _ => (0.0, len),
         }
+    }
+
+    /// Whether the transport actually wraps. An armed punch suppresses looping outright: the
+    /// loop would carry the playhead back over the punch range and record it a second time,
+    /// which is take stacking by accident. The UI says so too; this is the backstop.
+    fn loop_active(&self) -> bool {
+        self.looping && self.punch.is_none()
     }
 
     fn channel_mut(&mut self, id: &Uuid) -> Option<&mut Channel> {
@@ -1212,7 +1331,7 @@ impl Engine {
         self.apply_arm();
         self.tempo = Tempo::new(self.sequence.tempo_bpm);
         let (start, end) = self.loop_bounds();
-        if self.looping && self.position >= end {
+        if self.loop_active() && self.position >= end {
             self.position = start;
         }
     }
@@ -1275,6 +1394,7 @@ impl Engine {
         self.mix_l[..frames].fill(0.0);
         self.mix_r[..frames].fill(0.0);
         self.pull_input(frames);
+        self.run_tuner(frames);
 
         self.tick_count_in(frames);
         self.capture_take(frames);
@@ -1357,12 +1477,38 @@ impl Engine {
         for s in out.iter_mut() {
             *s = s.clamp(-1.0, 1.0);
         }
+        if self.tuner_open {
+            // After the limiter and the clicks, so nothing — mix, metronome, monitored rig —
+            // survives the tuner being open. The meters above still read the real signal, so
+            // the input strip keeps working while the room stays quiet.
+            out.fill(0.0);
+        }
 
         if self.playing {
             self.position = self.advance(self.position, frames - self.late_start.min(frames));
         }
         self.late_start = 0;
         self.publish();
+    }
+
+    /// Feed the tuner this block's input while it is open and the transport is stopped.
+    ///
+    /// Stopped only: playing back and tuning at once is not a thing anyone does, and the
+    /// search is the one piece of per-block work here that is not proportional to the mix.
+    fn run_tuner(&mut self, frames: usize) {
+        if !self.tuner_open || self.playing {
+            return;
+        }
+        if !self.tuner.push(&self.input_block[..frames]) {
+            return;
+        }
+        // A search that heard nothing publishes zero: a muted string has to stop reading as
+        // whatever was last plucked, or the needle lies while you are reaching for the peg.
+        let (hz, clarity) = self.tuner.last().map(|p| (p.hz, p.clarity)).unwrap_or((0.0, 0.0));
+        self.shared.tuner_hz.store(hz.to_bits(), Ordering::Relaxed);
+        self.shared
+            .tuner_clarity
+            .store(clarity.to_bits(), Ordering::Relaxed);
     }
 
     /// While counting in: click on each beat boundary inside this block and, when the count
@@ -1460,6 +1606,18 @@ impl Engine {
         self.shared
             .input_peak
             .store(peak.to_bits(), Ordering::Relaxed);
+        // Hold and latch here, where every captured sample passes, rather than in the UI: the
+        // meter is read a few times a second and the peak that matters when you are setting
+        // gain is the one that happened between two of those reads.
+        let held = f32::from_bits(self.shared.input_peak_hold.load(Ordering::Relaxed));
+        if peak > held {
+            self.shared
+                .input_peak_hold
+                .store(peak.to_bits(), Ordering::Relaxed);
+        }
+        if peak >= 1.0 {
+            self.shared.input_over.store(true, Ordering::Relaxed);
+        }
         // What is still in hand is latency the player hears, so report it rather than the
         // block size alone.
         self.shared.input_backlog.store(
@@ -1476,20 +1634,25 @@ impl Engine {
         if !self.recording || !self.playing {
             return;
         }
+        let (first, last, start_tick) = self.capture_window(frames);
+        // Before the drop-in and after the drop-out there is nothing to write and nothing to
+        // announce: as far as the take is concerned those blocks did not happen.
+        if self.punch.is_some() && first >= last {
+            return;
+        }
         if !self.record_started {
             self.record_started = true;
             self.shared
                 .record_start_tick
-                .store(self.position.to_bits(), Ordering::Relaxed);
+                .store(start_tick.to_bits(), Ordering::Relaxed);
             self.shared.record_frames.store(0, Ordering::Relaxed);
             self.shared.recording.store(true, Ordering::Relaxed);
         }
-        let from = self.late_start.min(frames);
         let Some(capture) = &mut self.capture else {
             return;
         };
         let mut written = 0u64;
-        for &s in &self.input_block[from..frames] {
+        for &s in &self.input_block[first..last] {
             // A full ring drops samples rather than blocking: missing the audio deadline would
             // glitch everything the user is playing along to.
             if capture.push(s).is_err() {
@@ -1500,6 +1663,27 @@ impl Engine {
         self.shared
             .record_frames
             .fetch_add(written, Ordering::Relaxed);
+    }
+
+    /// Which frames of this block reach the take, and the tick the take starts on.
+    ///
+    /// Without a punch that is everything from `late_start`, stamped with the playhead. With
+    /// one it narrows to the frames whose playhead falls inside the punch range, and the take
+    /// is stamped with the punch-in tick itself: the clip has to land exactly on the punch,
+    /// not within a block of it, or the crossfade it was recorded for lands somewhere else.
+    fn capture_window(&self, frames: usize) -> (usize, usize, f64) {
+        let base = self.late_start.min(frames);
+        let Some((punch_in, punch_out)) = self.punch else {
+            return (base, frames, self.position);
+        };
+        let map = &self.sequence.tempo_map;
+        let sr = self.sample_rate as f64;
+        let t0 = map.seconds_at_tick(self.position);
+        // `position` is the tick at frame `base`, so that is where the block's clock starts.
+        let frame_of = |tick: f64| base as f64 + (map.seconds_at_tick(tick) - t0) * sr;
+        let first = (frame_of(punch_in).round().max(base as f64) as usize).min(frames);
+        let last = (frame_of(punch_out).round().max(0.0) as usize).min(frames);
+        (first, last, punch_in)
     }
 
     /// The song ticks at the first and last frame of the sub-block `[from, to)`, for reading
@@ -1588,8 +1772,9 @@ impl Engine {
                 slide,
             } => {
                 if let Some(ch) = self.channels.get_mut(track) {
-                    ch.instrument
-                        .note_on_tagged(pitch, velocity, shape, tag, slide);
+                    // Through the channel, not the instrument: a hosted instrument's bent note
+                    // needs following there for its contour to reach the plugin.
+                    ch.note_on_tagged(pitch, velocity, shape, tag, slide);
                 }
             }
             EventKind::NoteOff { track, pitch, tag } => {
@@ -1624,7 +1809,7 @@ impl Engine {
         };
         let (start, end) = self.loop_bounds();
         let len = end - start;
-        if self.looping && len > 0.0 && p >= end {
+        if self.loop_active() && len > 0.0 && p >= end {
             // Carry the time past the loop end into the loop start at the tempo there.
             let excess = map.seconds_at_tick(p) - map.seconds_at_tick(end);
             p = map.tick_at_seconds(map.seconds_at_tick(start) + excess);
@@ -1655,7 +1840,7 @@ impl Engine {
             self.resume_notes_under(start);
         }
 
-        if self.looping && loop_end > loop_start && end >= loop_end && start < loop_end {
+        if self.loop_active() && loop_end > loop_start && end >= loop_end && start < loop_end {
             // Two segments: [start, loop_end) then [loop_start, …), with a release at the seam.
             let seam_secs = map.seconds_at_tick(loop_end) - t0;
             let seam = base + (seam_secs * sr).round() as usize;
@@ -1775,6 +1960,9 @@ impl Engine {
     /// in the overlap's few milliseconds) and then reaches the plugin for a key it isn't
     /// holding, which it ignores. A source that already overlaps is resumed, because a plugin
     /// really does hear it until its own end.
+    ///
+    /// A resumed note's bend is positioned where it would be, not restarted: seeking into the
+    /// middle of a bend should land you in the middle of the bend.
     fn resume_notes_under(&mut self, from: f64) {
         let any_solo = self.sequence.any_solo();
         let seq = Arc::clone(&self.sequence);
@@ -1812,7 +2000,13 @@ impl Engine {
                                     track: ti,
                                     pitch: note.pitch.clamp(0, 127) as u8,
                                     velocity: note.velocity.clamp(1, 127) as u8,
-                                    shape: NoteShape::from_note(note),
+                                    shape: NoteShape::from_note(note).bent(note_bend(
+                                        note,
+                                        &seq.tempo_map,
+                                        s,
+                                        from,
+                                        self.sample_rate as f64,
+                                    )),
                                     tag: VoiceTag::for_hit(ni, h),
                                     slide: None,
                                 },
@@ -1868,6 +2062,7 @@ impl Engine {
                 let pitch = note.pitch.clamp(0, 127) as u8;
                 let velocity = note.velocity.clamp(1, 127) as u8;
                 let shape = NoteShape::from_note(note);
+                let bends = !note.pitch_envelope.is_empty();
                 // `shift_ticks` moves only when the note *sounds*: its grid position stays its
                 // identity, so a step nudged early still belongs to the cell it is drawn in.
                 let start = note.shifted_start() as f64;
@@ -1884,7 +2079,14 @@ impl Engine {
                                 track: ti,
                                 pitch,
                                 velocity,
-                                shape,
+                                // Each repeat is its own strike, so each one bends from its
+                                // own start; the envelope is written against one note's
+                                // length and the repeats share it.
+                                shape: if bends {
+                                    shape.bent(note_bend(note, &seq.tempo_map, s, s, sr))
+                                } else {
+                                    shape
+                                },
                                 tag,
                                 // Only the first hit slides; the rest retrigger as written.
                                 slide: if h == 0 && play == RopePlay::Glide {

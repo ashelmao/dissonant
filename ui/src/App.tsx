@@ -14,7 +14,7 @@ import { SettingsWindow } from "./components/Settings";
 import { PluginBrowserWindow } from "./components/PluginBrowser";
 import { ExportDialog, ExportProgressBar } from "./components/ExportDialog";
 import { NewProjectScreen } from "./components/NewProjectScreen";
-import { GuitarTab } from "./components/GuitarTab";
+import { RecPage } from "./components/RecPage";
 import { selectedPattern, useStore } from "./store";
 import { useLiveKeyboard } from "./liveKeyboard";
 import { splitNotes } from "./noteEditing";
@@ -100,14 +100,17 @@ export default function App() {
         e.preventDefault();
         // Tab cycles the working screens in the order the transport lists them; from SETUP it
         // goes to the pattern editor.
-        s.setScreen(s.screen === "pattern" ? "song" : s.screen === "song" ? "guitar" : "pattern");
+        s.setScreen(s.screen === "pattern" ? "song" : s.screen === "song" ? "rec" : "pattern");
       } else if (soundPage) {
         // Letters are notes here.
       } else if (!mod && s.liveKeyboard === "off" && k === "l") {
         s.toggleLooping();
       } else if (!mod && s.liveKeyboard === "off" && k === "r") {
-        // Recording lands in the selected pattern, so there has to be one to arm.
-        if (!s.armed && !selectedPattern(s)) s.showToast("pick a pattern to record into first");
+        // On REC with an audio track armed, R is the audio take the transport's button
+        // already promises; everywhere else it arms MIDI into the selected pattern, so
+        // there has to be a pattern to arm.
+        if (s.screen === "rec" && s.armedAudioTrackId) void (s.recordingAudio ? s.stopRecording() : s.startRecording());
+        else if (!s.armed && !selectedPattern(s)) s.showToast("pick a pattern to record into first");
         else s.toggleRecord();
       } else if (!mod && s.liveKeyboard === "off" && k === "m") {
         s.toggleMetronome();
@@ -134,8 +137,8 @@ export default function App() {
           <Setup />
         ) : screen === "sound" ? (
           <SoundPage />
-        ) : screen === "guitar" ? (
-          <GuitarTab />
+        ) : screen === "rec" ? (
+          <RecPage />
         ) : screen === "song" ? (
           <>
             <TrackTree />

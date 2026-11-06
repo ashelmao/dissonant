@@ -1,8 +1,8 @@
 // Pure note-editing math for the piano roll. Geometry-free: works in ticks and MIDI pitches.
 // The roll previews with these during a drag and commits one `setNotes` on release.
 
-import type { NoteEvent, NoteProp } from "./types";
-import { NOTE_PROPS, noteProp, TICKS_PER_BEAT, uuid } from "./types";
+import type { Curve, NoteEvent, NoteProp, PitchPoint } from "./types";
+import { MAX_PITCH_POINTS, NOTE_PROPS, noteProp, TICKS_PER_BEAT, uuid } from "./types";
 import { remapRopes, repointRopes, tidyRopes, unroped } from "./ropes";
 
 export const MIN_LENGTH_TICKS = TICKS_PER_BEAT / 16;
@@ -653,6 +653,154 @@ export function rampNoteProp(notes: NoteEvent[], ids: Set<string>, prop: NotePro
     return writeProp(n, prop, v);
   });
   return changed ? out : notes;
+}
+
+// ─── Pitch envelope (the bend contour drawn inside a note's body) ───────────────────────────
+
+/** Cents are bounded by the same range `fine` is: the envelope is an offset in its units. */
+const MIN_CENTS = NOTE_PROPS.fine.min;
+const MAX_CENTS = NOTE_PROPS.fine.max;
+
+/**
+ * Sort by tick, clamp into range and keep one point per tick — the later one, which is the
+ * one the writer just dragged there. Mirrors `dissonant_core::model::tidy_pitch_envelope`
+ * apart from the over-the-cap case: the roll refuses the seventeenth point rather than
+ * decimating, since a person adding points one at a time should be told no, not have an
+ * earlier one quietly rewritten.
+ */
+export function tidyPitchEnvelope(points: PitchPoint[]): PitchPoint[] {
+  const out: PitchPoint[] = [];
+  for (const p of [...points].sort((a, b) => a.tick - b.tick)) {
+    if (!Number.isFinite(p.cents) || p.tick < 0) continue;
+    const point = { tick: Math.round(p.tick), cents: Math.min(MAX_CENTS, Math.max(MIN_CENTS, p.cents)), curve: p.curve };
+    if (out.length && out[out.length - 1].tick === point.tick) out[out.length - 1] = point;
+    else out.push(point);
+  }
+  return out;
+}
+
+/**
+ * The cents in force `tick` after the note's start. Mirrors the voice's reading rule: zero
+ * before the first point (an envelope offsets a note, it does not override a control, so a
+ * note that has not bent yet is in tune), a linear glide into a `ramp` point, a hold then a
+ * jump at a `step` point, and the last value from then on.
+ */
+export function pitchCentsAt(points: PitchPoint[], tick: number): number {
+  let i = 0;
+  while (i < points.length && points[i].tick <= tick) i++;
+  const prevTick = i === 0 ? 0 : points[i - 1].tick;
+  const prev = i === 0 ? 0 : points[i - 1].cents;
+  const next = points[i];
+  if (next && next.curve === "ramp" && next.tick > prevTick) {
+    return prev + (next.cents - prev) * ((tick - prevTick) / (next.tick - prevTick));
+  }
+  return prev;
+}
+
+/**
+ * The contour as a polyline in (tick, cents), ready to stroke across the note's body: it
+ * opens at the note's own pitch, carries a step point's corner as two vertices so the drawn
+ * line matches what is heard, and runs flat to `lengthTicks`.
+ */
+export function pitchPolyline(points: PitchPoint[], lengthTicks: number): { tick: number; cents: number }[] {
+  if (!points.length) return [];
+  const out: { tick: number; cents: number }[] = [{ tick: 0, cents: points[0].tick === 0 ? points[0].cents : 0 }];
+  let prev = out[0].cents;
+  for (const p of points) {
+    if (p.tick === 0) continue;
+    if (p.curve === "step") out.push({ tick: p.tick, cents: prev });
+    out.push({ tick: p.tick, cents: p.cents });
+    prev = p.cents;
+  }
+  const end = points[points.length - 1].tick;
+  if (end < lengthTicks) out.push({ tick: lengthTicks, cents: prev });
+  return out;
+}
+
+/** Replace one note's envelope, tidied. Notes without the id are returned untouched. */
+export function setPitchEnvelope(notes: NoteEvent[], id: string, points: PitchPoint[]): NoteEvent[] {
+  const tidy = tidyPitchEnvelope(points);
+  return notes.map((n) => (n.id === id ? { ...n, pitchEnvelope: tidy } : n));
+}
+
+/**
+ * Add a point to a note's contour. A point on a tick that already carries one replaces it,
+ * and the cap is a refusal rather than a silent eviction: the notes come back unchanged.
+ */
+export function addPitchPoint(notes: NoteEvent[], id: string, tick: number, cents: number, curve: Curve = "ramp"): NoteEvent[] {
+  const note = notes.find((n) => n.id === id);
+  if (!note) return notes;
+  const points = note.pitchEnvelope ?? [];
+  const t = Math.round(Math.max(0, Math.min(note.lengthTicks, tick)));
+  if (points.length >= MAX_PITCH_POINTS && !points.some((p) => p.tick === t)) return notes;
+  return setPitchEnvelope(notes, id, [...points, { tick: t, cents, curve }]);
+}
+
+/**
+ * Move the point at `index` to a new tick and cents. The tick stays inside the note (a point
+ * past its end would be unreachable), and dragging one point past another reorders rather
+ * than refusing — a drag is a gesture, not a constraint solver.
+ */
+export function movePitchPoint(notes: NoteEvent[], id: string, index: number, tick: number, cents: number): NoteEvent[] {
+  const note = notes.find((n) => n.id === id);
+  if (!note) return notes;
+  const points = note.pitchEnvelope ?? [];
+  if (index < 0 || index >= points.length) return notes;
+  const t = Math.round(Math.max(0, Math.min(note.lengthTicks, tick)));
+  return setPitchEnvelope(
+    notes,
+    id,
+    points.map((p, i) => (i === index ? { ...p, tick: t, cents } : p)),
+  );
+}
+
+export function removePitchPoint(notes: NoteEvent[], id: string, index: number): NoteEvent[] {
+  const note = notes.find((n) => n.id === id);
+  if (!note) return notes;
+  const points = note.pitchEnvelope ?? [];
+  if (index < 0 || index >= points.length) return notes;
+  return setPitchEnvelope(
+    notes,
+    id,
+    points.filter((_, i) => i !== index),
+  );
+}
+
+/** Flip a point between gliding into its value and jumping to it (the lane's ⌥-click). */
+export function togglePitchCurve(notes: NoteEvent[], id: string, index: number): NoteEvent[] {
+  const note = notes.find((n) => n.id === id);
+  if (!note) return notes;
+  const points = note.pitchEnvelope ?? [];
+  if (index < 0 || index >= points.length) return notes;
+  return setPitchEnvelope(
+    notes,
+    id,
+    points.map((p, i) => (i === index ? { ...p, curve: p.curve === "ramp" ? ("step" as const) : ("ramp" as const) } : p)),
+  );
+}
+
+/**
+ * The point under a pointer, as an index into the note's envelope, or null. Distances are in
+ * the roll's own pixels, which is why the caller passes both scales: a handle is a fixed size
+ * on screen however far the view is zoomed.
+ */
+export function pitchPointAt(
+  note: NoteEvent,
+  tick: number,
+  cents: number,
+  scale: { pxPerTick: number; pxPerCent: number },
+  radiusPx: number,
+): number | null {
+  let best: number | null = null;
+  let bestDistance = radiusPx;
+  (note.pitchEnvelope ?? []).forEach((p, i) => {
+    const d = Math.hypot((p.tick - tick) * scale.pxPerTick, (p.cents - cents) * scale.pxPerCent);
+    if (d <= bestDistance) {
+      best = i;
+      bestDistance = d;
+    }
+  });
+  return best;
 }
 
 // ─── Step rows (FL's step sequencer: a step is a note, so these are note edits) ─────────────

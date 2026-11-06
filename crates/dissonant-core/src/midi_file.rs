@@ -1,15 +1,41 @@
 //! Standard MIDI files: export a pattern or the whole song (one MIDI track per Dissonant
 //! track, chord names as markers), and import a file into a pattern as new tracks.
+//!
+//! A track whose notes bend — a pitch envelope or a `fine` detune — exports MPE-style: plain
+//! MIDI has one pitch wheel per channel, so the only faithful way to give each note its own
+//! contour is to give each note its own channel. Tracks that don't bend export exactly as they
+//! always did; MPE costs a reader fifteen channels and is only worth it when it carries pitch.
 
 use crate::arrangement::Arrangement;
+use crate::automation::Curve;
 use crate::chord_track::ChordTrack;
-use crate::model::{NoteEvent, ProjectModel, Track, MIN_NOTE_TICKS, ROPE_OVERLAP_SECS};
+use crate::model::{NoteEvent, PitchPoint, ProjectModel, Track, MIN_NOTE_TICKS, ROPE_OVERLAP_SECS};
 use crate::sequence::live_ropes;
 use crate::ticks::TICKS_PER_BEAT;
 use midly::num::{u15, u24, u28, u4, u7};
-use midly::{Format, Header, MetaMessage, MidiMessage, Smf, Timing, TrackEvent, TrackEventKind};
+use midly::{
+    Format, Header, MetaMessage, MidiMessage, PitchBend, Smf, Timing, TrackEvent, TrackEventKind,
+};
 use thiserror::Error;
 use uuid::Uuid;
+
+/// Pitch-bend range set on every MPE member channel, in semitones. ±48 is the MPE spec's
+/// default, so a receiver that ignores the RPN still reads the bends right; it also covers the
+/// widest bend the model can hold (`fine` ±12 plus an envelope ±12) with room to spare, at
+/// 4800 / 8192 ≈ 0.59 cents per wheel step — finer than anything the envelope stores.
+pub const MPE_BEND_RANGE_SEMITONES: u8 = 48;
+
+/// How often a ramp is sampled into pitch-bend messages, in project ticks: 1/96 beat, five
+/// file ticks, about 5 ms at 120 BPM. MIDI has no ramps, only wheel positions, so a glide has
+/// to be drawn as a staircase; at this rate a semitone ramp over one beat steps about one cent
+/// at a time and even a fast whole-tone slide over a sixteenth stays within the 5 ms a synth's
+/// own bend smoothing covers. Coarser is audible as zipper on slow bends; finer only bloats the
+/// file. Holds and steps cost one message each, and unchanged values are never written.
+pub const BEND_RAMP_STEP_TICKS: i64 = TICKS_PER_BEAT / 96;
+
+/// MPE member channels as zero-based channel numbers: 2–16. Channel 1 is the lower zone's
+/// master channel and is left alone.
+const MPE_MEMBER_CHANNELS: u8 = 15;
 
 /// Ticks per quarter note written and assumed on import when the file says nothing. This is
 /// the file format's own resolution, not the project's: 960 % 480 == 0, so both directions are
@@ -166,16 +192,61 @@ pub fn export(model: &ProjectModel, scope: MidiScope) -> Result<Vec<u8>, MidiErr
         } else {
             live_ropes(notes, i64::MAX)
         };
-        for (i, n) in notes.iter().enumerate().filter(|(_, n)| !n.muted) {
+        // Each note keeps its index in `notes`, which is what a rope points at: MPE reorders.
+        let mut live: Vec<(usize, &NoteEvent)> =
+            notes.iter().enumerate().filter(|(_, n)| !n.muted).collect();
+        // Drums never go MPE: channel 10 *is* what makes them drums to every reader, and a
+        // bent hit on channel 2 would come back as a pitched note.
+        let mpe = !track.is_drum && live.iter().any(|(_, n)| bends(n));
+        if mpe {
+            for ch in 1..=MPE_MEMBER_CHANNELS {
+                for message in bend_range_rpn() {
+                    events.push((
+                        0,
+                        TrackEventKind::Midi {
+                            channel: u4::new(ch),
+                            message,
+                        },
+                    ));
+                }
+            }
+            // Round-robin in time order, so a channel comes back round only after the
+            // fourteen notes started since — the longest a channel can sit free.
+            live.sort_by_key(|(_, n)| n.shifted_start());
+        }
+        for (turn, (i, n)) in live.into_iter().enumerate() {
             // A note's colour group is its MIDI channel, the way FL Studio treats colour.
-            // Drums stay on channel 10 whatever colour they carry.
-            let channel = u4::new(if track.is_drum { 9 } else { n.color.min(15) });
+            // Drums stay on channel 10 whatever colour they carry. MPE spends the channels
+            // on pitch instead, so a bending track's colours do not survive export.
+            let channel = u4::new(if track.is_drum {
+                9
+            } else if mpe {
+                1 + (turn % MPE_MEMBER_CHANNELS as usize) as u8
+            } else {
+                n.color.min(15)
+            });
             let key = u7::new(n.pitch.clamp(0, 127) as u8);
             let vel = u7::new(n.velocity.clamp(1, 127) as u8);
             let on = smf_tick(n.shifted_start());
             let mut off = smf_tick(n.shifted_start() + n.length_ticks).max(on + 1);
             if let Some(target) = ropes.get(i).and_then(|r| r.to) {
                 off = rope_off(notes, i, target, off, overlap);
+            }
+            if mpe {
+                // Pushed before the note-on: the sort is stable, so the channel is already
+                // where the note starts when it sounds, rather than gliding there from the
+                // previous note's last value.
+                for (at, bend) in bend_events(n, off) {
+                    events.push((
+                        at,
+                        TrackEventKind::Midi {
+                            channel,
+                            message: MidiMessage::PitchBend {
+                                bend: PitchBend::from_int(bend),
+                            },
+                        },
+                    ));
+                }
             }
             events.push((
                 on,
@@ -225,7 +296,9 @@ fn overlap_ticks(bpm: f64) -> u64 {
 /// tie) is left alone, as is a source whose stretched end would swallow the next note of its
 /// own key on its own channel: the note-off would end that note instead, or be paired with it
 /// on import. A chord's ropes are each stretched, and a polyphonic synth simply hears every
-/// pair overlap for a moment: one file can't glide several voices separately.
+/// pair overlap for a moment: one file can't glide several voices separately. On a bending
+/// (MPE) track every note has a channel of its own, so the overlap only glides on a reader
+/// that plays the whole zone as one voice.
 fn rope_off(notes: &[NoteEvent], source: usize, target: usize, off: u64, overlap: u64) -> u64 {
     let (src, tgt) = (&notes[source], &notes[target]);
     let target_on = smf_tick(tgt.shifted_start());
@@ -245,6 +318,96 @@ fn rope_off(notes: &[NoteEvent], source: usize, target: usize, off: u64, overlap
     } else {
         late
     }
+}
+
+/// Whether a note needs its own pitch wheel. `fine` counts: plain MIDI has nowhere else to put
+/// a detune, and dropping it would export a deliberately out-of-tune note in tune.
+fn bends(n: &NoteEvent) -> bool {
+    n.fine != 0 || !n.pitch_envelope.is_empty()
+}
+
+/// RPN 0 (pitch-bend sensitivity) set to [`MPE_BEND_RANGE_SEMITONES`], then the null RPN so a
+/// stray data-entry message later cannot retune the range.
+fn bend_range_rpn() -> [MidiMessage; 6] {
+    let cc = |controller: u8, value: u8| MidiMessage::Controller {
+        controller: u7::new(controller),
+        value: u7::new(value),
+    };
+    [
+        cc(101, 0),
+        cc(100, 0),
+        cc(6, MPE_BEND_RANGE_SEMITONES),
+        cc(38, 0),
+        cc(101, 127),
+        cc(100, 127),
+    ]
+}
+
+/// A note's envelope offset at `tick` after its start, in cents, by the envelope's reading
+/// rule: zero before the first point, ramps glide from the previous point (or from zero at the
+/// note's start), steps jump on arrival, the last value holds.
+fn envelope_cents(env: &[PitchPoint], tick: i64) -> f32 {
+    let i = env.partition_point(|p| p.tick <= tick);
+    let (prev_tick, prev) = match i {
+        0 => (0, 0.0),
+        _ => (env[i - 1].tick, env[i - 1].cents),
+    };
+    match env.get(i) {
+        Some(next) if next.curve == Curve::Ramp && next.tick > prev_tick => {
+            let t = (tick - prev_tick) as f32 / (next.tick - prev_tick) as f32;
+            prev + (next.cents - prev) * t.clamp(0.0, 1.0)
+        }
+        _ => prev,
+    }
+}
+
+/// Cents to a signed 14-bit wheel position at [`MPE_BEND_RANGE_SEMITONES`].
+fn cents_to_bend(cents: f32) -> i16 {
+    let full = MPE_BEND_RANGE_SEMITONES as f32 * 100.0;
+    (cents / full * 8192.0).round().clamp(-8192.0, 8191.0) as i16
+}
+
+/// The pitch-bend messages that trace one note's `fine` plus envelope, as (file tick, wheel)
+/// in time order, all before the note-off at `off`.
+///
+/// The first message lands on the note-on tick and is always written, even when it is zero: the
+/// channel still holds whatever the previous note left on it. After that, points become one
+/// message each, ramps a message every [`BEND_RAMP_STEP_TICKS`], and anything that would not
+/// move the wheel is skipped. Movement after the note-off is dropped — the channel is about to
+/// be handed to another note, and a release tail bending under it would detune that note.
+fn bend_events(n: &NoteEvent, off: u64) -> Vec<(u64, i16)> {
+    let env = &n.pitch_envelope;
+    let mut ticks = vec![0i64];
+    let mut prev = 0i64;
+    for p in env {
+        if p.curve == Curve::Ramp {
+            let mut t = prev + BEND_RAMP_STEP_TICKS;
+            while t < p.tick {
+                ticks.push(t);
+                t += BEND_RAMP_STEP_TICKS;
+            }
+        }
+        ticks.push(p.tick);
+        prev = p.tick;
+    }
+
+    let start = n.shifted_start();
+    let on = smf_tick(start);
+    let mut out: Vec<(u64, i16)> = Vec::with_capacity(ticks.len());
+    for t in ticks {
+        let at = smf_tick(start + t).max(on);
+        if at >= off {
+            break;
+        }
+        let bend = cents_to_bend(n.fine as f32 + envelope_cents(env, t));
+        match out.last_mut() {
+            // Two project ticks share one file tick: the later value is where the wheel is.
+            Some(last) if last.0 == at => last.1 = bend,
+            Some(last) if last.1 == bend => {}
+            _ => out.push((at, bend)),
+        }
+    }
+    out
 }
 
 /// Sort absolute-tick events (note-offs before note-ons at the same tick) and convert to deltas.
@@ -500,6 +663,30 @@ mod tests {
         }
         out.sort_by_key(|&(key, on, _)| (on, key));
         out
+    }
+
+    #[test]
+    fn a_rope_on_a_bending_track_finds_its_notes_after_mpe_reorders_them() {
+        let mut model = ProjectModel::empty();
+        model.tempo = 120.0;
+        let pid = model.patterns[0].id;
+        let mut muted = NoteEvent::new(0, BEAT, 72);
+        muted.muted = true;
+        let mut bent = NoteEvent::new(3 * BEAT, BEAT, 67);
+        bent.fine = 20;
+        let source = NoteEvent::new(BEAT, BEAT, 60);
+        let mut slide = NoteEvent::new(2 * BEAT, BEAT, 64);
+        slide.slide_from = Some(source.id);
+        model.patterns[0].length_ticks = 4 * BEAT;
+        // Stored out of time order, so the export's sort moves every note off its index.
+        model.patterns[0].notes = vec![muted, bent, slide, source];
+        let notes = exported_notes(&export(&model, pattern_scope(pid)).unwrap());
+        let q = PPQ as u64;
+        assert_eq!(
+            notes,
+            vec![(60, q, 2 * q + 5), (64, 2 * q, 3 * q), (67, 3 * q, 4 * q)],
+            "the source is held into its own slide note, and no other note is"
+        );
     }
 
     #[test]

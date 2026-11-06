@@ -9,8 +9,9 @@
 //! audio thread.
 
 use crate::dsp::{
-    db_to_linear, Allpass1, Biquad, CabIr, Compressor, EnvFollower, MicVoice, NoiseGate, Over4,
-    Reverb, RigDelay, SineLfo, SpeakerVoice, ToneStack, ToneStackParts, TubeStage,
+    db_to_linear, Allpass1, Biquad, CabIr, CathodeFollower, Compressor, EnvFollower, MicVoice,
+    NoiseGate, Over4, PowerAmp, Reverb, RigDelay, Sag, SineLfo, SpeakerVoice, ToneStack,
+    ToneStackParts, TubeStage,
 };
 use dissonant_core::{AmpModel, AmpRig, CabModel, EqModel, MicModel, Pedal, PedalKind};
 
@@ -381,8 +382,8 @@ fn log_map(knob: f32, lo: f32, hi: f32) -> f32 {
 }
 
 /// How hard one amp model bites: how many triode stages the signal passes through, where they
-/// idle on the tube's curve, how far `gain` pushes them, and the pre-emphasis that decides which
-/// part of the spectrum distorts first.
+/// idle on the tube's curve, how far `gain` pushes them, the pre-emphasis that decides which
+/// part of the spectrum distorts first, and how willingly its supply gives up under load.
 struct Voicing {
     stages: usize,
     /// Grid volts away from the operating point. Colder — more negative — rides the signal nearer
@@ -390,36 +391,87 @@ struct Voicing {
     bias: f32,
     drive_scale: f32,
     pre_emphasis_hz: f32,
+    /// The power supply's manners. Baked here and nowhere else: there is no schema field and no
+    /// knob, because nobody adjusts their amp's filter capacitors, and because the difference
+    /// between a tweed and a modern head is mostly this rather than anything in the preamp.
+    sag: Sag,
 }
 
 fn voicing(model: AmpModel) -> Voicing {
     match model {
+        // A small cathode-biased combo on a tube rectifier: it collapses under a hard chord and
+        // takes its time coming back, which is the whole reason people still record them.
         AmpModel::Clean => Voicing {
             stages: 1,
             bias: 0.0,
             drive_scale: 6.0,
             pre_emphasis_hz: 0.0,
+            sag: Sag {
+                droop: 0.5,
+                fall_ms: 13.0,
+                rise_ms: 190.0,
+                bias_depth: 0.1,
+                bias_ms: 240.0,
+            },
         },
+        // A bigger fixed-bias head, still on a rectifier tube: it breathes, but it does not fold.
         AmpModel::Crunch => Voicing {
             stages: 2,
             bias: -0.3,
             drive_scale: 24.0,
             pre_emphasis_hz: 720.0,
+            sag: Sag {
+                droop: 0.26,
+                fall_ms: 17.0,
+                rise_ms: 140.0,
+                bias_depth: 0.055,
+                bias_ms: 200.0,
+            },
         },
+        // Solid-state rectification and a bank of filter capacitors: the rail hardly notices,
+        // which is what "tight" means when a modern amp is described that way.
         AmpModel::Lead => Voicing {
             stages: 3,
             bias: -0.6,
             drive_scale: 70.0,
             pre_emphasis_hz: 900.0,
+            sag: Sag {
+                droop: 0.1,
+                fall_ms: 22.0,
+                rise_ms: 110.0,
+                bias_depth: 0.02,
+                bias_ms: 180.0,
+            },
         },
+        // The preamp has already flattened everything; a supply that moved too would only make
+        // the wall of fuzz quieter.
         AmpModel::Fuzz => Voicing {
             stages: 3,
             bias: -1.2,
             drive_scale: 220.0,
             pre_emphasis_hz: 1_100.0,
+            sag: Sag {
+                droop: 0.05,
+                fall_ms: 25.0,
+                rise_ms: 90.0,
+                bias_depth: 0.01,
+                bias_ms: 150.0,
+            },
         },
     }
 }
+
+/// The bright cap's corner, and the most it can lift with the gain pot right down. A treble
+/// bypass is a capacitor across that pot: it can only return what the pot is throwing away, so
+/// its effect shrinks to nothing as the knob opens.
+const BRIGHT_HZ: f32 = 1_200.0;
+const BRIGHT_DB: f32 = 11.0;
+
+/// What the half-power switch leaves of the rail, and how much further it lets the supply fall.
+/// Pulling half the output tubes does not halve the volume — it halves the headroom, so the
+/// stage arrives at its limit sooner and stays there longer.
+const HALF_POWER_HEADROOM: f32 = 0.55;
+const HALF_POWER_SAG: f32 = 1.4;
 
 /// Most preamp stages any voicing uses.
 const MAX_STAGES: usize = 3;
@@ -543,11 +595,16 @@ pub struct Rig {
     pedal_on: Vec<bool>,
 
     // Amp head.
+    /// The treble bypass across the gain pot, when the model has one. Identity when it does not,
+    /// or when the pot is wide open and there is nothing left for the cap to return.
+    bright: Biquad,
     stages: [TubeStage; MAX_STAGES],
     active_stages: usize,
+    /// Between the last preamp stage and the tone stack, on the models whose circuit has one.
+    follower: CathodeFollower,
+    follower_on: bool,
     stack: ToneStack,
-    power: Over4,
-    power_drive: f32,
+    power: PowerAmp,
     presence: Biquad,
 
     // Cabinet and microphone.
@@ -584,10 +641,12 @@ impl Rig {
                 TubeStage::new(sample_rate),
                 TubeStage::new(sample_rate),
             ],
+            bright: Biquad::identity(),
             active_stages: 1,
+            follower: CathodeFollower::new(sample_rate),
+            follower_on: false,
             stack: ToneStack::new(),
-            power: Over4::new(sample_rate),
-            power_drive: 1.0,
+            power: PowerAmp::new(sample_rate),
             presence: Biquad::identity(),
             cab: CabIr::new(),
             cab_on: true,
@@ -632,24 +691,56 @@ impl Rig {
         }
 
         let v = voicing(settings.amp.model);
+        let head = &settings.amp;
+        // A switch is only real on the models whose circuit has it. `AmpRig::sanitized` already
+        // clears the others, but `apply` is handed rigs that never went through it — defaults,
+        // and whatever a plugin host passes — so the decision is made here too.
+        let model = head.model;
+        let bright_cap = head.bright_cap && model.has_bright_cap();
+        let half_power = head.half_power && model.has_half_power();
+        self.follower_on = head.cathode_follower && model.has_cathode_follower();
+
         self.active_stages = v.stages;
         // A gain pot is an audio taper, and the useful range runs from "barely tickling the grid"
         // to "slammed", which is multiplicative, not additive.
-        let stage_gain = log_map(settings.amp.gain as f32, 0.2, v.drive_scale);
+        let gain_knob = head.gain as f32;
+        let stage_gain = log_map(gain_knob, 0.2, v.drive_scale);
         for stage in &mut self.stages {
             stage.set(sr, stage_gain, v.bias, v.pre_emphasis_hz);
         }
+        // A 0 dB shelf is exactly unity, so switching the cap out keeps the filter's state
+        // rather than zeroing it — throwing the switch mid-note must not click.
+        let bright_db = if bright_cap {
+            BRIGHT_DB * (1.0 - gain_knob / 10.0)
+        } else {
+            0.0
+        };
+        self.bright.high_shelf(sr, BRIGHT_HZ, bright_db, 0.707);
+        // How hard the stage in front swings the follower's grid, which is the only thing that
+        // decides whether it sits there politely or starts conducting.
+        self.follower.set(sr, log_map(gain_knob, 1.5, 5.0));
 
         self.stack.set(
             sr,
             tone_stack_parts(settings.eq),
-            settings.amp.treble as f32 / 10.0,
-            settings.amp.mid as f32 / 10.0,
-            settings.amp.bass as f32 / 10.0,
+            head.treble as f32 / 10.0,
+            head.mid as f32 / 10.0,
+            head.bass as f32 / 10.0,
         );
-        self.power_drive = 0.6 + settings.amp.master as f32 / 10.0 * 2.4;
+        let mut sag = v.sag;
+        let headroom = if half_power {
+            // Half the bottles, half the reservoir behind them: the stage runs out sooner and
+            // what is left gives way further.
+            sag.droop *= HALF_POWER_SAG;
+            sag.bias_depth *= HALF_POWER_SAG;
+            HALF_POWER_HEADROOM
+        } else {
+            1.0
+        };
+        self.power
+            .set(sr, 0.6 + head.master as f32 / 10.0 * 2.4, headroom, sag);
         self.presence
-            .high_shelf(sr, 6_000.0, settings.amp.presence as f32, 0.707);
+            .high_shelf(sr, 6_000.0, head.presence as f32, 0.707);
 
         self.cab_on = settings.cab.model != CabModel::Direct;
         if self.cab_on {
@@ -686,16 +777,16 @@ impl Rig {
                 }
             }
 
+            s = self.bright.process(s);
             for stage in self.stages.iter_mut().take(self.active_stages) {
                 s = stage.process(s);
             }
+            if self.follower_on {
+                s = self.follower.process(s);
+            }
 
             s = self.stack.process(s);
-
-            let pd = self.power_drive;
-            // Divide the drive back out so `master` changes how hard the power stage is
-            // pushed, not how loud the amp is.
-            s = self.power.process(s, &mut |x| (x * pd).tanh() / pd);
+            s = self.power.process(s);
             s = self.presence.process(s);
 
             if self.cab_on {
@@ -730,9 +821,11 @@ impl Rig {
         for p in &mut self.pedals {
             p.reset();
         }
+        self.bright.reset();
         for stage in &mut self.stages {
             stage.reset();
         }
+        self.follower.reset();
         self.stack.reset();
         self.power.reset();
         self.presence.reset();

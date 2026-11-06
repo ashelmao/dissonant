@@ -1762,6 +1762,239 @@ impl TubeStage {
     }
 }
 
+/// How one amp model's supply behaves under load.
+///
+/// Baked per model rather than put on a knob: nobody adjusts their amp's filter capacitors, and
+/// this is most of what people mean when they say one amp "feels" different from another with
+/// the same gain and the same speakers.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Sag {
+    /// The largest fraction of the rail that load can pull down. Zero is a bench supply.
+    pub droop: f32,
+    /// How quickly the rail gives up, in ms — the reservoir capacitor discharging into the
+    /// tubes, so it is fast enough that the attack gets through before the squash arrives.
+    pub fall_ms: f32,
+    /// How long the rectifier takes to put it back. Slow, and the reason a held chord blooms.
+    pub rise_ms: f32,
+    /// How far the cathode-bias capacitor pushes the tubes cold, in rail units.
+    pub bias_depth: f32,
+    /// The bias capacitor's time constant: an order slower than the rail, so it answers to a
+    /// whole loud passage rather than to one note.
+    pub bias_ms: f32,
+}
+
+impl Sag {
+    /// A supply that does not move. The power stage still clips; it just never breathes.
+    pub const STIFF: Sag = Sag {
+        droop: 0.0,
+        fall_ms: 10.0,
+        rise_ms: 100.0,
+        bias_depth: 0.0,
+        bias_ms: 200.0,
+    };
+}
+
+/// Rail left under the stage however hard it is hit. Below this it stops being an amplifier and
+/// starts being a gate, which is not what sag sounds like.
+const MIN_HEADROOM: f32 = 0.1;
+
+/// Output level at which the stage is drawing the current it was designed for, so half the sag
+/// its supply has to give is already gone. Everything above it is the amp working harder than
+/// the designer intended, which is where it was always going to be played.
+const SAG_KNEE: f32 = 0.3;
+
+/// The power stage: output tubes on a supply that is not a battery.
+///
+/// A guitar amp's rail is a capacitor behind a rectifier. Loud playing pulls current, the rail
+/// falls, the tubes run out of headroom early and the note squashes; stop playing and the rail
+/// climbs back, which is the bloom at the end of a held chord. The cathode-bias resistor does
+/// the same thing far more slowly and in the other direction — it charges with the average
+/// current and leaves the tubes idling cold, so a loud passage goes lopsided as well as quiet.
+/// Both are what the player is leaning on when they say an amp responds.
+#[derive(Debug, Clone)]
+pub struct PowerAmp {
+    os: Over4,
+    /// The output transformer, which passes no DC. Not decoration: bias excursion makes the
+    /// stage lopsided, and the offset that creates must not walk into the cabinet.
+    dc: Biquad,
+    drive: f32,
+    headroom: f32,
+    /// Supply rail, 1.0 = idle.
+    rail: f32,
+    /// Bias excursion in rail units; positive means colder than the stage was built to idle.
+    bias: f32,
+    droop: f32,
+    rail_fall: f32,
+    rail_rise: f32,
+    bias_depth: f32,
+    bias_charge: f32,
+    bias_bleed: f32,
+}
+
+impl PowerAmp {
+    pub fn new(sample_rate: f32) -> Self {
+        let mut power = PowerAmp {
+            os: Over4::new(sample_rate),
+            dc: Biquad::default(),
+            drive: 1.0,
+            headroom: 1.0,
+            rail: 1.0,
+            bias: 0.0,
+            droop: 0.0,
+            rail_fall: 0.0,
+            rail_rise: 0.0,
+            bias_depth: 0.0,
+            bias_charge: 0.0,
+            bias_bleed: 0.0,
+        };
+        power.set(sample_rate, 1.0, 1.0, Sag::STIFF);
+        power
+    }
+
+    /// `drive` is how hard the master knob pushes the stage and is divided back out, so the
+    /// knob changes how hard the amp works rather than how loud it is. `headroom` is the rail
+    /// the stage idles on — half power runs it lower, which is the entire point of the switch.
+    pub fn set(&mut self, sample_rate: f32, drive: f32, headroom: f32, sag: Sag) {
+        self.drive = drive.max(1e-3);
+        self.headroom = headroom.max(MIN_HEADROOM);
+        self.droop = sag.droop.clamp(0.0, 0.8);
+        self.rail_fall = 1.0 - time_coef(sample_rate, sag.fall_ms);
+        self.rail_rise = 1.0 - time_coef(sample_rate, sag.rise_ms);
+        self.bias_depth = sag.bias_depth.max(0.0);
+        self.bias_charge = 1.0 - time_coef(sample_rate, sag.bias_ms);
+        // The bias capacitor bleeds back through the cathode resistor alone, which is slower
+        // than charging it through a conducting tube.
+        self.bias_bleed = 1.0 - time_coef(sample_rate, sag.bias_ms * 2.5);
+        self.dc.highpass(sample_rate, 12.0, 0.707);
+    }
+
+    #[inline]
+    pub fn process(&mut self, x: f32) -> f32 {
+        let g = x * self.drive;
+        // Current the output tubes are asked to pass: rectified, because the supply does not
+        // care which half of the waveform drew it, and saturating against the current the stage
+        // was built to pass, because past full conduction there is no more to draw. Half power
+        // reaches that point at half the signal, which is why it sags at a lower volume.
+        let a = g.abs();
+        let knee = self.headroom * SAG_KNEE;
+        let demand = a / (knee + a);
+        let target = 1.0 - self.droop * demand;
+        let coef = if target < self.rail {
+            self.rail_fall
+        } else {
+            self.rail_rise
+        };
+        self.rail += (target - self.rail) * coef;
+        let bias_target = self.bias_depth * demand;
+        let coef = if bias_target > self.bias {
+            self.bias_charge
+        } else {
+            self.bias_bleed
+        };
+        self.bias += (bias_target - self.bias) * coef;
+
+        // Work against the rail that is there *now*. A supply on the floor turns the whole stage
+        // down — that is the compression, and it is audible long before anything is visibly
+        // clipping. The bias excursion is what reshapes it: the half already heading for cutoff
+        // gives way first, the same way the preamp's does, so the amp goes lopsided as it
+        // squashes rather than merely getting quieter.
+        let (gain, head) = (self.rail, self.headroom * self.rail);
+        let hi = (head + self.bias * 0.5).max(MIN_HEADROOM);
+        let lo = (head - self.bias).max(MIN_HEADROOM);
+        let y = self.os.process(g, &mut |s| {
+            let c = if s >= 0.0 { hi } else { lo };
+            c * (s * gain / c).tanh()
+        });
+        self.dc.process(y) / self.drive
+    }
+
+    pub fn reset(&mut self) {
+        self.os.reset();
+        self.dc.reset();
+        self.rail = 1.0;
+        self.bias = 0.0;
+    }
+}
+
+/// Where the follower's grid starts conducting, in its own volts.
+const CF_CONDUCTION: f32 = 0.55;
+/// Where the cathode current runs out going the other way. Further off than conduction, which is
+/// what makes a driven follower lopsided rather than merely squashed.
+const CF_CUTOFF: f32 = 0.95;
+
+/// The cathode follower that drives the tone stack on a British amp.
+///
+/// It has no voltage gain, so on paper it does nothing. In practice it is why those amps feel
+/// springy: it sources far more current than it sinks, so hard playing bends the top of the
+/// waveform against grid conduction long before the bottom reaches cutoff — and that grid
+/// current charges the coupling capacitor exactly as a preamp stage's does, so the note chokes
+/// for a moment and then comes back. All of it happens before the tone stack, which is the
+/// difference between this and a compressor after the amp.
+#[derive(Debug, Clone)]
+pub struct CathodeFollower {
+    dc: Biquad,
+    os: Over2,
+    drive: f32,
+    /// Charge on the coupling capacitor, in the follower's own volts.
+    blocking: f32,
+    charge: f32,
+    bleed: f32,
+}
+
+impl CathodeFollower {
+    pub fn new(sample_rate: f32) -> Self {
+        let mut cf = CathodeFollower {
+            dc: Biquad::default(),
+            os: Over2::new(sample_rate),
+            drive: 1.0,
+            blocking: 0.0,
+            charge: 0.0,
+            bleed: 0.0,
+        };
+        cf.set(sample_rate, 1.0);
+        cf
+    }
+
+    /// `drive` is how hard the stage in front swings the follower's grid; it is divided back
+    /// out, so switching the follower in changes the shape of the signal and not its level.
+    pub fn set(&mut self, sample_rate: f32, drive: f32) {
+        self.drive = drive.max(1e-3);
+        self.dc.highpass(sample_rate, 30.0, 0.707);
+        // The curve is evaluated at twice the rate, so the capacitor sees twice as many steps.
+        let inner = sample_rate * 2.0;
+        self.charge = 1.0 - time_coef(inner, 2.0);
+        self.bleed = 1.0 - time_coef(inner, 80.0);
+    }
+
+    #[inline]
+    pub fn process(&mut self, x: f32) -> f32 {
+        let v = self.dc.process(x) * self.drive;
+        let (charge, bleed) = (self.charge, self.bleed);
+        let blocking = &mut self.blocking;
+        let y = self.os.process(v, &mut |s| {
+            let g = s - *blocking;
+            let conduction = (g - CF_CONDUCTION).max(0.0);
+            *blocking += if conduction > *blocking {
+                (conduction - *blocking) * charge
+            } else {
+                -*blocking * bleed
+            };
+            if g >= 0.0 {
+                soft_limit(g, CF_CONDUCTION)
+            } else {
+                soft_limit(g, CF_CUTOFF)
+            }
+        });
+        y / self.drive
+    }
+
+    pub fn reset(&mut self) {
+        self.dc.reset();
+        self.os.reset();
+        self.blocking = 0.0;
+    }
+}
+
 /// The range a guitar actually occupies, used to measure how loud a tone stack is overall.
 const BAND_LOW: f32 = 80.0;
 const BAND_HIGH: f32 = 6_400.0;

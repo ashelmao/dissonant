@@ -1,8 +1,8 @@
 import { useState } from "react";
 import { barTicks, dbText, effectiveKey, GRID_OPTIONS, gridLabel, selectedPattern, selectedTrack, selectedTrackIndex, usePatternChords, useStore } from "../store";
-import { chordAt, explainNote, keyName, midiName, noteName, tierMap } from "../theory";
+import { chordAt, explainNote, keyName, midiName, noteName, noteTier, tierMap } from "../theory";
 import { arpeggiateNotes, chopNotes, humanizeNotes, invertNotes, legatoNotes, quantizeNotes, resolveTargets, reverseNotes, scaleNotes, setLength, strumNotes, toggleMute } from "../noteEditing";
-import { EQ_LABELS, keyAt, songLength, SOUND_PRESETS, soundPresetOf, TICKS_PER_BEAT, TRACK_PALETTE, trackColor, type TrackParam } from "../types";
+import { EQ_LABELS, keyAt, songLength, SOUND_PRESETS, soundPresetOf, TICKS_PER_BEAT, TRACK_PALETTE, trackColor, type PitchPoint, type TrackParam } from "../types";
 import { padName } from "../drumKit";
 import { useMediaQuery } from "../uiScale";
 import { hz, Knob, lin, log, panText, pct } from "./Knob";
@@ -287,7 +287,7 @@ export function Inspector() {
           </div>
         )}
 
-        {/* INSTRUMENT — an audio track has a rig instead, which lives on the guitar screen. */}
+        {/* INSTRUMENT — an audio track has a rig instead, which lives on the rec page. */}
         <div className="section">
           <div className="head">
             <span className="cap">{track.isAudio ? "rig" : "instrument"} · {track.name}</span>
@@ -304,11 +304,11 @@ export function Inspector() {
             </span>
           </div>
           {track.isAudio ? (
-            <div className="devchip" style={{ cursor: "pointer" }} onClick={() => s.setScreen("guitar")} title="open the guitar screen">
+            <div className="devchip" style={{ cursor: "pointer" }} onClick={() => s.setScreen("rec")} title="open the rec page">
               <span className={`led${track.amp?.enabled ? " on" : ""}`} />
               <span className="n">amp + cab</span>
               <span className="spacer" />
-              <span className="meta">edit on the guitar screen →</span>
+              <span className="meta">edit on the rec page →</span>
             </div>
           ) : (
             <>
@@ -451,7 +451,7 @@ function DialRow({ label, title, value, min, max, step, text, onChange }: { labe
 }
 
 /** For one selected dissonant note: say why, offer the two nearest chord tones, or keep it on purpose. */
-function ResolveKeep({ note }: { note: { id: string; pitch: number; startTick: number; intentional?: boolean } }) {
+function ResolveKeep({ note }: { note: { id: string; pitch: number; startTick: number; intentional?: boolean; pitchEnvelope?: PitchPoint[] } }) {
   const s = useStore();
   const pattern = useStore(selectedPattern);
   const track = useStore(selectedTrack);
@@ -459,8 +459,8 @@ function ResolveKeep({ note }: { note: { id: string; pitch: number; startTick: n
   const chords = usePatternChords();
   if (!pattern || !track) return null;
   const tiers = tierMap(note.startTick, chords, key);
-  const t = tiers[((note.pitch % 12) + 12) % 12];
-  const why = explainNote(note.pitch, chords, key, note.startTick);
+  const { tier: t, moving } = noteTier(note, chords, key);
+  const why = explainNote(note.pitch, chords, key, note.startTick, moving);
   const notes = pattern.notes;
   const update = (patch: Partial<{ pitch: number; intentional: boolean }>) =>
     void s.dispatch(

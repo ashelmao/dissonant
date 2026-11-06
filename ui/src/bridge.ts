@@ -14,6 +14,9 @@ import type {
   CatalogEntry,
   ChordEvent,
   Clip,
+  ClipDetection,
+  DetectedChord,
+  DetectionReport,
   ExportProgress,
   ExportRequest,
   ExportResult,
@@ -41,21 +44,25 @@ import type {
   SongPattern,
   TrackParam,
   TemplateInfo,
+  TunerReading,
   KeyState,
   ScaleType,
   VibeInfo,
 } from "./types";
 import {
+  AMP_SWITCH_MODELS,
   autoTargetRange,
   autoTrackId,
   beatsPerBar,
   beatsToTicks,
   defaultAmpRig,
+  DEFAULT_PUNCH_CROSSFADE_SECONDS,
   DEFAULT_SWING_GRID_TICKS,
   EQ_MODELS,
   hostPlatforms,
   layOutLoop,
   MAX_CLIP_GAIN,
+  MAX_DETECTED_CHORDS,
   MAX_FADE_SECONDS,
   MAX_INSERTS,
   MAX_PEDALS,
@@ -74,10 +81,11 @@ import {
   nativeValue,
   sanitizeNativeParams,
 } from "./effects";
-import { deletePieces, deletePoint, insertPieces, insertPoint, windowPiece, type Piece } from "./clipEditing";
+import { deletePieces, deletePoint, insertPieces, insertPoint, punchSplit, windowPiece, type Piece } from "./clipEditing";
 import { defaultKit, filledSound, isFactory, lookupSound, validKit, type Sound } from "./sound";
 import { chordAt, normalize, progression } from "./theory";
 import { MAX_SLIDE_SECS, remapRopes, tidyRopes } from "./ropes";
+import { placeChord } from "./songSetup";
 import vibesJson from "../../crates/dissonant-core/assets/vibes.json";
 
 export interface Bridge {
@@ -156,6 +164,9 @@ export interface Bridge {
   setLoop(start: number, end: number): Promise<void>;
   clearLoop(): Promise<void>;
   setLooping(on: boolean): Promise<void>;
+  /** Arm the punch range in ticks; the engine drops in and out on those points. */
+  setPunch(start: number, end: number): Promise<void>;
+  clearPunch(): Promise<void>;
   /** Native open dialog; `extensions` defaults to the project formats. */
   pickOpenPath(extensions?: string[], label?: string): Promise<string | null>;
   pickSavePath(defaultName: string, extension: string): Promise<string | null>;
@@ -274,8 +285,18 @@ export interface Bridge {
     trackId: string | null,
     startTick?: number,
   ): Promise<Snapshot>;
+  /** Transcribe one audio clip's raw DI: notes onto a new synth track, chord candidates into
+   *  the detected lane, as one undo step. Runs off the UI thread; resolves when it lands. */
+  detectAudioClip(clipId: string): Promise<DetectionReport>;
   /** `buckets` min/max pairs over one source, for the waveform lane. */
   audioPeaks(sourceId: string, buckets: number): Promise<[number, number][]>;
+  /** Acknowledge the input meter's peak hold and clip latch together. */
+  clearInputPeak(): Promise<AudioStatus>;
+  /** Open or close the tuner. While it is open the engine is silent and the live input is
+   *  run through pitch detection on every block the transport is stopped for. */
+  setTuner(on: boolean): Promise<void>;
+  /** The tuner's latest reading; `null` before it hears a pitch and once one dies away. */
+  tunerReading(): Promise<TunerReading | null>;
   onAudioImport(cb: (p: AudioImportProgress) => void): () => void;
   /** An audio file was dropped onto the window. */
   onAudioDropped(cb: (path: string) => void): () => void;
@@ -383,6 +404,8 @@ async function tauriBridge(): Promise<Bridge> {
     setLoop: (start, end) => invoke("set_loop", { start, end }),
     clearLoop: () => invoke("clear_loop"),
     setLooping: (on) => invoke("set_looping", { on }),
+    setPunch: (start, end) => invoke("set_punch", { start, end }),
+    clearPunch: () => invoke("clear_punch"),
     pickOpenPath: async (
       extensions = ["dissonant", "json"],
       label = "dissonant project",
@@ -485,8 +508,12 @@ async function tauriBridge(): Promise<Bridge> {
     stopAudioRecord: () => invoke<Snapshot>("stop_audio_record"),
     importAudio: (path, trackId, startTick = 0) =>
       invoke<Snapshot>("import_audio", { path, trackId, startTick }),
+    detectAudioClip: (clipId) => invoke<DetectionReport>("detect_audio_clip", { clipId }),
     audioPeaks: (sourceId, buckets) =>
       invoke<[number, number][]>("audio_peaks", { sourceId, buckets }),
+    clearInputPeak: () => invoke<AudioStatus>("clear_input_peak"),
+    setTuner: (on) => invoke("set_tuner", { on }),
+    tunerReading: () => invoke<TunerReading | null>("tuner_reading"),
     onAudioImport: (cb) => subscribe<AudioImportProgress>("audio-import", cb),
     onAudioDropped: (cb) => subscribe<string>("audio-dropped", cb),
   };
@@ -523,6 +550,7 @@ const NO_SUCH_AUTOMATION_POINT = "no such automation point";
 const NO_SUCH_NOTE = "no such note";
 const ROPE_LOOP = "a note can't slide from itself, or from a note that slides from it";
 const NO_ROPE = "that note has no rope";
+const NO_SUCH_DETECTED_CHORD = "no such detected chord";
 /** `ProjectModel` decoding refuses a schema it cannot migrate with this text. */
 export const OLD_SCHEMA = "This project was made with an older version of dissonant and can't be opened.";
 
@@ -767,7 +795,20 @@ function sanitizeRig(r: AmpRig): AmpRig | null {
     inputDb,
     gate: { on: r.gate.on, thresholdDb, releaseMs },
     pedals,
-    amp: { model: r.amp.model, gain, bass, mid, treble, presence, master },
+    // A switch the circuit never had is not a switch, exactly as `AmpRig::sanitized` decides it.
+    amp: {
+      model: r.amp.model,
+      gain,
+      bass,
+      mid,
+      treble,
+      presence,
+      master,
+      brightCap: !!r.amp.brightCap && AMP_SWITCH_MODELS.brightCap.includes(r.amp.model),
+      halfPower: !!r.amp.halfPower && AMP_SWITCH_MODELS.halfPower.includes(r.amp.model),
+      cathodeFollower:
+        !!r.amp.cathodeFollower && AMP_SWITCH_MODELS.cathodeFollower.includes(r.amp.model),
+    },
     // An unrecognised component falls back to its default instead of sinking the rig: only a
     // number that cannot be made sane is worth rejecting a command over.
     eq: EQ_MODELS.includes(r.eq) ? r.eq : "usClassic",
@@ -1278,6 +1319,7 @@ function normalizedModel(m: ProjectModel): ProjectModel {
   // A brace left hanging past the end (hand-edited, or saved before the song was shortened)
   // would loop over silence.
   m.loopRegion = clampLoop(m.loopRegion, m.songLengthTicks);
+  m.punchRegion = clampLoop(m.punchRegion, m.songLengthTicks);
   foldImplicitExtent(m.sections ?? []);
   // Unreferenced sources stay: undoing the clip that used one must not force a re-decode.
   m.audioSources ??= [];
@@ -1290,6 +1332,14 @@ function normalizedModel(m: ProjectModel): ProjectModel {
     .map(sanitizeAudioClip)
     .filter((c): c is AudioClip => c !== null)
     .sort((a, b) => a.startTick - b.startTick);
+  // Detection results of a take that is gone describe nothing on the song any more.
+  const clipIds = new Set(m.audioClips.map((c) => c.id));
+  const seen = new Set<string>();
+  const detections = (m.detections ?? [])
+    .filter((d) => clipIds.has(d.clipId) && !seen.has(d.clipId) && (seen.add(d.clipId), true))
+    .map(sanitizeDetection);
+  if (detections.length) m.detections = detections;
+  else delete m.detections;
   // Only when the key is there: an absent chain is how a project with no effects is written,
   // and filling it in would put `"inserts": []` on every track of every saved file.
   for (const t of m.tracks) if (t.inserts) t.inserts = sanitizeInserts(t.inserts);
@@ -1392,6 +1442,50 @@ function splitChord(chord: ChordEvent, pieces: Piece[]): ChordEvent[] {
   return pieces.map((p, i) => ({ ...chord, id: i === 0 ? chord.id : uuid(), startTick: p.start, lengthTicks: p.len }));
 }
 
+/** `ripple.rs::split_detected`: a candidate stays over the music it was heard in. */
+function splitDetected(m: ProjectModel, pieces: (c: DetectedChord) => Piece[]): void {
+  for (const d of m.detections ?? []) {
+    d.chords = d.chords.flatMap((c) =>
+      pieces(c).map((p, i) => ({ ...c, id: i === 0 ? c.id : uuid(), startTick: p.start, lengthTicks: p.len })),
+    );
+  }
+}
+
+/** `ClipDetection::sanitized`: chords sorted, cut so none overlap, confidence in 0…1. */
+function sanitizeDetection(d: ClipDetection): ClipDetection {
+  const chords = (d.chords ?? [])
+    .filter((c) => allFinite(c.startTick, c.lengthTicks) && c.startTick >= 0 && c.lengthTicks > 0)
+    .map((c) => ({
+      ...c,
+      startTick: Math.round(c.startTick),
+      lengthTicks: Math.round(c.lengthTicks),
+      pitchClasses: [...new Set(c.pitchClasses.map(normalize))],
+      confidence: Number.isFinite(c.confidence) ? clamp(c.confidence, 0, 1) : 0,
+    }))
+    .filter((c) => c.pitchClasses.length > 0)
+    .sort((a, b) => a.startTick - b.startTick);
+  for (let i = 0; i + 1 < chords.length; i++)
+    chords[i].lengthTicks = Math.min(chords[i].lengthTicks, chords[i + 1].startTick - chords[i].startTick);
+  const chroma = Array.from({ length: 12 }, (_, i) => {
+    const v = d.chroma?.[i] ?? 0;
+    return Number.isFinite(v) && v > 0 ? v : 0;
+  });
+  return { clipId: d.clipId, chords: chords.filter((c) => c.lengthTicks > 0).slice(0, MAX_DETECTED_CHORDS), chroma };
+}
+
+/** `document.rs::take_detected_chord`: out of the lane by id; an emptied detection goes too. */
+function takeDetectedChord(m: ProjectModel, id: string): DetectedChord {
+  const list = m.detections ?? [];
+  const d = list.findIndex((x) => x.chords.some((c) => c.id === id));
+  if (d < 0) fail(NO_SUCH_DETECTED_CHORD);
+  const det = list[d];
+  const chord = det.chords.find((c) => c.id === id)!;
+  det.chords = det.chords.filter((c) => c.id !== id);
+  if (det.chords.length === 0 && det.chroma.every((v) => v <= 0)) list.splice(d, 1);
+  if (list.length === 0) delete m.detections;
+  return chord;
+}
+
 /**
  * `ripple.rs::split_audio`. Audio never warps: the split point goes through the tempo map (the
  * one from before the edit) to find how many seconds of the file each piece holds. The leading
@@ -1447,6 +1541,7 @@ function settle(m: ProjectModel): void {
   foldImplicitExtent(m.sections);
   m.tempoPoints?.sort((a, b) => a.tick - b.tick);
   m.loopRegion = clampLoop(m.loopRegion, m.songLengthTicks);
+  m.punchRegion = clampLoop(m.punchRegion, m.songLengthTicks);
 }
 
 /** `ripple.rs::insert_time`. */
@@ -1466,12 +1561,17 @@ function insertTime(m: ProjectModel, at: number, ticks: number): void {
   );
   m.tempoPoints = (m.tempoPoints ?? []).map((p) => ({ ...p, tick: insertPoint(p.tick, at, ticks) }));
   m.chords = tidyChords(m.chords.flatMap((ch) => splitChord(ch, insertPieces(ch.startTick, ch.lengthTicks, at, ticks))));
+  splitDetected(m, (c) => insertPieces(c.startTick, c.lengthTicks, at, ticks));
   for (const lane of m.automation ?? []) {
     lane.points = lane.points.map((p) => ({ ...p, tick: insertPoint(p.tick, at, ticks) }));
     tidyLane(lane);
   }
   // Time opened inside the brace lengthens it; a brace ending where the time opens does not.
-  if (m.loopRegion) m.loopRegion = [insertPoint(m.loopRegion[0], at, ticks), m.loopRegion[1] > at ? m.loopRegion[1] + ticks : m.loopRegion[1]];
+  // The punch range is a place in the music too, so it moves by the same rule.
+  const grow = (r: [number, number] | null | undefined): [number, number] | null =>
+    r ? [insertPoint(r[0], at, ticks), r[1] > at ? r[1] + ticks : r[1]] : null;
+  m.loopRegion = grow(m.loopRegion);
+  m.punchRegion = grow(m.punchRegion);
   m.songLengthTicks = Math.max(m.songLengthTicks, at) + ticks;
   settle(m);
 }
@@ -1499,13 +1599,17 @@ function deleteTime(m: ProjectModel, at: number, ticks: number): void {
   // A tempo change inside the cut goes with it: what was in force before it plays on.
   m.tempoPoints = (m.tempoPoints ?? []).filter((p) => p.tick < at || p.tick >= cutEnd).map((p) => ({ ...p, tick: deletePoint(p.tick, at, ticks) }));
   m.chords = tidyChords(m.chords.flatMap((ch) => splitChord(ch, deletePieces(ch.startTick, ch.lengthTicks, at, ticks))));
+  splitDetected(m, (c) => deletePieces(c.startTick, c.lengthTicks, at, ticks));
   for (const lane of m.automation ?? []) {
     lane.points = lane.points.filter((p) => p.tick < at || p.tick >= cutEnd).map((p) => ({ ...p, tick: deletePoint(p.tick, at, ticks) }));
     tidyLane(lane);
   }
   // A lane with every point inside the cut has nothing left to say.
   m.automation = (m.automation ?? []).filter((l) => l.points.length > 0);
-  if (m.loopRegion) m.loopRegion = [deletePoint(m.loopRegion[0], at, ticks), deletePoint(m.loopRegion[1], at, ticks)];
+  const pull = (r: [number, number] | null | undefined): [number, number] | null =>
+    r ? [deletePoint(r[0], at, ticks), deletePoint(r[1], at, ticks)] : null;
+  m.loopRegion = pull(m.loopRegion);
+  m.punchRegion = pull(m.punchRegion);
   m.songLengthTicks = Math.max(barOf(m), m.songLengthTicks - Math.max(0, Math.min(m.songLengthTicks, cutEnd) - at));
   settle(m);
 }
@@ -1859,6 +1963,7 @@ function reduce(m: ProjectModel, c: Command): void {
         .filter((cl) => cl.startTick < end)
         .map((cl) => (cl.startTick + cl.lengthTicks > end ? { ...cl, lengthTicks: end - cl.startTick } : cl));
       m.loopRegion = clampLoop(m.loopRegion, end);
+      m.punchRegion = clampLoop(m.punchRegion, end);
       break;
     }
     case "setLoopRegion": {
@@ -1871,6 +1976,17 @@ function reduce(m: ProjectModel, c: Command): void {
       // so with `null`.
       if (!allFinite(start, end) || start < 0 || end <= start) fail(INVALID_VALUE);
       m.loopRegion = clampLoop([start, end], m.songLengthTicks) ?? fail(INVALID_VALUE);
+      break;
+    }
+    case "setPunchRegion": {
+      if (c.region === null) {
+        m.punchRegion = null;
+        break;
+      }
+      const [start, end] = c.region;
+      // Same rule as the loop brace: disarming says so with `null`.
+      if (!allFinite(start, end) || start < 0 || end <= start) fail(INVALID_VALUE);
+      m.punchRegion = clampLoop([start, end], m.songLengthTicks) ?? fail(INVALID_VALUE);
       break;
     }
     case "addSection":
@@ -2064,6 +2180,34 @@ function reduce(m: ProjectModel, c: Command): void {
       );
       break;
     }
+    case "punchAudioTake": {
+      if (c.clip.trackId !== c.trackId || c.clip.sourceId !== c.source.id)
+        fail(INVALID_VALUE);
+      if (
+        c.source.sampleRate === 0 ||
+        c.source.channels === 0 ||
+        c.source.frames === 0
+      )
+        fail(INVALID_VALUE);
+      const t = track(c.trackId);
+      if (!t.isAudio) fail(NOT_AN_AUDIO_TRACK);
+      const clip = sanitizeAudioClip(c.clip) ?? fail(INVALID_VALUE);
+      // A nonsense crossfade falls back to the default rather than refusing a take the player
+      // has already performed.
+      const asked = Number.isFinite(c.crossfadeSeconds) && c.crossfadeSeconds >= 0 ? c.crossfadeSeconds : DEFAULT_PUNCH_CROSSFADE_SECONDS;
+      const xf = Math.min(asked, MAX_FADE_SECONDS, clip.lengthSeconds / 2);
+      // The punch owns both of the take's edges.
+      const take = { ...clip, fadeInSeconds: xf, fadeOutSeconds: xf };
+      const { secondsAt } = tempoMap(m.tempo, m.tempoPoints);
+      m.audioSources ??= [];
+      const at = m.audioSources.findIndex((s) => s.id === c.source.id);
+      if (at >= 0) m.audioSources[at] = { ...c.source };
+      else m.audioSources.push({ ...c.source });
+      m.audioClips = [...punchSplit(m.audioClips ?? [], take, xf, secondsAt, uuid), take].sort(
+        (a, b) => a.startTick - b.startTick,
+      );
+      break;
+    }
     case "updateAudioClip": {
       if (!(m.audioSources ?? []).some((s) => s.id === c.clip.sourceId))
         fail(NO_SUCH_AUDIO_SOURCE);
@@ -2093,6 +2237,51 @@ function reduce(m: ProjectModel, c: Command): void {
     case "duplicateRange":
       if (!allFinite(c.from, c.to, c.at) || c.from < 0 || c.to <= c.from || c.at < 0) fail(INVALID_VALUE);
       duplicateRange(m, c.from, c.to, c.at);
+      break;
+    case "addTranscription": {
+      if (!allFinite(c.startTick, c.lengthTicks) || c.startTick < 0 || c.lengthTicks <= 0) fail(INVALID_VALUE);
+      // Results for a take that is not on the song would be dropped on the next load.
+      if (!(m.audioClips ?? []).some((a) => a.id === c.detection.clipId)) fail(NO_SUCH_AUDIO_CLIP);
+      if (c.notes.length > 0) {
+        const name = c.name.trim();
+        const t = newTrack(false, name === "" ? "notes" : name);
+        const length = Math.max(TICKS_PER_BEAT, Math.round(c.lengthTicks));
+        const p: SongPattern = { ...newPattern(t.id, nextPatternName(m, t)), lengthTicks: length };
+        // Inside the pattern or not at all: a note past its end would never sound.
+        p.notes = c.notes
+          .map(sanitizeNote)
+          .filter((n) => n.startTick < length)
+          .map((n) => ({ ...n, lengthTicks: Math.min(n.lengthTicks, length - n.startTick) }))
+          .sort((a, b) => a.startTick - b.startTick || a.pitch - b.pitch);
+        const startTick = Math.round(c.startTick);
+        m.clips.push({ id: uuid(), patternId: p.id, startTick, lengthTicks: length, offsetTicks: 0, muted: false });
+        m.clips.sort((a, b) => a.startTick - b.startTick);
+        m.songLengthTicks = Math.max(m.songLengthTicks, startTick + length);
+        m.tracks.push(t);
+        m.patterns.push(p);
+      }
+      const d = sanitizeDetection(c.detection);
+      const rest = (m.detections ?? []).filter((x) => x.clipId !== d.clipId);
+      if (d.chords.length > 0 || d.chroma.some((v) => v > 0)) rest.push(d);
+      if (rest.length) m.detections = rest;
+      else delete m.detections;
+      break;
+    }
+    case "acceptDetectedChord": {
+      const found = takeDetectedChord(m, c.id);
+      if (found.startTick >= m.songLengthTicks) fail(PAST_SONG_END);
+      const chord: ChordEvent = {
+        id: found.id,
+        startTick: found.startTick,
+        lengthTicks: Math.min(found.lengthTicks, m.songLengthTicks - found.startTick),
+        pitchClasses: [...found.pitchClasses],
+        name: found.name,
+      };
+      m.chords = tidyChords(placeChord(m.chords, chord));
+      break;
+    }
+    case "dismissDetectedChord":
+      takeDetectedChord(m, c.id);
       break;
   }
 }
@@ -2736,7 +2925,7 @@ function installedDescriptor(entry: CatalogEntry): PluginDescriptor {
  */
 
 /**
- * A deterministic waveform envelope seeded from a source id, so the guitar screen can be
+ * A deterministic waveform envelope seeded from a source id, so the rec page can be
  * designed under `pnpm --dir ui dev` without any audio at all. Shaped like a strummed take:
  * a pick attack decaying into a body, repeated.
  */
@@ -2822,6 +3011,8 @@ function mockBridge(): Bridge {
   let last = performance.now();
   let loop: [number, number] | null = null;
   let looping = true;
+  /** Armed punch range in ticks; blocks looping, exactly as the engine does. */
+  let punch: [number, number] | null = null;
   let armed = false;
   let quantize: number | null = TICKS_PER_BEAT / 4;
   let liveTrack: string | null = null;
@@ -2951,7 +3142,7 @@ function mockBridge(): Bridge {
         loop && loop[1] > loop[0]
           ? [Math.min(loop[0], len), Math.min(loop[1], len)]
           : [0, len];
-      if (looping && playTick >= le && le > ls)
+      if (looping && !punch && playTick >= le && le > ls)
         playTick = ls + ((playTick - le) % (le - ls));
     }
     last = now;
@@ -3324,6 +3515,12 @@ function mockBridge(): Bridge {
     setLooping: async (on) => {
       looping = on;
     },
+    setPunch: async (s, e) => {
+      punch = [s, e];
+    },
+    clearPunch: async () => {
+      punch = null;
+    },
     pickOpenPath: async () => null,
     pickSavePath: async (name, ext) =>
       name.endsWith(`.${ext}`) ? name : `${name}.${ext}`,
@@ -3618,7 +3815,19 @@ function mockBridge(): Bridge {
     importAudio: async () => {
       throw new Error("importing audio needs the desktop app");
     },
+    detectAudioClip: async () => {
+      throw new Error("detecting notes needs the desktop app");
+    },
     audioPeaks: async (sourceId, buckets) => syntheticPeaks(sourceId, buckets),
+    clearInputPeak: async () => ({
+      running: false,
+      sampleRate: null,
+      error: "browser mock: no engine",
+    }),
+    // No input stream means nothing to detect: the strip stays at rest rather than inventing
+    // a string for someone to tune to.
+    setTuner: async () => {},
+    tunerReading: async () => null,
     onAudioImport: () => () => {},
     onAudioDropped: () => () => {},
   };

@@ -1023,7 +1023,8 @@ select {
   position: relative;
 }
 .arr .ruler {
-  height: 44px;
+  /* 16 markers + 10 loop brace + 10 punch + 18 bar numbers. */
+  height: 54px;
   flex: none;
   display: flex;
   background: var(--bg-1);
@@ -1056,11 +1057,11 @@ select {
 .arr .timeline {
   position: relative;
   flex: none;
-  height: 44px;
+  height: 54px;
 }
 .arr .bar {
   position: absolute;
-  top: 26px;
+  top: 36px;
   height: 18px;
   border-left: 1px solid var(--line-1);
   padding-left: 3px;
@@ -1076,7 +1077,7 @@ select {
 }
 .arr .phtri {
   position: absolute;
-  top: 24px;
+  top: 34px;
   width: 0;
   height: 0;
   border-left: 5px solid transparent;
@@ -2692,6 +2693,17 @@ select {
 .clip.audio.muted {
   opacity: 0.45;
 }
+/* "notes": transcribe the take. Bottom-right, clear of the fade handles along the top edge. */
+.clip.audio .detect {
+  position: absolute;
+  right: 3px;
+  bottom: 3px;
+  z-index: 1;
+}
+.clip.audio .detect:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
 
 /* Progression starters: the mood leads, the chords it writes in this key sit under it. */
 .chip.starter {
@@ -3218,7 +3230,7 @@ select {
   display: flex;
   height: 30px;
   position: sticky;
-  top: 44px;
+  top: 54px;
   z-index: 3;
   background: var(--bg-1);
   border-bottom: 1px solid var(--line-1);
@@ -3242,6 +3254,37 @@ select {
 /* Its own gutter sticks just right of the head cell, so the pair fills the header column. */
 .arr.song .songchords .chordlane .gut {
   left: var(--sc-head);
+}
+/* Chords heard in recorded takes: sticky right under the progression while any wait. */
+.arr.song .songchords.detected {
+  top: 85px;
+}
+.chordblock.detected {
+  background: transparent;
+  border-style: dashed;
+  cursor: default;
+  gap: 4px;
+  padding-right: 2px;
+}
+.chordblock.detected .conf {
+  font-weight: 400;
+  font-size: 9px;
+  opacity: 0.8;
+}
+.chordblock .dact {
+  flex: none;
+  padding: 0 4px;
+  height: 18px;
+  font-size: 10px;
+  line-height: 1;
+  background: none;
+  border: 1px solid var(--accent-border);
+  color: inherit;
+  border-radius: 2px;
+  cursor: pointer;
+}
+.chordblock .dact:hover {
+  background: var(--accent-bg);
 }
 
 /* Right-click menu on a clip. */

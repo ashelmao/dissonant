@@ -15,6 +15,7 @@
 pub mod audio;
 pub mod channel;
 pub mod device;
+pub mod detect;
 pub mod drums;
 pub mod dsp;
 pub mod effects;
@@ -23,6 +24,7 @@ pub mod input;
 pub mod render;
 pub mod rig;
 pub mod synth;
+pub mod tuner;
 
 pub use audio::{AudioBuffer, AudioLane, AudioPool, BlockContext};
 pub use channel::{InsertSlot, InsertUnit, Instrument};
@@ -30,14 +32,19 @@ pub use device::{
     default_output_name, list_output_devices, AudioConfig, AudioDevice, DeviceError, EngineIo,
     OutputDeviceInfo,
 };
+pub use detect::{clip_mono, hear, place_on_song, HeardChord, HeardNote, Hearing, Transcription};
 pub use effects::NativeEffect;
 pub use drums::{render_drum, DrumBank, DrumKit, RenderedDrum};
 pub use engine::{
     Engine, EngineCommand, NoteShape, PreviewPatch, Shared, Slide, VoiceTag, MAX_TRACKS,
     SCOPE_SAMPLES,
 };
-pub use input::{default_input_name, list_input_devices, AudioInput, InputDeviceInfo};
+pub use input::{
+    align_take, default_input_name, input_latency_ms, list_input_devices, AudioInput,
+    InputDeviceInfo, TakeAlignment,
+};
 pub use render::{
     normalize, render_to_buffer, render_wav, write_wav, RenderError, RenderOptions, RenderPlugins,
 };
 pub use rig::Rig;
+pub use tuner::{Pitch, PitchTracker};

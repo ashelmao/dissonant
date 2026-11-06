@@ -2,8 +2,8 @@
 // hits, all kept inside the song's hard end. The backend clamps too; this keeps the preview
 // honest.
 
-import type { Clip } from "./types";
-import { TICKS_PER_BEAT } from "./types";
+import type { AudioClip, Clip } from "./types";
+import { MAX_FADE_SECONDS, TICKS_PER_BEAT } from "./types";
 
 /** Shortest clip a trim can leave (one beat), unless the song end leaves less room. */
 export const MIN_CLIP_TICKS = TICKS_PER_BEAT;
@@ -173,4 +173,96 @@ export function windowPiece(start: number, len: number, from: number, to: number
   const s = Math.max(start, from);
   const e = Math.min(start + len, to);
   return e > s ? { start: at + (s - from), skip: s - start, len: e - s } : null;
+}
+
+// ─── Audio clips: fades and the punch split ────────────────────────────────────────────────
+// Audio never warps, so these work in seconds and only cross into ticks through the song's
+// tempo map. They mirror `crates/dissonant-core/src/document.rs` (`punch_split`) and
+// `model.rs` (`clamp_fade`); the backend clamps too, this keeps the drag preview honest.
+
+/** `model.rs::clamp_fade`: fades may not overlap, so each is capped at half the clip. */
+export function clampFade(seconds: number, lengthSeconds: number): number {
+  if (!Number.isFinite(seconds)) return 0;
+  return Math.min(Math.max(seconds, 0), MAX_FADE_SECONDS, Math.max(0, lengthSeconds) / 2);
+}
+
+/**
+ * `audio.rs::equal_power`: the gain `t` of the way through a fade, so the handle draws the
+ * curve the engine actually plays rather than a straight line that lies about it.
+ */
+export function equalPowerGain(t: number): number {
+  return Math.sin(Math.min(Math.max(t, 0), 1) * (Math.PI / 2));
+}
+
+/**
+ * The whole tick nearest `seconds` on a map that only ever increases. Binary search, the same
+ * way `bridge.ts::audioLenTicks` crosses the other way: the map is a closure, not a formula.
+ */
+export function tickAtSeconds(secondsAt: (tick: number) => number, seconds: number): number {
+  if (!(seconds > secondsAt(0))) return 0;
+  let lo = 0;
+  let hi = TICKS_PER_BEAT;
+  while (secondsAt(hi) < seconds) hi *= 2;
+  for (let i = 0; i < 60; i++) {
+    const mid = (lo + hi) / 2;
+    if (secondsAt(mid) < seconds) lo = mid;
+    else hi = mid;
+  }
+  return Math.round(hi);
+}
+
+/**
+ * `document.rs::punch_split`: `clips` with everything the punch covers on the take's track cut
+ * back around it, ready for the take itself to be added.
+ *
+ * A clip the take lands inside becomes at most two — a head running one crossfade *past* the
+ * take's start and fading out over it, and a tail starting one crossfade *before* the take's
+ * end and fading in over that one. Those overlaps are the crossfades: the engine sums
+ * overlapping clips, so both sides sounding at once is the whole mechanism. A clip buried
+ * under the take leaves nothing. Each new edge is placed on a whole tick and takes its offset
+ * into the file from that tick, so the material under it never slides.
+ */
+export function punchSplit(
+  clips: AudioClip[],
+  take: AudioClip,
+  crossfadeSeconds: number,
+  secondsAt: (tick: number) => number,
+  newId: () => string,
+): AudioClip[] {
+  const from = secondsAt(take.startTick);
+  const to = from + take.lengthSeconds;
+  const xf = Math.min(Math.max(crossfadeSeconds, 0), MAX_FADE_SECONDS, take.lengthSeconds / 2);
+  const out: AudioClip[] = [];
+  for (const c of clips) {
+    const start = secondsAt(c.startTick);
+    const end = start + c.lengthSeconds;
+    if (c.trackId !== take.trackId || end <= from || start >= to) {
+      out.push(c);
+      continue;
+    }
+    // Only a clip that was already sounding when the punch dropped in has a head.
+    const headEnd = Math.min(from + xf, end);
+    const head: AudioClip | null =
+      start < from
+        ? { ...c, lengthSeconds: headEnd - start, fadeOutSeconds: clampFade(xf, headEnd - start) }
+        : null;
+    let tail: AudioClip | null = null;
+    if (end > to) {
+      const tick = tickAtSeconds(secondsAt, Math.max(to - xf, start));
+      const at = Math.min(Math.max(secondsAt(tick), start), end);
+      tail = {
+        ...c,
+        // The head keeps the clip's identity when there is one; with the take butted against
+        // the clip's front the tail is all that is left of it and keeps the id instead.
+        id: head ? newId() : c.id,
+        startTick: tick,
+        lengthSeconds: end - at,
+        offsetSeconds: c.offsetSeconds + (at - start),
+        fadeInSeconds: clampFade(xf, end - at),
+      };
+    }
+    if (head && head.lengthSeconds > 0) out.push(head);
+    if (tail && tail.lengthSeconds > 0) out.push(tail);
+  }
+  return out;
 }

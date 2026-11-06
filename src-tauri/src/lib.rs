@@ -21,7 +21,7 @@ use dissonant_engine::{
 use dissonant_plugins::{ParamInfo, PluginDescriptor, PluginFormat};
 use plugins::PluginHostThread;
 use recording::TakeWriter;
-use settings::{NewProjectKind, Settings};
+use settings::{AudioSettings, NewProjectKind, Settings};
 use midir::{MidiInput, MidiInputConnection};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -58,6 +58,8 @@ struct PlaybackContext {
     looping: bool,
     /// Loop sub-range in ticks.
     loop_region: Option<(f64, f64)>,
+    /// Armed punch range in ticks, if any.
+    punch_region: Option<(f64, f64)>,
     metronome: bool,
     metronome_volume: f32,
 }
@@ -74,6 +76,7 @@ impl Default for PlaybackContext {
             live_track: None,
             looping: true,
             loop_region: None,
+            punch_region: None,
             metronome: false,
             metronome_volume: 0.6,
         }
@@ -134,7 +137,15 @@ pub struct AppState {
     armed_audio: Mutex<(Option<Uuid>, bool)>,
     /// The source id the current take is being written to.
     recording_source: Mutex<Option<Uuid>>,
+    /// What the last take's latency correction came to. Kept here rather than on the clip:
+    /// it describes the recording session, not the project, and the REC page is the only
+    /// thing that reads it.
+    last_take_align: Mutex<Option<TakeAlign>>,
+    /// The tuner strip is open, so a rebuilt engine has to be told again.
+    tuner_open: AtomicBool,
     importing: AtomicBool,
+    /// A DI analysis is running: one at a time, since each one ends in a new track.
+    detecting: AtomicBool,
 }
 
 /// What every editing command returns to the UI.
@@ -237,6 +248,27 @@ pub struct AudioStatus {
     pub input_underruns: u32,
     /// Latched since the last `clear_clip`: the mix asked the master for more than its ceiling.
     pub master_over: bool,
+    /// The input meter's peak hold, and whether the input has hit full scale, both since the
+    /// last `clear_input_peak`. Pre-rig: this is the signal the interface is sending.
+    pub input_peak_hold: f32,
+    pub input_over: bool,
+    /// The manual trim in force for the open input device, in ms.
+    pub input_trim_ms: f64,
+    /// What the next take will be pulled back by: block + backlog + trim.
+    pub alignment_ms: f64,
+    /// What the last take was actually corrected by, if one has been recorded this session.
+    pub last_take_align: Option<TakeAlign>,
+}
+
+/// How far the last take moved, and how much of its head was cut to keep it on the grid.
+///
+/// Two numbers rather than one because they are not interchangeable: a shift is free, a trim
+/// threw audio away, and the REC page says so.
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TakeAlign {
+    pub shifted_ms: f64,
+    pub trimmed_ms: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -283,12 +315,27 @@ impl AppState {
             peak_cache: Mutex::new(HashMap::new()),
             armed_audio: Mutex::new((None, false)),
             recording_source: Mutex::new(None),
+            last_take_align: Mutex::new(None),
+            tuner_open: AtomicBool::new(false),
             importing: AtomicBool::new(false),
+            detecting: AtomicBool::new(false),
         }
     }
 
     fn settings(&self) -> Settings {
         self.settings.lock().unwrap().clone()
+    }
+
+    /// The manual latency trim set for `device`, in ms. Unknown devices read as 0.
+    fn input_trim_ms(&self, device: &str) -> f64 {
+        self.settings
+            .lock()
+            .unwrap()
+            .audio
+            .input_trims
+            .get(device)
+            .copied()
+            .unwrap_or(0.0)
     }
 
     fn settings_path(&self) -> Option<PathBuf> {
@@ -345,6 +392,14 @@ impl AppState {
         } else {
             0.0
         };
+        // The same figure with the device's manual trim on top: what a take gets moved by,
+        // as against what the round trip measures.
+        let input_trim_ms = input.as_ref().map(|i| self.input_trim_ms(&i.device_name)).unwrap_or(0.0);
+        let alignment_ms = if input.is_some() {
+            dissonant_engine::input_latency_ms(block, queued, sr, input_trim_ms)
+        } else {
+            0.0
+        };
         AudioStatus {
             running: audio.is_some(),
             sample_rate: audio.as_ref().map(|a| a.sample_rate),
@@ -361,14 +416,19 @@ impl AppState {
             round_trip_ms: latency_ms + input_latency_ms,
             input_underruns: shared.map(|s| s.input_underruns()).unwrap_or(0),
             master_over: shared.map(|s| s.master_over()).unwrap_or(false),
+            input_peak_hold: shared.map(|s| s.input_peak_hold()).unwrap_or(0.0),
+            input_over: shared.map(|s| s.input_over()).unwrap_or(false),
+            input_trim_ms,
+            alignment_ms,
+            last_take_align: *self.last_take_align.lock().unwrap(),
         }
     }
 
     /// Re-send the transport settings the engine forgets when its device is rebuilt.
     fn resend_transport(&self) {
-        let (hear_chords, looping, loop_region, metronome, volume) = {
+        let (hear_chords, looping, loop_region, punch_region, metronome, volume) = {
             let ctx = self.playback.lock().unwrap();
-            (ctx.hear_chords, ctx.looping, ctx.loop_region, ctx.metronome, ctx.metronome_volume)
+            (ctx.hear_chords, ctx.looping, ctx.loop_region, ctx.punch_region, ctx.metronome, ctx.metronome_volume)
         };
         self.send(EngineCommand::SetHearChords(hear_chords));
         self.send(EngineCommand::SetLooping(looping));
@@ -376,6 +436,10 @@ impl AppState {
         match loop_region {
             Some((start, end)) => self.send(EngineCommand::SetLoop { start, end }),
             None => self.send(EngineCommand::ClearLoop),
+        }
+        match punch_region {
+            Some((start, end)) => self.send(EngineCommand::SetPunch { start, end }),
+            None => self.send(EngineCommand::ClearPunch),
         }
     }
 
@@ -402,6 +466,9 @@ impl AppState {
         self.resend_transport();
         let (armed, monitor) = *self.armed_audio.lock().unwrap();
         self.send(EngineCommand::SetAudioArm { track_id: armed, monitor });
+        if self.tuner_open.load(Ordering::SeqCst) {
+            self.send(EngineCommand::SetTuner(true));
+        }
         if let Some((tick, playing)) = was {
             self.send(EngineCommand::Seek { tick });
             if playing {
@@ -1606,6 +1673,20 @@ fn set_looping(state: State<'_, AppState>, on: bool) {
     state.send(EngineCommand::SetLooping(on));
 }
 
+/// Arm the punch range. The engine holds capture until the playhead reaches `start` and drops
+/// it at `end`, and stops looping for as long as one is armed.
+#[tauri::command]
+fn set_punch(state: State<'_, AppState>, start: f64, end: f64) {
+    state.playback.lock().unwrap().punch_region = if end > start { Some((start, end)) } else { None };
+    state.send(EngineCommand::SetPunch { start, end });
+}
+
+#[tauri::command]
+fn clear_punch(state: State<'_, AppState>) {
+    state.playback.lock().unwrap().punch_region = None;
+    state.send(EngineCommand::ClearPunch);
+}
+
 // ─── Export ──────────────────────────────────────────────────────────────────────────────────
 
 /// Everything the export dialog decides. Fields left `None` fall back to the export settings.
@@ -2018,7 +2099,19 @@ fn set_settings(app: AppHandle, state: State<'_, AppState>, settings: Settings) 
     let settings = settings.sanitized();
     let (audio_changed, midi_changed) = {
         let mut current = state.settings.lock().unwrap();
-        let audio_changed = current.audio != settings.audio;
+        // Only the fields the streams are actually built from. The manual latency trim lives
+        // in this section too and is nudged a millisecond at a time while a take is being
+        // checked; restarting both devices under the player for that would be absurd.
+        let device_shape = |a: &AudioSettings| {
+            (
+                a.device.clone(),
+                a.sample_rate,
+                a.buffer_size,
+                a.input_device.clone(),
+                a.input_channel,
+            )
+        };
+        let audio_changed = device_shape(&current.audio) != device_shape(&settings.audio);
         let midi_changed = current.midi.default_input != settings.midi.default_input;
         *current = settings.clone();
         (audio_changed, midi_changed)
@@ -2067,6 +2160,46 @@ fn test_tone(state: State<'_, AppState>) {
 #[tauri::command]
 fn clear_clip(state: State<'_, AppState>) {
     state.send(EngineCommand::ClearClip);
+}
+
+/// Acknowledge the input meter's peak hold and its clip latch, together: they are one reading
+/// of the same signal and clearing half of it would leave the strip lying.
+#[tauri::command]
+fn clear_input_peak(state: State<'_, AppState>) -> AudioStatus {
+    state.send(EngineCommand::ClearInputPeak);
+    state.audio_status()
+}
+
+/// What the tuner hears: a frequency and how periodic the window was.
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TunerReading {
+    pub hz: f32,
+    /// 0…1. A chord or a muted string reads low, and the strip says "—" rather than guessing.
+    pub clarity: f32,
+}
+
+/// Open or close the tuner. While it is open the engine is silent and the live input is run
+/// through pitch detection on every stopped block.
+#[tauri::command]
+fn set_tuner(state: State<'_, AppState>, on: bool) {
+    // Remembered as well as sent: a rebuilt engine starts with the tuner closed, and the strip
+    // would be left showing a needle over an engine that was no longer listening.
+    state.tuner_open.store(on, Ordering::SeqCst);
+    state.send(EngineCommand::SetTuner(on));
+}
+
+/// The tuner's latest reading, polled by the strip. `None` before it has heard a pitch, and
+/// again once the string has died away.
+#[tauri::command]
+fn tuner_reading(state: State<'_, AppState>) -> Option<TunerReading> {
+    state
+        .audio
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|a| a.shared().tuner_reading())
+        .map(|(hz, clarity)| TunerReading { hz, clarity })
 }
 
 // ─── Guitar: input, recording and audio import ───────────────────────────────────────────────
@@ -2163,13 +2296,17 @@ fn stop_audio_record(state: State<'_, AppState>) -> Result<Snapshot, String> {
     // Give the audio thread one block to see the stop before the writer closes the file.
     std::thread::sleep(Duration::from_millis(30));
 
-    let (start_tick, captured) = state
+    let (start_tick, captured, block, backlog) = state
         .audio
         .lock()
         .unwrap()
         .as_ref()
-        .map(|a| a.shared().take_span())
-        .unwrap_or((0.0, 0));
+        .map(|a| {
+            let s = a.shared();
+            let (tick, frames) = s.take_span();
+            (tick, frames, s.block_frames(), s.input_backlog())
+        })
+        .unwrap_or((0.0, 0, 0, 0));
     let rate = state.audio.lock().unwrap().as_ref().map(|a| a.sample_rate).unwrap_or(48_000);
     let frames = state
         .takes
@@ -2194,6 +2331,28 @@ fn stop_audio_record(state: State<'_, AppState>) -> Result<Snapshot, String> {
     let track_id = track_id.ok_or("the armed track went away mid-take")?;
     let take_number = state.doc.lock().unwrap().model().audio_clips_on(track_id).count() + 1;
 
+    // Everything between the string and the take ring is delay, so the take is pulled back by
+    // it before it lands. The tempo map is the song's, read at the take's own position: a take
+    // recorded into a ritardando is worth fewer ticks per millisecond than the base tempo says.
+    let trim_ms = state
+        .input
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|i| state.input_trim_ms(&i.device_name))
+        .unwrap_or(0.0);
+    let latency_ms = dissonant_engine::input_latency_ms(block, backlog, rate, trim_ms);
+    let map = state.doc.lock().unwrap().model().tempo_map();
+    let aligned = dissonant_engine::align_take(&map, start_tick, latency_ms);
+    let duration = frames as f64 / rate as f64;
+    if duration <= aligned.offset_seconds {
+        // The whole take is inside the latency: there is no audio left once the head is cut,
+        // so this was a stray click rather than a performance.
+        let _ = std::fs::remove_file(audio_files::source_path(&dir, source_id));
+        *state.last_take_align.lock().unwrap() = None;
+        return Ok(state.snapshot());
+    }
+
     let source = dissonant_core::AudioSource {
         id: source_id,
         name: format!("take {take_number}"),
@@ -2201,7 +2360,17 @@ fn stop_audio_record(state: State<'_, AppState>) -> Result<Snapshot, String> {
         sample_rate: rate,
         channels: 1,
     };
-    let clip = dissonant_core::AudioClip::new(track_id, source_id, start_tick.round() as i64, frames as f64 / rate as f64);
+    let mut clip = dissonant_core::AudioClip::new(
+        track_id,
+        source_id,
+        aligned.start_tick,
+        duration - aligned.offset_seconds,
+    );
+    clip.offset_seconds = aligned.offset_seconds;
+    *state.last_take_align.lock().unwrap() = Some(TakeAlign {
+        shifted_ms: aligned.shifted_ms,
+        trimmed_ms: aligned.trimmed_ms,
+    });
 
     match audio_files::read_source(&dir, source_id) {
         Ok(buffer) => {
@@ -2210,14 +2379,28 @@ fn stop_audio_record(state: State<'_, AppState>) -> Result<Snapshot, String> {
         Err(e) => log::warn!("the take was written but could not be read back: {e}"),
     }
 
+    // With a punch armed the engine captured exactly the punch range, so the take lands on
+    // top of what is already there and the clips underneath are split and crossfaded against
+    // it — one command, one undo step, because half-undoing a punch leaves a hole.
+    let punched = state.doc.lock().unwrap().model().punch_region.is_some();
+    let command = if punched {
+        Command::PunchAudioTake {
+            track_id,
+            source,
+            clip,
+            crossfade_seconds: dissonant_core::DEFAULT_PUNCH_CROSSFADE_SECONDS,
+        }
+    } else {
+        Command::AddAudioTake { track_id, source, clip }
+    };
     state
         .doc
         .lock()
         .unwrap()
         .apply_labeled(
-            Command::AddAudioTake { track_id, source, clip },
+            command,
             false,
-            Some("record take".into()),
+            Some(if punched { "punch in".into() } else { "record take".into() }),
         )
         .map_err(|e| e.to_string())?;
     state.sync_engine();
@@ -2353,6 +2536,87 @@ fn source_path_stem(path: &str) -> String {
         .and_then(|s| s.to_str())
         .unwrap_or("audio")
         .to_string()
+}
+
+/// What a DI analysis did, for the UI to say so.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DetectionReport {
+    snapshot: Snapshot,
+    /// The new note track, when any notes were written.
+    track_id: Option<Uuid>,
+    notes: usize,
+    chords: usize,
+    /// Regions refused as polyphonic, `[start, end]` in song ticks: no notes there.
+    refused: Vec<(i64, i64)>,
+}
+
+/// Transcribe one audio clip's raw DI: notes onto a new synth track, chord candidates into the
+/// detected lane, one undo step for both. The analysis runs on a blocking worker over samples
+/// already in memory, so neither the UI nor the audio thread waits on it; the document is only
+/// locked to read the clip at the start and to land the result at the end.
+#[tauri::command]
+async fn detect_audio_clip(state: State<'_, AppState>, clip_id: Uuid) -> Result<DetectionReport, String> {
+    if state.detecting.swap(true, Ordering::SeqCst) {
+        return Err("a detection is already running".into());
+    }
+    let result = detect_audio_clip_inner(&state, clip_id).await;
+    state.detecting.store(false, Ordering::SeqCst);
+    result
+}
+
+async fn detect_audio_clip_inner(state: &State<'_, AppState>, clip_id: Uuid) -> Result<DetectionReport, String> {
+    // The clip and tempo map as they are now: a take moved while it is being analysed lands
+    // its notes where it was when the button was pressed.
+    let (clip, source, map) = {
+        let doc = state.doc.lock().unwrap();
+        let m = doc.model();
+        let clip = m.audio_clips.iter().find(|c| c.id == clip_id).cloned().ok_or("that take is not on the song any more")?;
+        let source = m.audio_source(&clip.source_id).cloned().ok_or("that take's audio is missing")?;
+        (clip, source, m.tempo_map())
+    };
+    let cached = state.audio_cache.lock().unwrap().get(&source.id).cloned();
+    let buffer = match cached {
+        Some(b) => b,
+        None => {
+            let dir = state.data_dir().map(|d| audio_files::store_dir(&d)).ok_or("the audio store is not available")?;
+            Arc::new(audio_files::read_source(&dir, source.id)?)
+        }
+    };
+    let (start_tick, offset, length) = (clip.start_tick, clip.offset_seconds, clip.length_seconds);
+    let t = tauri::async_runtime::spawn_blocking(move || {
+        let mono = dissonant_engine::clip_mono(&buffer, offset, length);
+        let heard = dissonant_engine::hear(&mono, buffer.sample_rate as f32);
+        dissonant_engine::place_on_song(&heard, clip_id, start_tick, length, &map)
+    })
+    .await
+    .map_err(|e| format!("the detection thread failed: {e}"))?;
+    if t.notes.is_empty() && t.detection.chords.is_empty() && t.refused.is_empty() {
+        return Err("nothing with a pitch in it in that take".into());
+    }
+
+    let (notes, chords, refused) = (t.notes.len(), t.detection.chords.len(), t.refused);
+    let label = if notes > 0 { "detect notes" } else { "detect chords" };
+    let track_id = {
+        let mut doc = state.doc.lock().unwrap();
+        let before = doc.model().tracks.len();
+        doc.apply_labeled(
+            Command::AddTranscription {
+                name: format!("{} notes", source_path_stem(&source.name)),
+                start_tick,
+                length_ticks: t.length_ticks,
+                notes: t.notes,
+                detection: t.detection,
+            },
+            false,
+            Some(label.into()),
+        )
+        .map_err(|e| e.to_string())?;
+        let m = doc.model();
+        (m.tracks.len() > before).then(|| m.tracks.last().map(|t| t.id)).flatten()
+    };
+    state.sync_engine();
+    Ok(DetectionReport { snapshot: state.snapshot(), track_id, notes, chords, refused })
 }
 
 /// The waveform envelope for one source: `buckets` min/max pairs over the mono sum.
@@ -3049,6 +3313,8 @@ pub fn run() {
             set_loop,
             clear_loop,
             set_looping,
+            set_punch,
+            clear_punch,
             quit,
             recent_files,
             clear_recent,
@@ -3061,6 +3327,9 @@ pub fn run() {
             output_devices,
             test_tone,
             clear_clip,
+            clear_input_peak,
+            set_tuner,
+            tuner_reading,
             export_midi,
             import_midi,
             list_templates,
@@ -3086,6 +3355,7 @@ pub fn run() {
             start_audio_record,
             stop_audio_record,
             import_audio,
+            detect_audio_clip,
             audio_peaks,
             library_sounds,
             save_library_sound,

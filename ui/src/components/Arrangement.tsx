@@ -1,15 +1,16 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { barTicks, beatsPerBar, dbText, useStore } from "../store";
 import type { DrumPad } from "../sound";
-import { automationLane, automationValueAt, autoTargetRange, sectionSpan, songLength, trackColor, trackKind, TICKS_PER_BEAT, type AutoTarget, type Clip, type NoteEvent, type Section, type SongPattern, type Track, type TrackParam } from "../types";
+import { automationLane, automationValueAt, autoTargetRange, sectionSpan, songLength, trackColor, trackKind, TICKS_PER_BEAT, type AudioClip, type AutoTarget, type Clip, type NoteEvent, type Section, type SongPattern, type Track, type TrackParam } from "../types";
 import { noteName } from "../theory";
 import { VMeter } from "./Meter";
-import { ChordLane, GUTTER } from "./ChordLane";
+import { ChordLane, DetectedChordLane, GUTTER } from "./ChordLane";
+import { detectedChords } from "../detection";
 import { SECTION_COLORS, SectionEditor } from "./SectionEditor";
 import { BreakpointLane, TempoLane } from "./TempoLane";
 import { hz, panText, pct } from "./Knob";
 import { keys } from "../platform";
-import { clipsInBox, dropAt, duplicateClips, groupMoveDelta, moveClips, pasteClips, snapGrid, snapTo, toggleId, toggleMuted, trimClip, type ArrSnap } from "../clipEditing";
+import { clampFade, clipsInBox, dropAt, duplicateClips, equalPowerGain, groupMoveDelta, moveClips, pasteClips, snapGrid, snapTo, toggleId, toggleMuted, trimClip, type ArrSnap } from "../clipEditing";
 import { usePanelSize } from "../panels";
 import { Splitter } from "./Splitter";
 
@@ -24,6 +25,9 @@ const DRAG_PX = 3;
 const MARKER_H = 16;
 /** The strip under the markers, where the loop brace is drawn and dragged. */
 const LOOP_H = 10;
+/** The strip under the brace, where the punch range is drawn and dragged. Its own lane, not a
+ *  mode of the brace: the two mean different things and only one of them can be live. */
+const PUNCH_H = 10;
 
 /** The song view's snap choices, coarse to fine; the labels match the roll's grid select. */
 const SNAP_OPTIONS: [string, ArrSnap][] = [
@@ -394,6 +398,80 @@ export function Arrangement() {
     if (region) void s.setSongLoop(region);
   };
 
+  // ── Punch range ────────────────────────────────────────────────────────────────────────
+  // Same gesture as the brace, one strip down, and the same deal: saved with the project, so
+  // the drag is an edit that lands on release.
+  const punchDrag = useRef<{ anchor: number } | null>(null);
+  const [punchPreview, setPunchPreview] = useState<[number, number] | null>(null);
+  const punch = punchPreview ?? model.punchRegion ?? null;
+
+  const onPunchDown = (e: React.PointerEvent) => {
+    const x = e.clientX - e.currentTarget.getBoundingClientRect().left;
+    if (e.button === 2) {
+      void s.setPunch(null);
+      return;
+    }
+    if (e.button !== 0) return;
+    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+    punchDrag.current = { anchor: Math.max(0, Math.min(songEnd, snapTo(x / pxPerTick, snapGrid(arrSnap, barTick, e.shiftKey)))) };
+  };
+  const onPunchMove = (e: React.PointerEvent) => {
+    const d = punchDrag.current;
+    if (!d) return;
+    const x = e.clientX - e.currentTarget.getBoundingClientRect().left;
+    const tick = Math.max(0, Math.min(songEnd, snapTo(x / pxPerTick, snapGrid(arrSnap, barTick, e.shiftKey))));
+    setPunchPreview(tick === d.anchor ? null : [Math.min(d.anchor, tick), Math.max(d.anchor, tick)]);
+  };
+  const onPunchUp = () => {
+    if (!punchDrag.current) return;
+    punchDrag.current = null;
+    const region = punchPreview;
+    setPunchPreview(null);
+    if (region) void s.setPunch(region);
+  };
+
+  // ── Audio clip fades ───────────────────────────────────────────────────────────────────
+  // The one part of a take the song view edits, because it is where a punch leaves its seams:
+  // the crossfades land on these corners and are dragged from here. Transient while dragging
+  // and closed by `commitGesture`, so one drag is one undo step, the way a trim is.
+  // Audio does not warp, so a clip's width is its seconds at the project tempo — the same
+  // conversion the lane already draws it with.
+  const ticksToSeconds = (t: number) => ((t / TICKS_PER_BEAT) * 60) / model.tempo;
+  const secondsToTicks = (sec: number) => ((sec * model.tempo) / 60) * TICKS_PER_BEAT;
+  const fadeDrag = useRef<{ clip: AudioClip; edge: "in" | "out" } | null>(null);
+  const [fadePreview, setFadePreview] = useState<AudioClip | null>(null);
+
+  const onFadeDown = (e: React.PointerEvent, clip: AudioClip, edge: "in" | "out") => {
+    e.stopPropagation();
+    if (e.button !== 0) return;
+    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+    s.selectAudioClip(clip.id);
+    fadeDrag.current = { clip, edge };
+    setFadePreview(clip);
+  };
+  const onFadeMove = (e: React.PointerEvent) => {
+    const d = fadeDrag.current;
+    if (!d) return;
+    e.stopPropagation();
+    const tick = lanePoint(e).x / pxPerTick;
+    const from =
+      d.edge === "in"
+        ? tick - d.clip.startTick
+        : d.clip.startTick + secondsToTicks(d.clip.lengthSeconds) - tick;
+    const fade = clampFade(ticksToSeconds(from), d.clip.lengthSeconds);
+    const next: AudioClip =
+      d.edge === "in" ? { ...d.clip, fadeInSeconds: fade } : { ...d.clip, fadeOutSeconds: fade };
+    setFadePreview(next);
+    void dispatch({ type: "updateAudioClip", clip: next }, true, "fade take");
+  };
+  const onFadeUp = (e: React.PointerEvent) => {
+    if (!fadeDrag.current) return;
+    e.stopPropagation();
+    fadeDrag.current = null;
+    setFadePreview(null);
+    void s.commitGesture();
+  };
+
   // ── Ripple: insert, delete and duplicate bars ──────────────────────────────────────────
   // The ruler's right-click. Each of these is one command, so each is one undo step however
   // many clips, markers, tempo points, chords and automation points it carries.
@@ -403,9 +481,9 @@ export function Arrangement() {
 
   const onRulerMenu = (e: React.MouseEvent) => {
     const rect = e.currentTarget.getBoundingClientRect();
-    // The marker strip removes a section and the brace strip clears the loop; this is the
-    // bar ruler below them.
-    if (e.clientY - rect.top < MARKER_H + LOOP_H) return;
+    // The marker strip removes a section, the brace strip clears the loop and the punch strip
+    // clears the punch; this is the bar ruler below them all.
+    if (e.clientY - rect.top < MARKER_H + LOOP_H + PUNCH_H) return;
     e.preventDefault();
     const tick = Math.max(0, Math.floor((e.clientX - rect.left) / pxPerTick / barTick) * barTick);
     setRulerMenu({ tick, x: e.clientX, y: e.clientY });
@@ -526,6 +604,7 @@ export function Arrangement() {
     ...(dropGhost ? [{ clip: dropGhost, kind: "drop" as const }] : []),
   ];
   const audioClips = model.audioClips ?? [];
+  const heard = detectedChords(model);
   const sectionsShown = model.sections.map((x) => (sectionPreview && x.id === sectionPreview.id ? sectionPreview : x));
   // A marker drag previews where it would land, so the bands are measured against that list.
   const sectionModel = { ...model, sections: sectionsShown };
@@ -558,14 +637,29 @@ export function Arrangement() {
         {/* The transport owns the loop on/off switch; this says what is braced, in bars. */}
         <span
           className="mono"
-          style={{ fontSize: 9.5, color: looping ? "var(--text-4)" : "var(--text-6)" }}
-          title={keys("drag the strip under the ruler's markers to set this · right-click it to clear · L loops")}
+          style={{ fontSize: 9.5, color: looping && !punch ? "var(--text-4)" : "var(--text-6)" }}
+          title={keys(
+            punch
+              ? "looping is blocked while a punch is armed — clear the punch range to loop again"
+              : "drag the strip under the ruler's markers to set this · right-click it to clear · L loops",
+          )}
         >
           loop {songLoop ? `${+(songLoop[0] / barTick + 1).toFixed(2)} → ${+(songLoop[1] / barTick + 1).toFixed(2)}` : "whole song"}
-          {looping ? "" : " (off)"}
+          {punch ? " (blocked by punch)" : looping ? "" : " (off)"}
         </span>
         {songLoop && (
           <button className="chip tiny" onClick={() => void s.setSongLoop(null)} title="clear the loop brace">clear</button>
+        )}
+        <div className="vdiv" />
+        <span
+          className="mono"
+          style={{ fontSize: 9.5, color: punch ? "var(--rec-text)" : "var(--text-6)" }}
+          title="drag the strip under the loop brace to set the punch range · right-click it to clear · recording drops in and out on these points"
+        >
+          punch {punch ? `${+(punch[0] / barTick + 1).toFixed(2)} → ${+(punch[1] / barTick + 1).toFixed(2)}` : "off"}
+        </span>
+        {punch && (
+          <button className="chip tiny" onClick={() => void s.setPunch(null)} title="clear the punch range and let the loop work again">clear</button>
         )}
         <span className="spacer" />
         <span className="mono" style={{ fontSize: 9.5, color: "var(--text-4)" }}>
@@ -615,14 +709,26 @@ export function Arrangement() {
                 onLoopDown(e);
                 return;
               }
+              if (y < MARKER_H + LOOP_H + PUNCH_H) {
+                onPunchDown(e);
+                return;
+              }
               if (e.button !== 0) return;
               s.seek(Math.min(songEnd, Math.max(0, (e.clientX - rect.left) / pxPerTick)));
             }}
-            onPointerMove={onLoopMove}
-            onPointerUp={onLoopUp}
+            onPointerMove={(e) => {
+              onLoopMove(e);
+              onPunchMove(e);
+            }}
+            onPointerUp={() => {
+              onLoopUp();
+              onPunchUp();
+            }}
             onPointerCancel={() => {
               loopDrag.current = null;
               setLoopPreview(null);
+              punchDrag.current = null;
+              setPunchPreview(null);
             }}
             onDoubleClick={(e) => {
               const rect = e.currentTarget.getBoundingClientRect();
@@ -630,7 +736,7 @@ export function Arrangement() {
               void dispatch({ type: "addSection", name: "", startTick: Math.max(0, snapTo((e.clientX - rect.left) / pxPerTick, grid)) });
             }}
             onContextMenu={onRulerMenu}
-            title="click to seek · drag the strip under the markers to loop · double-click the top strip to add a section · right-click the bars to insert, delete or duplicate time"
+            title="click to seek · drag the strip under the markers to loop · drag the one under that to set the punch range · right-click either to clear it · double-click the top strip to add a section · right-click the bars to insert, delete or duplicate time"
           >
             <div className="oob" style={{ left: endX }} />
             {sectionsShown.map((sec, i) => {
@@ -676,8 +782,26 @@ export function Arrangement() {
                   width: Math.max(2, (songLoop[1] - songLoop[0]) * pxPerTick),
                   height: LOOP_H - 4,
                   background: "var(--accent)",
-                  // Off, the brace is still where it was, but nothing is looping to it.
-                  opacity: looping ? 0.85 : 0.3,
+                  // Off — or blocked by an armed punch — the brace is still where it was, but
+                  // nothing is looping to it.
+                  opacity: looping && !punch ? 0.85 : 0.3,
+                  borderRadius: 3,
+                  pointerEvents: "none",
+                }}
+              />
+            )}
+            {/* The punch strip, in the record colour so it never reads as a second loop. */}
+            <div style={{ position: "absolute", left: 0, top: MARKER_H + LOOP_H + 2, width: endX, height: PUNCH_H - 4, background: "var(--line-1)", opacity: 0.5, borderRadius: 3, pointerEvents: "none" }} />
+            {punch && (
+              <div
+                style={{
+                  position: "absolute",
+                  left: punch[0] * pxPerTick,
+                  top: MARKER_H + LOOP_H + 2,
+                  width: Math.max(2, (punch[1] - punch[0]) * pxPerTick),
+                  height: PUNCH_H - 4,
+                  background: "var(--rec)",
+                  opacity: 0.9,
                   borderRadius: 3,
                   pointerEvents: "none",
                 }}
@@ -705,6 +829,20 @@ export function Arrangement() {
           <div className="oob" style={{ left: HEAD_W + endX }} />
         </div>
 
+        {/* Chords heard in recorded takes, under the progression they may join. Only there
+            while something is waiting to be reviewed. */}
+        {heard.length > 0 && (
+          <div className="songchords detected" style={{ width: rowW, "--sc-head": `${HEAD_W - GUTTER}px` } as React.CSSProperties}>
+            <div className="schead">
+              <span className="cap" title="chords detected in recorded DI: review each one">
+                {heard.length} to review
+              </span>
+            </div>
+            <DetectedChordLane lengthTicks={songEnd} beatW={pxPerBeat} />
+            <div className="oob" style={{ left: HEAD_W + endX }} />
+          </div>
+        )}
+
         <TempoLane headW={HEAD_W} timelineW={timelineW} pxPerBeat={pxPerBeat} bpb={bpb} />
 
         <div className="lanes" ref={lanesRef} onPointerMove={onPointerMove} onPointerUp={onPointerUp} onPointerCancel={onPointerCancel}>
@@ -729,22 +867,48 @@ export function Arrangement() {
                 onLaneDown={(e) => onLaneDown(e, track)}
               >
                 {track.isAudio
-                  ? // An audio track's lane shows its own takes, read-only: editing them happens
-                    // on the guitar screen, where the waveform and the rig are.
+                  ? // An audio track's lane shows its own takes. Only the fades are editable
+                    // here; trimming, gain and the rig live on the rec page.
                     audioClips
                       .filter((c) => c.trackId === track.id)
-                      .map((c) => {
+                      .map((raw) => {
+                        const c = fadePreview?.id === raw.id ? fadePreview : raw;
                         const source = (model.audioSources ?? []).find((src) => src.id === c.sourceId);
-                        const widthTicks = ((c.lengthSeconds * model.tempo) / 60) * TICKS_PER_BEAT;
+                        const widthTicks = secondsToTicks(c.lengthSeconds);
+                        const w = Math.max(6, widthTicks * pxPerTick);
                         return (
                           <div
                             key={c.id}
                             className={`clip audio${c.muted ? " muted" : ""}`}
-                            style={{ left: c.startTick * pxPerTick, width: Math.max(6, widthTicks * pxPerTick), height: CLIP_H, borderColor: color }}
-                            title={`${source?.name ?? "missing audio"} · ${c.lengthSeconds.toFixed(1)}s — edit on the guitar screen`}
-                            onDoubleClick={() => (s.selectTrack(track.id), s.selectAudioClip(c.id), s.setScreen("guitar"))}
+                            style={{ left: c.startTick * pxPerTick, width: w, height: CLIP_H, borderColor: color }}
+                            title={`${source?.name ?? "missing audio"} · ${c.lengthSeconds.toFixed(1)}s — drag a top corner to fade · double-click to open it on the rec page`}
+                            onDoubleClick={() => (s.selectTrack(track.id), s.selectAudioClip(c.id), s.setScreen("rec"))}
                           >
                             <span className="name">{source?.name ?? "missing audio"}</span>
+                            {source && (
+                              <button
+                                className="chip tiny detect"
+                                disabled={s.detectingClipId !== null}
+                                title="transcribe this take's raw DI: single notes onto a new synth track (bends kept), strummed parts refused and offered as chords above"
+                                onPointerDown={(e) => e.stopPropagation()}
+                                onDoubleClick={(e) => e.stopPropagation()}
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  void s.detectNotes(c.id);
+                                }}
+                              >
+                                {s.detectingClipId === c.id ? "listening…" : "notes"}
+                              </button>
+                            )}
+                            <FadeHandles
+                              clip={c}
+                              width={w}
+                              height={CLIP_H}
+                              pxPerSecond={secondsToTicks(1) * pxPerTick}
+                              onDown={onFadeDown}
+                              onMove={onFadeMove}
+                              onUp={onFadeUp}
+                            />
                           </div>
                         );
                       })
@@ -1192,6 +1356,76 @@ function AutomationRow({ track, param, headW, timelineW, pxPerBeat, bpb }: { tra
       onRemove={(id) => void dispatch({ type: "removeAutomationPoint", lane: lane!.id, id })}
       onCommit={() => void commitGesture()}
     />
+  );
+}
+
+/**
+ * A take's fades, drawn inside the clip with a handle on each top corner.
+ *
+ * The shaded wedge is the level the fade takes away, sampled off the engine's equal-power
+ * curve rather than drawn as a straight line: a fade that looks linear and sounds equal-power
+ * lies about where the level is halfway down, and these are the curves a punch seam is made of.
+ */
+function FadeHandles({
+  clip,
+  width,
+  height,
+  pxPerSecond,
+  onDown,
+  onMove,
+  onUp,
+}: {
+  clip: AudioClip;
+  width: number;
+  height: number;
+  pxPerSecond: number;
+  onDown: (e: React.PointerEvent, clip: AudioClip, edge: "in" | "out") => void;
+  onMove: (e: React.PointerEvent) => void;
+  onUp: (e: React.PointerEvent) => void;
+}) {
+  const inW = Math.min(width, clip.fadeInSeconds * pxPerSecond);
+  const outW = Math.min(width, clip.fadeOutSeconds * pxPerSecond);
+  /** The gap between the curve and full level, as a closed path. */
+  const wedge = (span: number, rising: boolean) => {
+    const steps = 12;
+    const points = Array.from({ length: steps + 1 }, (_, i) => {
+      const t = i / steps;
+      const x = rising ? t * span : width - t * span;
+      return `${x.toFixed(2)} ${(height * (1 - equalPowerGain(t))).toFixed(2)}`;
+    });
+    return `M ${points.join(" L ")} L ${rising ? 0 : width} 0 Z`;
+  };
+  const handle = (edge: "in" | "out", left: number) => (
+    <div
+      style={{
+        position: "absolute",
+        top: 0,
+        left,
+        width: 8,
+        height: 8,
+        background: "var(--accent)",
+        opacity: 0.9,
+        borderRadius: 2,
+        cursor: "ew-resize",
+        touchAction: "none",
+      }}
+      title={`${edge === "in" ? "fade in" : "fade out"}: ${((edge === "in" ? clip.fadeInSeconds : clip.fadeOutSeconds) * 1000).toFixed(0)} ms — drag to change`}
+      onPointerDown={(e) => onDown(e, clip, edge)}
+      onPointerMove={onMove}
+      onPointerUp={onUp}
+      onPointerCancel={onUp}
+      onDoubleClick={(e) => e.stopPropagation()}
+    />
+  );
+  return (
+    <>
+      <svg width={width} height={height} style={{ position: "absolute", inset: 0, pointerEvents: "none" }}>
+        {inW > 0 && <path d={wedge(inW, true)} fill="rgba(0, 0, 0, 0.5)" />}
+        {outW > 0 && <path d={wedge(outW, false)} fill="rgba(0, 0, 0, 0.5)" />}
+      </svg>
+      {handle("in", Math.min(width - 8, Math.max(0, inW - 4)))}
+      {handle("out", Math.max(0, Math.min(width - 8, width - outW - 4)))}
+    </>
   );
 }
 

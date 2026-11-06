@@ -632,12 +632,26 @@ fn an_extreme_rig_never_produces_a_non_finite_sample() {
         treble: 10.0,
         presence: 10.0,
         master: 10.0,
+        bright_cap: true,
+        half_power: true,
+        cathode_follower: true,
     };
 
     let (source, buffer) = noise_source(2.0, 44_100, 1.0);
-    let out = through_rig(rig, source, buffer, 2.0);
+    let out = through_rig(rig.clone(), source, buffer, 2.0);
     for (i, s) in out.iter().enumerate() {
         assert!(s.is_finite(), "sample {i} is {s}");
+    }
+
+    // The fuzz voicing has none of those switches, so the run above never touched the circuits
+    // they throw. The tweed has all three, and all three in at once is the extreme that matters:
+    // a follower conducting into a half-powered supply that is already on the floor.
+    rig.amp.model = AmpModel::Clean;
+    rig.amp.cathode_follower = true;
+    let (source, buffer) = noise_source(2.0, 44_100, 1.0);
+    let out = through_rig(rig, source, buffer, 2.0);
+    for (i, s) in out.iter().enumerate() {
+        assert!(s.is_finite(), "sample {i} with every switch thrown is {s}");
     }
 }
 
@@ -1113,4 +1127,185 @@ fn the_cabinet_costs_no_latency() {
         peak_at(&fl) > close,
         "the far microphone heard the speaker no later than the close one"
     );
+}
+
+// ─── power supply and circuit switches ───────────────────────────────────────────────────────
+
+/// Peak over `len` seconds starting at `t`. Sag has to be measured this way: the envelope *is*
+/// the effect, so a Goertzel window long enough to be accurate would average it away.
+fn window_peak(x: &[f32], t: f64, len: f64) -> f64 {
+    let start = (t * SRD) as usize;
+    let end = (start + (len * SRD) as usize).min(x.len());
+    peak(&x[start..end]) as f64
+}
+
+/// Two loud 220 Hz bursts with a long rest between them, which is how a player finds out what
+/// an amp's supply does. Returns `(droop over the first burst, how far the second burst's
+/// attack came back)`, both in dB against the first attack.
+///
+/// The attack window is deliberately the first 9 ms — under two cycles, and shorter than any
+/// rail's time constant. Measure later and the sag has already happened, which is what the amp
+/// wants and the measurement does not.
+fn sag_profile(rig: &AmpRig) -> (f64, f64) {
+    let mut r = Rig::new(SR);
+    r.apply(rig);
+    let n = secs(1.8);
+    let input: Vec<f32> = (0..n)
+        .map(|i| {
+            let t = i as f64 / SRD;
+            // Nearly a second of rest between the bursts: the reservoir refills in a couple of
+            // hundred ms, but the cathode-bias capacitor behind it takes its time.
+            let loud = (0.05..0.45).contains(&t) || t >= 1.35;
+            ((if loud { 0.9 } else { 0.0 }) * (2.0 * PI * 220.0 * t).sin()) as f32
+        })
+        .collect();
+    let (mut l, mut right) = (vec![0.0; n], vec![0.0; n]);
+    r.process_add(&input, &mut l, &mut right);
+    let attack = window_peak(&l, 0.051, 0.009);
+    let settled = window_peak(&l, 0.41, 0.02);
+    let again = window_peak(&l, 1.351, 0.009);
+    (level_db(settled, attack), level_db(again, attack))
+}
+
+/// A head with its master wide open and plenty of signal arriving, so the measurement is of the
+/// power stage rather than of whatever the preamp did first. `gain` chooses how much of a front
+/// end is in the way.
+fn cranked(model: AmpModel, gain: f64) -> AmpRig {
+    let mut rig = head_only(model, gain);
+    rig.amp.master = 10.0;
+    rig.input_db = 12.0;
+    rig
+}
+
+#[test]
+fn the_supply_sags_under_a_sustained_note_and_climbs_back() {
+    // Hold a loud note into a tweed and the rail falls away under it: the attack gets out at
+    // full level and what follows is squashed. Stop, and the rectifier refills the reservoir, so
+    // the next attack is back where the first one was. That is the whole feel of a small amp.
+    let (droop, recovery) = sag_profile(&cranked(AmpModel::Clean, 7.0));
+    assert!(
+        droop < -2.0,
+        "a held note never pulled the rail down ({droop:.2} dB)"
+    );
+    assert!(
+        recovery.abs() < 0.5,
+        "the supply never climbed back: the second attack is {recovery:.2} dB off the first"
+    );
+}
+
+#[test]
+fn a_tweed_sags_and_a_modern_head_does_not() {
+    // Baked per model, not on a knob. A small cathode-biased combo on a rectifier tube folds;
+    // a modern head with solid-state rectification and a bank of capacitors barely moves.
+    let (tweed, _) = sag_profile(&cranked(AmpModel::Clean, 7.0));
+    let (modern, _) = sag_profile(&cranked(AmpModel::Lead, 7.0));
+    assert!(
+        tweed < modern - 1.5,
+        "the tweed sagged no further than the modern head ({tweed:.2} against {modern:.2} dB)"
+    );
+    assert!(
+        modern > -1.0,
+        "the modern head sagged like a tweed ({modern:.2} dB)"
+    );
+}
+
+#[test]
+fn the_bright_cap_returns_the_top_and_gives_it_up_as_the_gain_opens() {
+    // A treble bypass across the gain pot can only hand back what the pot is throwing away. Down
+    // low it is most of the amp's voice; wide open the wiper is at the top and the cap is out of
+    // the circuit, which is why nobody notices the switch on a cranked amp.
+    let lift = |gain: f64| {
+        let mut off = head_only(AmpModel::Clean, gain);
+        off.amp.master = 3.0;
+        let mut on = off.clone();
+        on.amp.bright_cap = true;
+        let at = |rig: &AmpRig, hz: f64| tone_amplitude(&rig_tone(rig, hz, 0.1), hz);
+        (
+            level_db(at(&on, 3_000.0), at(&off, 3_000.0)),
+            level_db(at(&on, 150.0), at(&off, 150.0)),
+        )
+    };
+    let (top_low, bottom_low) = lift(2.0);
+    let (top_high, _) = lift(10.0);
+    assert!(
+        top_low > 4.0,
+        "the bright cap returned no top end at a low gain setting ({top_low:.2} dB)"
+    );
+    assert!(
+        bottom_low.abs() < 0.5,
+        "the bright cap moved the bottom end too ({bottom_low:.2} dB), so it is a tone control"
+    );
+    assert!(
+        top_high < top_low * 0.25,
+        "the bright cap still lifted {top_high:.2} dB with the gain wide open, against \
+         {top_low:.2} dB at 2"
+    );
+}
+
+#[test]
+fn half_power_lowers_the_headroom_and_sags_further() {
+    // Pulling half the output tubes trades volume for break-up: the stage arrives at its ceiling
+    // sooner, so the gap between playing quietly and playing hard closes, and the supply behind
+    // it gives way further. If it only turned everything down it would be a master volume.
+    let full = cranked(AmpModel::Clean, 2.0);
+    let mut half = full.clone();
+    half.amp.half_power = true;
+
+    let level = |rig: &AmpRig, amp: f32| peak(&rig_tone(rig, 150.0, amp)) as f64;
+    let span = |rig: &AmpRig| level_db(level(rig, 0.6), level(rig, 0.06));
+    let (full_span, half_span) = (span(&full), span(&half));
+    let (full_droop, _) = sag_profile(&full);
+    let (half_droop, _) = sag_profile(&half);
+    assert!(
+        half_span < full_span - 1.0,
+        "half power left the headroom alone: {half_span:.2} dB of range against {full_span:.2} dB"
+    );
+    assert!(
+        half_droop < full_droop - 1.0,
+        "half power sagged no deeper ({half_droop:.2} against {full_droop:.2} dB)"
+    );
+}
+
+#[test]
+fn the_cathode_follower_squashes_before_the_tone_stack() {
+    // A follower has no voltage gain, so if it did nothing the switch would be a lie. What it
+    // does is source far more current than it sinks: hard playing bends the top of the wave
+    // against grid conduction while the bottom is still clean, which compresses and throws even
+    // harmonics — and it happens ahead of the stack, where the stack can still colour it.
+    let mut off = head_only(AmpModel::Crunch, 4.0);
+    off.amp.master = 4.0;
+    let mut on = off.clone();
+    on.amp.cathode_follower = true;
+
+    let fundamental = |rig: &AmpRig, amp: f32| tone_amplitude(&rig_tone(rig, 220.0, amp), 220.0);
+    let span = |rig: &AmpRig| level_db(fundamental(rig, 0.6), fundamental(rig, 0.15));
+    let (off_span, on_span) = (span(&off), span(&on));
+
+    let loud = rig_tone(&on, 220.0, 0.6);
+    let quiet_loud = rig_tone(&off, 220.0, 0.6);
+    let even = |x: &[f32]| tone_amplitude(x, 440.0) / tone_amplitude(x, 220.0);
+    let (off_even, on_even) = (even(&quiet_loud), even(&loud));
+    assert!(
+        on_span < off_span - 0.75,
+        "the follower compressed nothing: {on_span:.2} dB of range against {off_span:.2} dB"
+    );
+    assert!(
+        on_even > off_even * 1.15,
+        "the follower clipped symmetrically ({on_even:.4} against {off_even:.4}), which is not \
+         what grid conduction does"
+    );
+}
+
+#[test]
+fn a_switch_the_circuit_never_had_does_nothing() {
+    // The switches are per model, and the engine is the last line of that promise: a rig that
+    // arrives claiming a bright cap on a fuzz voicing has to sound exactly as it did without it.
+    let plain = head_only(AmpModel::Fuzz, 7.0);
+    let mut claimed = plain.clone();
+    claimed.amp.bright_cap = true;
+    claimed.amp.half_power = true;
+    claimed.amp.cathode_follower = true;
+    let a = rig_tone(&plain, 220.0, 0.4);
+    let b = rig_tone(&claimed, 220.0, 0.4);
+    assert_eq!(a, b, "a switch the fuzz voicing does not have changed its sound");
 }

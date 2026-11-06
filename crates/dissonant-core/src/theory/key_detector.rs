@@ -2,6 +2,10 @@
 //! all 24 major/minor key profiles. Accurate on lots of notes, unreliable on a handful — so
 //! confidence gates on note count and the top-two margin, and callers must never auto-lock an
 //! unconfident result.
+//!
+//! The histogram can also carry chroma heard in a recorded DI ([`KeyDetector::detect_with_chroma`]),
+//! already scaled to note equivalents, so a strummed riff is evidence on the same footing as
+//! the notes placed in the roll.
 
 use super::normalize;
 use crate::model::ScaleType;
@@ -63,15 +67,30 @@ const MINOR_PROFILE: [f64; 12] = [
 
 impl KeyDetector {
     pub fn detect(&self, pitch_classes: &[i32]) -> KeyDetectionResult {
-        if pitch_classes.is_empty() {
+        self.detect_with_chroma(pitch_classes, &[0.0; 12])
+    }
+
+    /// Placed notes plus detected chroma. `chroma` is per pitch class (0 = C) in note
+    /// equivalents — the scale [`crate::model::ClipDetection::chroma`] is stored on — so a bin
+    /// worth three strums weighs what three placed notes do, and every gate below reads the
+    /// combined evidence. A pitch class counts as distinct from half a note's worth up: a whole
+    /// placed note always does, and the faint harmonic leakage chroma carries never does.
+    pub fn detect_with_chroma(&self, pitch_classes: &[i32], chroma: &[f32; 12]) -> KeyDetectionResult {
+        let mut histogram = [0.0f64; 12];
+        for &pc in pitch_classes {
+            histogram[normalize(pc) as usize] += 1.0;
+        }
+        for (bin, &c) in histogram.iter_mut().zip(chroma) {
+            if c.is_finite() && c > 0.0 {
+                *bin += c as f64;
+            }
+        }
+        let evidence: f64 = histogram.iter().sum();
+        if evidence <= 0.0 {
             return KeyDetectionResult {
                 candidates: vec![],
                 is_confident: false,
             };
-        }
-        let mut histogram = [0.0f64; 12];
-        for &pc in pitch_classes {
-            histogram[normalize(pc) as usize] += 1.0;
         }
 
         let mut candidates = Vec::with_capacity(24);
@@ -92,8 +111,8 @@ impl KeyDetector {
         } else {
             1.0
         };
-        let distinct = histogram.iter().filter(|&&h| h > 0.0).count();
-        let is_confident = pitch_classes.len() >= self.min_notes_for_confidence
+        let distinct = histogram.iter().filter(|&&h| h >= 0.5).count();
+        let is_confident = evidence >= self.min_notes_for_confidence as f64
             && distinct >= self.min_distinct_pitch_classes
             && gap >= self.min_score_gap;
         KeyDetectionResult {

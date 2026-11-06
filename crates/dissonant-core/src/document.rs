@@ -8,11 +8,12 @@
 use crate::automation::{AutoTarget, AutomationLane, Breakpoint, Curve};
 use crate::midi_file::ImportedTrack;
 use crate::model::{
-    AmpRig, AudioClip, AudioSource, ChordEvent, Clip, Insert, KeyState, MasterSettings, NoteEvent,
-    ProjectModel, Section, SongPattern, Track, TrackPlugin, MAX_INSERTS,
+    AmpRig, AudioClip, AudioSource, ChordEvent, Clip, ClipDetection, Insert, KeyState,
+    MasterSettings, NoteEvent, ProjectModel, Section, SongPattern, Track, TrackPlugin,
+    DEFAULT_PUNCH_CROSSFADE_SECONDS, MAX_FADE_SECONDS, MAX_INSERTS,
 };
 use crate::sound::{is_factory, valid_kit, DrumPad, Sound};
-use crate::tempo::TempoPoint;
+use crate::tempo::{TempoMap, TempoPoint};
 use crate::ticks::TICKS_PER_BEAT;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -240,6 +241,11 @@ pub enum Command {
     SetLoopRegion {
         region: Option<(i64, i64)>,
     },
+    /// The punch range as `[in, out]` in song ticks, or `None` to disarm it. Undoable and
+    /// saved with the song for the same reasons the loop brace is.
+    SetPunchRegion {
+        region: Option<(i64, i64)>,
+    },
     AddSection {
         name: String,
         start_tick: i64,
@@ -319,6 +325,20 @@ pub enum Command {
         source: AudioSource,
         clip: AudioClip,
     },
+    /// A take that lands *inside* what was already there: the clips under it are split and
+    /// crossfaded against it, and the whole repair is one undo step, because a punch the user
+    /// has to undo three times is a punch that eats the original take.
+    ///
+    /// `crossfade_seconds` is the overlap at each seam: the head keeps playing that long past
+    /// the take's start while fading out, the tail starts that long before the take's end
+    /// while fading in, and the take fades in and out across both. Equal-power on both sides,
+    /// so the join holds its level.
+    PunchAudioTake {
+        track_id: Uuid,
+        source: AudioSource,
+        clip: AudioClip,
+        crossfade_seconds: f64,
+    },
     /// Move / trim / fade / mute an audio clip (matched by id).
     UpdateAudioClip {
         clip: AudioClip,
@@ -345,6 +365,28 @@ pub enum Command {
         from: i64,
         to: i64,
         at: i64,
+    },
+    /// What DI analysis heard in one audio clip, landed as one undo step: a new synth track
+    /// called `name` with the default sound, holding one `length_ticks` pattern of `notes`
+    /// placed at `start_tick` (no track at all when `notes` is empty — every region was
+    /// refused as polyphonic), and `detection` replacing whatever an earlier analysis of the
+    /// same clip left in the detected lane. The song grows to fit, as an import does.
+    AddTranscription {
+        name: String,
+        start_tick: i64,
+        length_ticks: i64,
+        notes: Vec<NoteEvent>,
+        detection: ClipDetection,
+    },
+    /// Lay one detected chord onto the song's progression over its own span: whatever it lands
+    /// on is trimmed back, removed or split, as a chord drawn in the lane would be. It leaves
+    /// the detected lane in the same step.
+    AcceptDetectedChord {
+        id: Uuid,
+    },
+    /// Drop one detected chord without touching the progression.
+    DismissDetectedChord {
+        id: Uuid,
     },
 }
 
@@ -394,6 +436,8 @@ pub enum EditError {
     RopeLoop,
     #[error("that note has no rope")]
     NoRope,
+    #[error("no such detected chord")]
+    NoSuchDetectedChord,
 }
 
 /// One undo step: the model before the edit, and what the edit was ("move notes").
@@ -666,6 +710,8 @@ impl Command {
             SetSongLength { .. } => "set song length",
             SetLoopRegion { region: Some(_) } => "set loop",
             SetLoopRegion { .. } => "clear loop",
+            SetPunchRegion { region: Some(_) } => "set punch",
+            SetPunchRegion { .. } => "clear punch",
             AddSection { .. } => "add section",
             UpdateSection { .. } => "edit section",
             RemoveSection { .. } => "remove section",
@@ -683,11 +729,15 @@ impl Command {
             AddAudioTrack { .. } => "add audio track",
             SetTrackAmp { .. } => "edit rig",
             AddAudioTake { .. } => "add audio",
+            PunchAudioTake { .. } => "punch in",
             UpdateAudioClip { .. } => "edit audio clip",
             RemoveAudioClip { .. } => "remove audio clip",
             InsertTime { .. } => "insert time",
             DeleteTime { .. } => "delete time",
             DuplicateRange { .. } => "duplicate range",
+            AddTranscription { .. } => "detect notes",
+            AcceptDetectedChord { .. } => "accept chord",
+            DismissDetectedChord { .. } => "dismiss chord",
         }
         .to_string()
     }
@@ -1169,6 +1219,22 @@ fn apply_to(m: &mut ProjectModel, command: Command) -> Result<(), EditError> {
                 }
             };
         }
+        SetPunchRegion { region } => {
+            m.punch_region = match region {
+                None => None,
+                Some((start, end)) => {
+                    // Same rule as the loop brace: an inverted or empty range is a caller bug,
+                    // and disarming says so with `None`.
+                    if start < 0 || end <= start {
+                        return Err(EditError::InvalidValue);
+                    }
+                    Some(
+                        crate::model::clamp_loop(start, end, m.song_length_ticks)
+                            .ok_or(EditError::InvalidValue)?,
+                    )
+                }
+            };
+        }
         RemoveClip { id } => {
             let before = m.clips.len();
             m.clips.retain(|c| c.id != id);
@@ -1434,6 +1500,45 @@ fn apply_to(m: &mut ProjectModel, command: Command) -> Result<(), EditError> {
             m.audio_clips.push(clip);
             m.audio_clips.sort_by_key(|c| c.start_tick);
         }
+        PunchAudioTake {
+            track_id,
+            source,
+            clip,
+            crossfade_seconds,
+        } => {
+            if clip.track_id != track_id || clip.source_id != source.id {
+                return Err(EditError::InvalidValue);
+            }
+            if source.sample_rate == 0 || source.channels == 0 || source.frames == 0 {
+                return Err(EditError::InvalidValue);
+            }
+            let t = m.track(&track_id).ok_or(EditError::NoSuchTrack)?;
+            if !t.is_audio {
+                return Err(EditError::NotAnAudioTrack);
+            }
+            let mut take = clip.sanitized().ok_or(EditError::InvalidValue)?;
+            // A crossfade longer than half the take would overlap itself; a nonsense one falls
+            // back to the default rather than refusing a take the player has already performed.
+            let xf = if crossfade_seconds.is_finite() && crossfade_seconds >= 0.0 {
+                crossfade_seconds
+            } else {
+                DEFAULT_PUNCH_CROSSFADE_SECONDS
+            }
+            .min(MAX_FADE_SECONDS)
+            .min(take.length_seconds * 0.5);
+            // The punch owns both of the take's edges: whatever fades it arrived with are the
+            // seams, not a shape the user chose.
+            take.fade_in_seconds = xf;
+            take.fade_out_seconds = xf;
+            let map = m.tempo_map();
+            m.audio_clips = punch_split(&map, std::mem::take(&mut m.audio_clips), &take, xf);
+            match m.audio_sources.iter_mut().find(|s| s.id == source.id) {
+                Some(slot) => *slot = source,
+                None => m.audio_sources.push(source),
+            }
+            m.audio_clips.push(take);
+            m.audio_clips.sort_by_key(|c| c.start_tick);
+        }
         UpdateAudioClip { clip } => {
             if m.audio_source(&clip.source_id).is_none() {
                 return Err(EditError::NoSuchAudioSource);
@@ -1475,8 +1580,174 @@ fn apply_to(m: &mut ProjectModel, command: Command) -> Result<(), EditError> {
             }
             crate::ripple::duplicate_range(m, from, to, at);
         }
+        AddTranscription {
+            name,
+            start_tick,
+            length_ticks,
+            notes,
+            detection,
+        } => {
+            if start_tick < 0 || length_ticks <= 0 {
+                return Err(EditError::InvalidValue);
+            }
+            // Results for a take that is not on the song would be dropped on the next load.
+            if !m.audio_clips.iter().any(|c| c.id == detection.clip_id) {
+                return Err(EditError::NoSuchAudioClip);
+            }
+            if !notes.is_empty() {
+                let name = name.trim();
+                let track = Track::new(if name.is_empty() { "notes" } else { name });
+                let length = length_ticks.max(TICKS_PER_BEAT);
+                let mut pattern = SongPattern::new(track.id, next_pattern_name(m, &track));
+                pattern.length_ticks = length;
+                // Inside the pattern or not at all: a note past its end would never sound.
+                pattern.notes = notes
+                    .into_iter()
+                    .map(NoteEvent::sanitized)
+                    .filter(|n| n.start_tick < length)
+                    .map(|mut n| {
+                        n.length_ticks = n.length_ticks.min(length - n.start_tick);
+                        n
+                    })
+                    .collect();
+                pattern
+                    .notes
+                    .sort_by(|a, b| a.start_tick.cmp(&b.start_tick).then(a.pitch.cmp(&b.pitch)));
+                m.clips.push(Clip::new(pattern.id, start_tick, length));
+                m.clips.sort_by_key(|c| c.start_tick);
+                m.song_length_ticks = m.song_length_ticks.max(start_tick + length);
+                m.tracks.push(track);
+                m.patterns.push(pattern);
+            }
+            let detection = detection.sanitized();
+            m.detections.retain(|d| d.clip_id != detection.clip_id);
+            if !detection.chords.is_empty() || detection.chroma.iter().any(|&c| c > 0.0) {
+                m.detections.push(detection);
+            }
+        }
+        AcceptDetectedChord { id } => {
+            let chord = take_detected_chord(m, id)?;
+            let end = m.song_length_ticks;
+            if chord.start_tick >= end {
+                return Err(EditError::PastSongEnd);
+            }
+            let mut chord = chord.to_chord();
+            chord.length_ticks = chord.length_ticks.min(end - chord.start_tick);
+            let placed = place_chord(m.chords.take(), chord);
+            m.chords = crate::chord_track::ChordTrack::new(crate::model::tidy_chords(placed));
+        }
+        DismissDetectedChord { id } => {
+            take_detected_chord(m, id)?;
+        }
     }
     Ok(())
+}
+
+/// Take one chord out of the detected lane by id. A detection left with no chords and no
+/// chroma has nothing more to say and goes with it.
+fn take_detected_chord(
+    m: &mut ProjectModel,
+    id: Uuid,
+) -> Result<crate::model::DetectedChord, EditError> {
+    let (d, i) = m
+        .detections
+        .iter()
+        .enumerate()
+        .find_map(|(d, det)| det.chords.iter().position(|c| c.id == id).map(|i| (d, i)))
+        .ok_or(EditError::NoSuchDetectedChord)?;
+    let chord = m.detections[d].chords.remove(i);
+    let det = &m.detections[d];
+    if det.chords.is_empty() && det.chroma.iter().all(|&c| c <= 0.0) {
+        m.detections.remove(d);
+    }
+    Ok(chord)
+}
+
+/// `chord` laid onto a progression: whatever it overlaps is trimmed back, removed when fully
+/// covered, or split in two when it spans the new chord (the far half gets a fresh id). The
+/// same rule as drawing a chord in the lane (`ui/src/songSetup.ts` `placeChord`), so an
+/// accepted detection lands exactly as the hand-drawn equivalent would.
+fn place_chord(chords: Vec<ChordEvent>, chord: ChordEvent) -> Vec<ChordEvent> {
+    let (s, e) = (chord.start_tick, chord.end_tick());
+    let mut out = Vec::with_capacity(chords.len() + 2);
+    for c in chords {
+        if c.id == chord.id {
+            continue;
+        }
+        let c_end = c.end_tick();
+        if c_end <= s || c.start_tick >= e {
+            out.push(c);
+            continue;
+        }
+        if c_end > e {
+            let mut tail = c.clone();
+            if c.start_tick < s {
+                tail.id = Uuid::new_v4();
+            }
+            tail.start_tick = e;
+            tail.length_ticks = c_end - e;
+            out.push(tail);
+        }
+        if c.start_tick < s {
+            let mut head = c;
+            head.length_ticks = s - head.start_tick;
+            out.push(head);
+        }
+    }
+    out.push(chord);
+    out.sort_by_key(|c| c.start_tick);
+    out
+}
+
+/// `clips` with everything the punch covers on the take's track cut back around it.
+///
+/// A clip the take lands inside becomes at most two: a head that runs from its own start to
+/// `xf` seconds *past* the take's start, fading out across that overlap, and a tail that
+/// starts `xf` seconds *before* the take's end, fading in across that one. The overlaps are
+/// the crossfades — the engine sums overlapping clips, so both sides sounding at once is the
+/// whole mechanism. A clip buried entirely under the take leaves nothing and is dropped.
+///
+/// Audio never warps, so each new edge is carried through the tempo map: the piece is placed
+/// on the nearest whole tick and its offset into the file is taken from *that* tick, so the
+/// material under it never slides even when the edge falls between ticks.
+fn punch_split(map: &TempoMap, clips: Vec<AudioClip>, take: &AudioClip, xf: f64) -> Vec<AudioClip> {
+    let from = map.seconds_at_tick(take.start_tick as f64);
+    let to = from + take.length_seconds;
+    let mut out = Vec::with_capacity(clips.len() + 1);
+    for c in clips {
+        let start = map.seconds_at_tick(c.start_tick as f64);
+        let end = start + c.length_seconds;
+        if c.track_id != take.track_id || end <= from || start >= to {
+            out.push(c);
+            continue;
+        }
+        // Only a clip that was already sounding when the punch dropped in has a head; one that
+        // starts inside the take has nothing in front of it to fade out.
+        let head_end = (from + xf).min(end);
+        let head = (start < from).then(|| AudioClip {
+            length_seconds: head_end - start,
+            fade_out_seconds: xf,
+            ..c.clone()
+        });
+        let tail = (end > to).then(|| {
+            let tick = map.tick_at_seconds((to - xf).max(start)).round() as i64;
+            let at = map.seconds_at_tick(tick as f64).clamp(start, end);
+            AudioClip {
+                // The head keeps the clip's identity when there is one, the way a ripple split
+                // does; with the take butted against the clip's front, the tail is all that is
+                // left of it and keeps the id instead.
+                id: if head.is_some() { Uuid::new_v4() } else { c.id },
+                start_tick: tick,
+                length_seconds: end - at,
+                offset_seconds: c.offset_seconds + (at - start),
+                fade_in_seconds: xf,
+                ..c.clone()
+            }
+        });
+        out.extend(head.and_then(AudioClip::sanitized));
+        out.extend(tail.and_then(AudioClip::sanitized));
+    }
+    out
 }
 
 #[cfg(test)]

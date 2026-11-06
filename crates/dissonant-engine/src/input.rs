@@ -13,6 +13,7 @@
 use crate::device::DeviceError;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Sample, SampleFormat, SizedSample};
+use dissonant_core::TempoMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 
@@ -56,6 +57,75 @@ pub fn list_input_devices() -> Vec<InputDeviceInfo> {
 /// The name of the host's current default input device, if any.
 pub fn default_input_name() -> Option<String> {
     Some(device_name(&cpal::default_host().default_input_device()?))
+}
+
+/// Where a take has to land, once the capture path's latency is taken off its start.
+///
+/// Everything on the way in is delay: the output block the engine renders before the input is
+/// read, whatever the ring is still holding, and whatever the interface and its driver add on
+/// top (which only the player can measure, so it is a manual per-device trim). The engine
+/// stamps a take's start tick at the moment the first captured sample reaches it, so the
+/// *sound* happened that whole latency earlier and the clip has to move back by it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TakeAlignment {
+    /// Where the clip goes.
+    pub start_tick: i64,
+    /// How far into the recording the clip starts. Non-zero only when the correction ran off
+    /// the front of the song.
+    pub offset_seconds: f64,
+    /// How far back the clip actually moved, in ms — what the REC page reports.
+    pub shifted_ms: f64,
+    /// How much of the take's head was cut instead of moved, in ms.
+    pub trimmed_ms: f64,
+}
+
+/// Pull `recorded_start_tick` back by `latency_ms`, in musical time.
+///
+/// The conversion goes through the tempo map rather than a single bpm: a take that starts in
+/// the middle of a ritardando is played at one tempo and written at another, and 20 ms is a
+/// different number of ticks at each. Seconds are the invariant, so the correction is done
+/// there and converted back once.
+///
+/// A correction that would push the start before tick 0 clamps there and cuts the difference
+/// off the head of the audio instead. Moving the clip and keeping all of it would slide the
+/// waveform off the grid, which is the one thing this exists to prevent; the lost head is the
+/// pickup noise before the first note.
+pub fn align_take(map: &TempoMap, recorded_start_tick: f64, latency_ms: f64) -> TakeAlignment {
+    let start = recorded_start_tick.max(0.0);
+    let latency = if latency_ms.is_finite() { latency_ms.max(0.0) / 1000.0 } else { 0.0 };
+    let recorded_seconds = map.seconds_at_tick(start);
+    let wanted = recorded_seconds - latency;
+    if wanted < 0.0 {
+        return TakeAlignment {
+            start_tick: 0,
+            offset_seconds: -wanted,
+            shifted_ms: recorded_seconds * 1000.0,
+            trimmed_ms: -wanted * 1000.0,
+        };
+    }
+    let tick = map.tick_at_seconds(wanted).round().max(0.0);
+    TakeAlignment {
+        start_tick: tick as i64,
+        offset_seconds: 0.0,
+        // Report the tick the clip really landed on, not the ideal: rounding to a whole tick
+        // is part of the correction the user is being told about.
+        shifted_ms: (recorded_seconds - map.seconds_at_tick(tick)) * 1000.0,
+        trimmed_ms: 0.0,
+    }
+}
+
+/// The capture path's latency in ms: the engine's block, whatever the input ring still holds,
+/// and the device's manual trim. The first two come from the engine, the third from settings.
+///
+/// With no sample rate there is no stream, so there is nothing to compensate and the trim does
+/// not apply on its own — a trim describes a device that is open.
+pub fn input_latency_ms(block_frames: u32, backlog_frames: u32, sample_rate: u32, trim_ms: f64) -> f64 {
+    if sample_rate == 0 {
+        return 0.0;
+    }
+    let measured = (block_frames as f64 + backlog_frames as f64) * 1000.0 / sample_rate as f64;
+    let trim = if trim_ms.is_finite() { trim_ms } else { 0.0 };
+    (measured + trim).max(0.0)
 }
 
 /// Handle to a running capture stream. Dropping it stops recording and monitoring.

@@ -12,7 +12,7 @@
 //! resampled, retimed or re-looped; the only thing that changes is where the music sits.
 
 use crate::automation::Breakpoint;
-use crate::model::{AudioClip, ChordEvent, Clip, ProjectModel, Section};
+use crate::model::{AudioClip, ChordEvent, Clip, DetectedChord, ProjectModel, Section};
 use crate::tempo::{TempoMap, TempoPoint};
 use uuid::Uuid;
 
@@ -139,6 +139,26 @@ fn split_chord(chord: &ChordEvent, pieces: Vec<Piece>) -> impl Iterator<Item = C
     })
 }
 
+/// Detected chords cut by the same pieces as the progression: a candidate stays over the music
+/// it was heard in, so accepting it after a time edit still lands on the right bars. One wholly
+/// inside a cut goes with it.
+fn split_detected(m: &mut ProjectModel, pieces: impl Fn(&DetectedChord) -> Vec<Piece>) {
+    for d in &mut m.detections {
+        let mut out = Vec::with_capacity(d.chords.len());
+        for c in std::mem::take(&mut d.chords) {
+            for (i, p) in pieces(&c).into_iter().enumerate() {
+                out.push(DetectedChord {
+                    id: if i == 0 { c.id } else { Uuid::new_v4() },
+                    start_tick: p.start,
+                    length_ticks: p.len,
+                    ..c.clone()
+                });
+            }
+        }
+        d.chords = out;
+    }
+}
+
 /// `clip` cut into its pieces, in seconds.
 ///
 /// Audio never warps: a take is anchored at a tick and then plays for a length in seconds, so
@@ -225,6 +245,7 @@ pub fn insert_time(m: &mut ProjectModel, at: i64, ticks: i64) {
             .flat_map(|c| split_chord(c, insert_pieces(c.start_tick, c.length_ticks, at, ticks)))
             .collect(),
     ));
+    split_detected(m, |c| insert_pieces(c.start_tick, c.length_ticks, at, ticks));
     for lane in &mut m.automation {
         for p in &mut lane.points {
             p.tick = insert_point(p.tick, at, ticks);
@@ -233,12 +254,17 @@ pub fn insert_time(m: &mut ProjectModel, at: i64, ticks: i64) {
     }
     // Time opened inside the brace lengthens it: the loop is a place in the music, and that
     // place just got longer. A brace that ends exactly where the time opens does not grow.
-    m.loop_region = m.loop_region.map(|(s, e)| {
-        (
-            insert_point(s, at, ticks),
-            if e > at { e + ticks } else { e },
-        )
-    });
+    // The punch range is a place in the music too, so it moves by the same rule.
+    let shift = |r: Option<(i64, i64)>| {
+        r.map(|(s, e)| {
+            (
+                insert_point(s, at, ticks),
+                if e > at { e + ticks } else { e },
+            )
+        })
+    };
+    m.loop_region = shift(m.loop_region);
+    m.punch_region = shift(m.punch_region);
     // `at` past the end means "open time there", so the song reaches it either way.
     m.song_length_ticks = m.song_length_ticks.max(at) + ticks;
     settle(m);
@@ -299,6 +325,7 @@ pub fn delete_time(m: &mut ProjectModel, at: i64, ticks: i64) {
             .flat_map(|c| split_chord(c, delete_pieces(c.start_tick, c.length_ticks, at, ticks)))
             .collect(),
     ));
+    split_detected(m, |c| delete_pieces(c.start_tick, c.length_ticks, at, ticks));
     for lane in &mut m.automation {
         lane.points.retain(|p| p.tick < at || p.tick >= cut_end);
         for p in &mut lane.points {
@@ -309,9 +336,11 @@ pub fn delete_time(m: &mut ProjectModel, at: i64, ticks: i64) {
     // A lane with every point inside the cut has nothing left to say; the parameter goes back
     // to its static control, as `ClearAutomation` leaves it.
     m.automation.retain(|l| !l.points.is_empty());
-    m.loop_region = m
-        .loop_region
-        .map(|(s, e)| (delete_point(s, at, ticks), delete_point(e, at, ticks)));
+    let pull = |r: Option<(i64, i64)>| {
+        r.map(|(s, e): (i64, i64)| (delete_point(s, at, ticks), delete_point(e, at, ticks)))
+    };
+    m.loop_region = pull(m.loop_region);
+    m.punch_region = pull(m.punch_region);
     let gone = (m.song_length_ticks.min(cut_end) - at).max(0);
     m.song_length_ticks = (m.song_length_ticks - gone).max(m.bar_ticks());
     settle(m);

@@ -196,3 +196,57 @@ describe("parity with dissonant-core", () => {
     expect(detectKey([60, 62, 64, 65, 67, 69, 71, 72, 67, 64, 60, 55]).isConfident).toBe(true);
   });
 });
+
+import { explainNote, moves, noteTier } from "./theory";
+import type { ChordEvent, KeyState, PitchPoint } from "./types";
+
+/** Mirrors `parity::MOVING_CASES` in crates/dissonant-core/tests/theory_behavior.rs verbatim. */
+const MOVING_CASES: [label: string, points: [tick: number, cents: number][], expected: boolean][] = [
+  ["empty", [], false],
+  ["held detune at the start", [[0, 30]], false],
+  ["held detune, two points", [[0, 30], [240, 30]], false],
+  ["all zero", [[120, 0], [240, 0]], false],
+  ["lone late point bends up to it", [[120, 150]], true],
+  ["start detune then fall", [[0, 30], [240, -20]], true],
+  ["returns to zero", [[0, 0], [120, 50], [240, 0]], true],
+];
+
+describe("moving notes (must agree with dissonant-core)", () => {
+  const C_KEY: KeyState = { rootPitchClass: 0, scale: "major", isLocked: true };
+  const twoBars: ChordEvent[] = progression([0, 3], 0, "major", 8 * TICKS_PER_BEAT, 4 * TICKS_PER_BEAT);
+  const ramp = (tick: number, cents: number): PitchPoint => ({ tick, cents, curve: "ramp" });
+
+  it("marks exactly the envelopes the Rust table marks", () => {
+    expect(moves(undefined)).toBe(false);
+    for (const [label, points, expected] of MOVING_CASES) {
+      const note = { pitch: 60, startTick: 0, pitchEnvelope: points.map(([t, c]) => ramp(t, c)) };
+      expect(`${label}=${noteTier(note, [], NO_KEY).moving}`).toBe(`${label}=${expected}`);
+    }
+  });
+
+  it("tiers a bent note by its start pitch, exactly as the same note unbent", () => {
+    // F over C bending a whole step up into G: still the avoid note where it starts.
+    const plain = { pitch: 65, startTick: 0 };
+    const bent = { ...plain, pitchEnvelope: [ramp(TICKS_PER_BEAT, 200)] };
+    expect(noteTier(plain, twoBars, C_KEY)).toEqual({ tier: "dissonance", moving: false });
+    expect(noteTier(bent, twoBars, C_KEY)).toEqual({ tier: "dissonance", moving: true });
+    for (let pitch = 48; pitch < 72; pitch++) {
+      const contexts: [ChordEvent[], KeyState][] = [[twoBars, C_KEY], [[], C_KEY], [[], NO_KEY]];
+      for (const [chords, key] of contexts) {
+        for (const startTick of [0, 3 * TICKS_PER_BEAT, 5 * TICKS_PER_BEAT]) {
+          const a = noteTier({ pitch, startTick }, chords, key);
+          const b = noteTier({ pitch, startTick, pitchEnvelope: [{ tick: 0, cents: -100, curve: "step" }, ramp(TICKS_PER_BEAT / 2, 300)] }, chords, key);
+          expect(b.tier).toBe(a.tier);
+          expect([a.moving, b.moving]).toEqual([false, true]);
+        }
+      }
+    }
+  });
+
+  it("says a bent note bends, and that it is judged where it starts", () => {
+    expect(explainNote(65, twoBars, C_KEY, 0, true)).toBe("F over C: a half step above E. It wants to fall to E — or stay, on purpose. It bends — judged where it starts.");
+    expect(explainNote(64, [], C_KEY, 0, true)).toBe("E is in C maj. It bends — judged where it starts.");
+    expect(explainNote(64, [], NO_KEY, 0, true)).toBe("no chord or key yet — anything goes. It bends.");
+    expect(explainNote(64, twoBars, C_KEY, 0)).not.toContain("bends");
+  });
+});

@@ -32,11 +32,14 @@ pub use document::{Command, Document, EditError, InsertTarget, TrackParam};
 pub use effects::{NativeKind, NativeParam, ParamMap, NATIVE_PREFIX};
 pub use midi_file::{ImportedMidi, ImportedTrack, MidiError, MidiScope};
 pub use model::{
-    remap_ropes, rope_is_live, tidy_chords, tidy_ropes, tile_chords, AmpHead, AmpModel, AmpRig, AudioClip, AudioSource, CabModel, Cabinet,
-    ChordEvent, Clip, EqModel, Gate, Insert, KeyState, MasterSettings, MicModel, NoteEvent, Pedal,
-    PedalKind, ProjectModel, Rack, ScaleType, Section, SongPattern, TimeSignature, Track,
-    TrackKind, TrackPlugin, DEFAULT_SONG_BARS, MAX_CLIP_GAIN, MAX_FADE_SECONDS, MAX_INSERTS,
-    MAX_PEDALS, MAX_SHIFT_TICKS, MAX_SLIDE_SECS, MIN_NOTE_TICKS, ROPE_OVERLAP_SECS, SCHEMA_VERSION,
+    decimate_pitch_envelope, remap_ropes, rope_is_live, tidy_chords, tidy_pitch_envelope,
+    tidy_ropes, tile_chords, AmpHead, AmpModel, AmpRig, AudioClip, AudioSource, CabModel, Cabinet,
+    ChordEvent, Clip, ClipDetection, DetectedChord, EqModel, Gate, Insert, KeyState,
+    MasterSettings, MicModel, NoteEvent, Pedal, PedalKind, PitchPoint, ProjectModel, Rack,
+    ScaleType, Section, SongPattern, TimeSignature, Track, TrackKind, TrackPlugin,
+    DEFAULT_PUNCH_CROSSFADE_SECONDS, DEFAULT_SONG_BARS, MAX_CLIP_GAIN, MAX_DETECTED_CHORDS,
+    MAX_FADE_SECONDS, MAX_FINE_CENTS, MAX_INSERTS, MAX_PEDALS, MAX_PITCH_POINTS, MAX_SHIFT_TICKS,
+    MAX_SLIDE_SECS, MIN_NOTE_TICKS, PITCH_DECIMATE_CENTS, ROPE_OVERLAP_SECS, SCHEMA_VERSION,
 };
 pub use sequence::{
     MasterAutomation, NoteRope, Sequence, SequenceAudioClip, SequenceTrack, TrackAutomation,
@@ -48,6 +51,6 @@ pub use tempo::{swing_warp_ticks, Tempo, TempoMap, TempoPoint};
 pub use theory::harmony::{self, ChordSuggestion, ProgressionStarter};
 pub use theory::highlight::HighlightEngine;
 pub use theory::key_detector::{KeyCandidate, KeyDetectionResult, KeyDetector};
-pub use theory::tier::{Tier, TierClassifier};
+pub use theory::tier::{NoteTier, Tier, TierClassifier};
 pub use ticks::{bar_ticks, beats_to_ticks, ticks_to_beats, TICKS_PER_BEAT};
 pub use vibes::{factory_loops, vibe_specs, vibes, DrumLane, DrumLoop, Groove, VibeInfo, VibeRole, VibeSpec};

@@ -1,6 +1,7 @@
 import { useRef, useState } from "react";
 import { barTicks, useStore } from "../store";
 import { chordAt, chordName, diatonicChords, noteName, NOTE_NAMES, tier } from "../theory";
+import { confidenceText, detectedChords } from "../detection";
 import { keyAt, uuid, TICKS_PER_BEAT, type ChordEvent, type ScaleType } from "../types";
 import { buildChord, degreeOf, gapAt, identifyChord, lengthText, nameOf, nextChords, placeChord, QUALITIES, rootOfName } from "../songSetup";
 
@@ -371,6 +372,68 @@ export function ChordBuilder({ chord, onChange }: { chord: ChordEvent; onChange:
           title="what the lane calls this chord; clear it to name it from its notes"
         />
         <button className="quiet" onClick={() => setPcs([])}>clear notes</button>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * The detected lane: chords heard in recorded DIs, waiting to be reviewed one at a time. Each
+ * block is accepted onto the progression (✓, one undo step) or dismissed (✕); nothing here
+ * touches the progression until accepted, so a wrong guess over bars nobody strummed costs a
+ * click rather than a rewritten harmony. Drawn from x = 0 at song tick 0, like the read-only
+ * progression it sits under.
+ */
+export function DetectedChordLane({ lengthTicks, beatW }: { lengthTicks: number; beatW: number }) {
+  const model = useStore((s) => s.snapshot!.model);
+  const dispatch = useStore((s) => s.dispatch);
+  const barTick = useStore(barTicks);
+  const pxPerTick = beatW / TICKS_PER_BEAT;
+  const chords = detectedChords(model).filter((c) => c.startTick < lengthTicks);
+  return (
+    <div className="chordlane detected">
+      <div className="gut" title="chords heard in recorded takes: accept one to put it on the progression">
+        <span className="cap">heard</span>
+      </div>
+      <div className="inner" style={{ width: lengthTicks * pxPerTick }} aria-label="detected chords">
+        {chords.map((c) => {
+          const name = c.name ?? chordName(c.pitchClasses);
+          const end = Math.min(c.startTick + c.lengthTicks, lengthTicks);
+          const w = Math.max(30, (end - c.startTick) * pxPerTick - 3);
+          const sure = confidenceText(c.confidence);
+          return (
+            <div
+              key={c.id}
+              className="chordblock detected"
+              style={{ left: c.startTick * pxPerTick, width: w, opacity: 0.55 + 0.45 * c.confidence }}
+              title={`${name}, heard at ${sure} · ${lengthText(c.lengthTicks, barTick)} · ✓ puts it on the progression, ✕ or right-click dismisses it`}
+              onContextMenu={(e) => {
+                e.preventDefault();
+                void dispatch({ type: "dismissDetectedChord", id: c.id });
+              }}
+            >
+              <span className="nm">{name}</span>
+              {w > 92 && <span className="conf">{sure}</span>}
+              <span className="spacer" />
+              <button
+                className="dact"
+                aria-label={`accept ${name}`}
+                onClick={() => void dispatch({ type: "acceptDetectedChord", id: c.id })}
+              >
+                ✓
+              </button>
+              {w > 46 && (
+                <button
+                  className="dact"
+                  aria-label={`dismiss ${name}`}
+                  onClick={() => void dispatch({ type: "dismissDetectedChord", id: c.id })}
+                >
+                  ✕
+                </button>
+              )}
+            </div>
+          );
+        })}
       </div>
     </div>
   );

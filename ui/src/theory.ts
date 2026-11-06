@@ -2,7 +2,7 @@
 // to round-trip to Rust per frame. Rust remains the source of truth; tests pin both to the
 // same expectations.
 
-import type { ChordEvent, KeyState, ScaleType, Tier } from "./types";
+import type { ChordEvent, KeyState, NoteEvent, PitchPoint, ScaleType, Tier } from "./types";
 import { TICKS_PER_BEAT, uuid } from "./types";
 
 export const NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
@@ -174,6 +174,31 @@ export function tierMap(tick: number, chords: ChordEvent[], key: KeyState): (Tie
   return Array(12).fill(null);
 }
 
+/**
+ * Mirrors `tier::moves`: an envelope moves the note once any point leaves the value the note
+ * starts on (zero before the first point). A value held throughout is a detune, not a bend.
+ */
+export function moves(envelope: PitchPoint[] | undefined): boolean {
+  if (!envelope || envelope.length === 0) return false;
+  const start = envelope[0].tick <= 0 ? envelope[0].cents : 0;
+  return envelope.some((p) => p.cents !== start);
+}
+
+/** Mirrors `HighlightEngine::note_tier`. */
+export interface NoteTier {
+  tier: Tier | null;
+  moving: boolean;
+}
+
+/**
+ * One note's tier and moving mark. A bent note is tiered where it starts — its row, exactly as
+ * the same note unbent — and the envelope only adds the mark, so one note keeps one colour and
+ * the move is said by a glyph rather than by the colour alone.
+ */
+export function noteTier(note: Pick<NoteEvent, "pitch" | "startTick" | "pitchEnvelope">, chords: ChordEvent[], key: KeyState): NoteTier {
+  return { tier: tierMap(note.startTick, chords, key)[normalize(note.pitch)], moving: moves(note.pitchEnvelope) };
+}
+
 // ─── Key detection (Krumhansl–Schmuckler) ─────────────────────────────────────────────────
 
 const MAJOR_PROFILE = [6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88];
@@ -209,11 +234,21 @@ function pearson(x: number[], y: number[]): number {
 }
 
 /** `minDistinct` mirrors dissonant-core's `min_distinct_pitch_classes`: repetition is not
- *  evidence — fewer than five distinct pitch classes is a chord, not a scale. */
-export function detectKey(pitchClasses: number[], minNotes = 10, minGap = 0.04, minDistinct = 5): KeyDetectionResult {
-  if (pitchClasses.length === 0) return { candidates: [], isConfident: false };
+ *  evidence — fewer than five distinct pitch classes is a chord, not a scale.
+ *
+ *  `chroma` is `KeyDetector::detect_with_chroma`'s: per pitch class, in note equivalents,
+ *  heard in a recorded DI. It adds to the placed notes' histogram and to the evidence count,
+ *  and a pitch class counts as distinct from half a note's worth up — every placed note does,
+ *  the faint harmonic leakage chroma carries never does. */
+export function detectKey(pitchClasses: number[], chroma: readonly number[] = [], minNotes = 10, minGap = 0.04, minDistinct = 5): KeyDetectionResult {
   const hist = Array(12).fill(0);
   for (const pc of pitchClasses) hist[normalize(pc)] += 1;
+  for (let i = 0; i < 12; i++) {
+    const v = chroma[i] ?? 0;
+    if (Number.isFinite(v) && v > 0) hist[i] += v;
+  }
+  const evidence = hist.reduce((a, b) => a + b, 0);
+  if (evidence <= 0) return { candidates: [], isConfident: false };
   const candidates: KeyCandidate[] = [];
   for (let root = 0; root < 12; root++) {
     for (const scale of ["major", "minor"] as ScaleType[]) {
@@ -224,8 +259,8 @@ export function detectKey(pitchClasses: number[], minNotes = 10, minGap = 0.04, 
   }
   candidates.sort((a, b) => b.score - a.score);
   const gap = candidates[0].score - candidates[1].score;
-  const distinct = hist.filter((h) => h > 0).length;
-  const isConfident = pitchClasses.length >= minNotes && distinct >= minDistinct && gap >= minGap;
+  const distinct = hist.filter((h) => h >= 0.5).length;
+  const isConfident = evidence >= minNotes && distinct >= minDistinct && gap >= minGap;
   return { candidates, isConfident };
 }
 
@@ -247,8 +282,19 @@ export function chordRoot(chord: ChordEvent): number {
 /**
  * Plain words for why a pitch is tiered the way it is against the chord at `tick`.
  * The voice from PRODUCT.md: names things plainly, never condescends, never forbids.
+ *
+ * `moving` is the note's moving mark ({@link noteTier}): a bent note is judged where it starts,
+ * and the text says so, so a bend up out of an avoid note isn't mistaken for the colour being
+ * wrong about where it lands.
  */
-export function explainNote(pitch: number, chords: ChordEvent[], key: KeyState, tick: number): string {
+export function explainNote(pitch: number, chords: ChordEvent[], key: KeyState, tick: number, moving = false): string {
+  const why = explainPitch(pitch, chords, key, tick);
+  if (!moving) return why;
+  if (!chordAt(chords, tick) && !keyPitchClasses(key)) return `${why}. It bends.`;
+  return `${why.endsWith(".") ? why : `${why}.`} It bends — judged where it starts.`;
+}
+
+function explainPitch(pitch: number, chords: ChordEvent[], key: KeyState, tick: number): string {
   const chord = chordAt(chords, tick);
   const keyPcs = keyPitchClasses(key);
   const pc = normalize(pitch);

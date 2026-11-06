@@ -126,6 +126,12 @@ hot color plus a hatch/stripe and a small flag affordance. The note stays fully 
 in every tier — tiering is information, never a gate. The same tier vocabulary appears in the "notes you
 could play now" readout so the two surfaces always agree.
 
+A note whose pitch bends (it carries a pitch envelope) keeps **one tier, read at its start pitch** —
+bending never recolours it — and adds a **moving mark**: a dark folded top-right corner, distinct from
+the tension dot, the dissonance hatch and the keep outline, sized off the row so it survives the
+smallest rows, and static (nothing animates, so reduced motion needs no special case). The inspector's
+explanation says it plainly: it bends, judged where it starts.
+
 ## 6. Do's and Don'ts
 
 ### Do:

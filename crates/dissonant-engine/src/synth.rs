@@ -21,6 +21,8 @@ use crate::dsp::{
     wave, Adsr, AdsrParams, Chorus, Crusher, Echo, Lfo, NoteFilter, Rng, Svf,
 };
 use crate::engine::{NoteShape, Slide, VoiceTag};
+use dissonant_core::automation::Curve;
+use dissonant_core::model::{PitchPoint, MAX_PITCH_POINTS};
 use dissonant_core::sound::{Envelope, FilterMode, LfoTarget, OscWave, SynthPatch, VoiceMode};
 use dissonant_core::MAX_SLIDE_SECS;
 use std::f32::consts::{PI, SQRT_2};
@@ -247,6 +249,142 @@ struct Key {
     tag: Option<VoiceTag>,
 }
 
+/// One resolved envelope point: the sample from note-on at which it is reached, the cents it
+/// arrives at, and whether the voice glides into it or jumps on arrival.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+struct BendPoint {
+    at: u32,
+    cents: f32,
+    ramp: bool,
+}
+
+/// A note's pitch envelope resolved onto the sample clock and walked one sample at a time.
+///
+/// Everything else the voice retunes for — glide, the pitch envelope, a pitch LFO — moves
+/// slowly enough that deciding it once per [`BLOCK`] and ramping the frequency across the
+/// block is inaudible. A bend does not: a whole-tone pull lands in a tenth of a second, and
+/// quantising that to the control rate is exactly the zipper you hear on a cheap pitch
+/// shifter. So this steps per sample — an add and a compare — and only voices that actually
+/// carry a contour pay for it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Bend {
+    pts: [BendPoint; MAX_PITCH_POINTS],
+    len: u8,
+    /// The point being travelled toward; `len` once the last one is past.
+    next: u8,
+    /// Samples since note-on.
+    pos: u32,
+    /// Sample at which the current segment ends.
+    end: u32,
+    /// Cents in force at `pos`, and the slope carrying it to the next point.
+    value: f32,
+    inc: f32,
+}
+
+impl Bend {
+    /// A note with no contour: every sample sits at the note's own pitch.
+    pub const NONE: Bend = Bend {
+        pts: [BendPoint {
+            at: 0,
+            cents: 0.0,
+            ramp: false,
+        }; MAX_PITCH_POINTS],
+        len: 0,
+        next: 0,
+        pos: 0,
+        end: u32::MAX,
+        value: 0.0,
+        inc: 0.0,
+    };
+
+    /// Resolve a note's envelope, with `sample_at` turning a tick offset from the note's
+    /// start into a sample offset (the caller owns the tempo map) and `from` the samples
+    /// already elapsed, which is non-zero only when a seek lands inside the note.
+    pub fn new(points: &[PitchPoint], sample_at: impl Fn(i64) -> f64, from: u32) -> Self {
+        let mut b = Bend::NONE;
+        for p in points.iter().take(MAX_PITCH_POINTS) {
+            b.pts[b.len as usize] = BendPoint {
+                at: sample_at(p.tick).round().clamp(0.0, u32::MAX as f64) as u32,
+                cents: p.cents,
+                ramp: p.curve == Curve::Ramp,
+            };
+            b.len += 1;
+        }
+        b.pos = from;
+        b.locate();
+        b
+    }
+
+    /// The cents in force right now, without moving on.
+    #[inline]
+    pub fn cents(&self) -> f32 {
+        self.value
+    }
+
+    /// Whether this note bends at all. The caller branches on it once per block so an unbent
+    /// note renders down exactly the path it did before envelopes existed.
+    #[inline]
+    pub fn active(&self) -> bool {
+        self.len > 0
+    }
+
+    /// The cents in force at the current sample, then step to the next one. The whole point
+    /// of the type: the voice calls this once per sample while a bent note sounds.
+    #[inline]
+    pub fn next_cents(&mut self) -> f32 {
+        if self.next == self.len {
+            // Past the last point: it holds for the rest of the note.
+            return self.value;
+        }
+        let v = self.value;
+        self.pos += 1;
+        if self.pos >= self.end {
+            self.locate();
+        } else {
+            self.value += self.inc;
+        }
+        v
+    }
+
+    /// Re-derive the segment around `pos`. Called at most once per point per note, so the
+    /// linear scan over sixteen is cheaper than keeping the state incrementally correct.
+    fn locate(&mut self) {
+        let n = self.len as usize;
+        // Before the first point the note is in tune rather than pre-loaded with that point's
+        // value: an envelope offsets a note, it does not override a control.
+        let (mut i, mut prev_at, mut prev) = (0usize, 0u32, 0.0f32);
+        while i < n && self.pts[i].at <= self.pos {
+            prev_at = self.pts[i].at;
+            prev = self.pts[i].cents;
+            i += 1;
+        }
+        self.next = i as u8;
+        match self.pts.get(i).filter(|_| i < n) {
+            Some(p) if p.ramp && p.at > prev_at => {
+                self.end = p.at;
+                self.inc = (p.cents - prev) / (p.at - prev_at) as f32;
+                self.value = prev + self.inc * (self.pos - prev_at) as f32;
+            }
+            Some(p) => {
+                self.end = p.at;
+                self.inc = 0.0;
+                self.value = prev;
+            }
+            None => {
+                self.end = u32::MAX;
+                self.inc = 0.0;
+                self.value = prev;
+            }
+        }
+    }
+}
+
+impl Default for Bend {
+    fn default() -> Self {
+        Bend::NONE
+    }
+}
+
 #[derive(Debug, Clone)]
 struct Voice {
     /// The held key; `None` once released.
@@ -284,6 +422,9 @@ struct Voice {
     note_filter: Option<NoteFilter>,
     /// The note's `fine` detune in semitones, added to its pitch.
     fine: f32,
+    /// The note's pitch contour, on top of `fine`. [`Bend::NONE`] for a note that does not
+    /// move, which is almost all of them.
+    bend: Bend,
     /// What the note's `release` multiplies the patch's tail by; 1 at neutral. Kept so that a
     /// live `set_patch` can re-apply it over the new patch's release.
     release_scale: f32,
@@ -323,6 +464,7 @@ impl Voice {
             gains: (1.0, 1.0),
             note_filter: None,
             fine: 0.0,
+            bend: Bend::NONE,
             release_scale: 1.0,
             pan: 0.5,
             filter_at: OPEN_FILTER,
@@ -391,6 +533,7 @@ impl Voice {
         self.pan = shape.pan;
         self.gains = note_pan_gains(shape.pan);
         self.fine = shape.fine as f32 / 100.0;
+        self.bend = shape.bend;
         self.release_scale = release_scale(shape.release);
         self.amp_env
             .set_release(p.amp_env.release * self.release_scale);
@@ -402,6 +545,10 @@ impl Voice {
     /// ease the new note's expression in over the same time. Nothing restarts — no envelope,
     /// LFO or pitch-envelope retrigger — so the two notes sound as one. At 0 seconds the pitch
     /// jumps and the expression lands at once, still without an attack.
+    ///
+    /// The new note's contour takes over at once, from its own start. The old note's stops, so
+    /// the pitch it had reached goes into the glide: the slide leaves from where the voice was
+    /// sounding rather than stepping back to the old note's written pitch first.
     #[allow(clippy::too_many_arguments)]
     fn slide_to(
         &mut self,
@@ -427,6 +574,10 @@ impl Voice {
         }
         self.target = pitch as f32;
         self.glide_rate = rate;
+        let bent = self.bend.cents();
+        self.glide += bent / 100.0;
+        self.last_hz *= (bent / 1200.0).exp2();
+        self.bend = shape.bend;
         let filtered = note_filter(sr, tone_hz, shape.mod_x, shape.mod_y).is_some();
         if filtered && self.note_filter.is_none() {
             // No filter on the way out: fade one in from wide open, where it is as good as
@@ -550,8 +701,17 @@ impl Voice {
             self.fresh = false;
         }
         let mut hzs = [0.0f32; BLOCK];
-        for (i, h) in hzs[..n].iter_mut().enumerate() {
-            *h = ramp(self.last_hz, hz, i, n);
+        if self.bend.active() {
+            // Cents are a frequency ratio, so the contour multiplies the block's own ramp
+            // rather than re-entering `midi_to_hz`: the base pitch glides exactly as it does
+            // for an unbent note and the bend rides on top, sample by sample.
+            for (i, h) in hzs[..n].iter_mut().enumerate() {
+                *h = ramp(self.last_hz, hz, i, n) * (self.bend.next_cents() / 1200.0).exp2();
+            }
+        } else {
+            for (i, h) in hzs[..n].iter_mut().enumerate() {
+                *h = ramp(self.last_hz, hz, i, n);
+            }
         }
         self.last_hz = hz;
 
@@ -1697,6 +1857,21 @@ mod tests {
             .find(|v| v.tag == Some(tag))
             .expect("a voice plays it");
         v.glide
+    }
+
+    #[test]
+    fn a_slide_leaves_from_the_bent_pitch_and_plays_the_new_notes_bend() {
+        let held = |cents| Bend::new(&[PitchPoint::new(0, cents, Curve::Step)], |t| t as f64, 0);
+        for mode in [VoiceMode::Poly, VoiceMode::Mono, VoiceMode::Legato] {
+            let mut s = PolySynth::new(&voiced(mode), SR, 4);
+            s.note_on_tagged(57, 100, NoteShape::neutral().bent(held(200.0)), A, None);
+            render(&mut s, BLOCK * 4);
+            let new = NoteShape::neutral().bent(held(-100.0));
+            s.note_on_tagged(69, 100, new, B, slide(A, Some(0.2)));
+            assert_eq!(glide_of(&s, B), 59.0, "{mode:?}: 57 bent up a whole tone");
+            let v = s.voices.iter().find(|v| v.tag == Some(B)).unwrap();
+            assert_eq!(v.bend, held(-100.0), "{mode:?}: the slide note's own contour");
+        }
     }
 
     #[test]

@@ -1,7 +1,7 @@
 import {
   barTicks,
   gridLabel,
-  selectedAudioTrack,
+  recTrack,
   selectedPattern,
   selectedTrack,
   useStore,
@@ -31,13 +31,13 @@ export function StatusBar() {
   const target = pattern && track ? `${track.name} › ${pattern.name}` : null;
   const ghostTrack = ghost ? m.tracks.find((t) => t.id === ghost.trackId) : null;
 
-  const audioTrack = useStore(selectedAudioTrack);
+  const audioTrack = useStore(recTrack);
   const takes = (snapshot.model.audioClips ?? []).filter(
     (c) => c.trackId === audioTrack?.id,
   ).length;
   const context =
-    screen === "guitar"
-      ? `guitar · ${audioTrack?.name ?? "no audio track"} · ${takes} clip${takes === 1 ? "" : "s"}${
+    screen === "rec"
+      ? `rec · ${audioTrack?.name ?? "no audio track"} · ${takes} clip${takes === 1 ? "" : "s"}${
           audioTrack?.amp
             ? ` · ${audioTrack.amp.enabled ? audioTrack.amp.amp.model : "rig off"}`
             : ""

@@ -7,6 +7,7 @@
 //! the best-sounding tensions there is, so flagging it red would be musically wrong.
 
 use super::normalize;
+use crate::model::PitchPoint;
 use serde::{Deserialize, Serialize};
 
 /// How a note relates to the chord sounding right now.
@@ -53,6 +54,35 @@ impl TierClassifier {
         }
         map
     }
+}
+
+/// What the roll says about one note: its tier, plus whether its pitch moves.
+///
+/// A bent note gets exactly one tier, read at its *start pitch*: the row it sits on, judged
+/// exactly as the same note unbent. The alternatives are worse: tiering every point of the bend
+/// would paint one note in three colours, and tiering where it lands would call a bend from
+/// an avoid note up into a chord tone "solid" while it is still rubbing. So the colour stays
+/// honest about where the note starts, and `moving` is the second channel that says the rest
+/// of it goes somewhere else — the Three-Tier Doctrine's rule that colour never speaks alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NoteTier {
+    /// `None` when there is no chord and no key to judge against.
+    pub tier: Option<Tier>,
+    pub moving: bool,
+}
+
+/// Whether a pitch envelope actually moves the note.
+///
+/// The envelope reads as zero before its first point, so a note moves as soon as any point
+/// leaves the value it started on. An envelope that holds one value throughout — a single
+/// point at tick 0, or points that are all zero — is a detune, not a bend, and marking it
+/// would be a mark that lies.
+pub fn moves(envelope: &[PitchPoint]) -> bool {
+    let Some(first) = envelope.first() else {
+        return false;
+    };
+    let start = if first.tick <= 0 { first.cents } else { 0.0 };
+    envelope.iter().any(|p| p.cents != start)
 }
 
 #[cfg(test)]
@@ -117,5 +147,19 @@ mod tests {
         assert_eq!(c.tier(13, &[0, 4, 7], None), c.tier(1, &[0, 4, 7], None));
         assert_eq!(c.tier(-1, &[0, 4, 7], None), c.tier(11, &[0, 4, 7], None));
         assert_eq!(c.tier(4, &[12, 16, 19], None), Tier::ChordTone);
+    }
+
+    #[test]
+    fn only_an_envelope_that_changes_value_moves() {
+        use crate::automation::Curve;
+        let p = |tick, cents| PitchPoint::new(tick, cents, Curve::Ramp);
+        assert!(!moves(&[]));
+        // Held values are a detune, not a bend.
+        assert!(!moves(&[p(0, 30.0)]));
+        assert!(!moves(&[p(0, 30.0), p(240, 30.0)]));
+        assert!(!moves(&[p(120, 0.0), p(240, 0.0)]));
+        // Zero before the first point, so a lone late point is a bend up to it.
+        assert!(moves(&[p(120, 150.0)]));
+        assert!(moves(&[p(0, 30.0), p(240, -20.0)]));
     }
 }

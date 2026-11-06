@@ -2,11 +2,13 @@ import { useEffect, useRef, useState } from "react";
 import { peakDb, selectedPattern, useStore } from "../store";
 import { DEFAULT_SWING_GRID_TICKS, tempoMap, TICKS_PER_BEAT, ticksToBeats, TIME_SIGNATURES } from "../types";
 import { detectKey, keyName } from "../theory";
+import { detectedChroma } from "../detection";
 import { HMeter } from "./Meter";
 import { keys } from "../platform";
 
-/** What the chip beside REC cycles through: the grid a take snaps to, and "free" — as played. */
-const RECORD_GRIDS: { ticks: number | null; label: string }[] = [
+/** What the chip beside REC cycles through: the grid a take snaps to, and "free" — as played.
+ *  Exported because the REC page owns the same chip for audio takes. */
+export const RECORD_GRIDS: { ticks: number | null; label: string }[] = [
   { ticks: TICKS_PER_BEAT, label: "1/4" },
   { ticks: TICKS_PER_BEAT / 2, label: "1/8" },
   { ticks: TICKS_PER_BEAT / 4, label: "1/16" },
@@ -28,6 +30,8 @@ export function Transport() {
   const setTempo = (bpm: number, transient = false) => void s.dispatch({ type: "setTempo", bpm: Math.min(300, Math.max(20, bpm)) }, transient, "set tempo");
   const swing = model.swing ?? 50;
   const swingGridTicks = model.swingGridTicks ?? DEFAULT_SWING_GRID_TICKS;
+  // A punch range on the song blocks looping; the loop switch shows it rather than lying.
+  const punchArmed = !!model.punchRegion;
 
   // Position: BBB.B.SS (bar . beat . sixteenth) and MM:SS.mmm
   const tick = s.playhead;
@@ -35,7 +39,7 @@ export function Transport() {
   const bar = Math.floor(tick / bticks) + 1;
   const bib = Math.floor((tick % bticks) / TICKS_PER_BEAT) + 1;
   const six = Math.floor((tick % TICKS_PER_BEAT) / (TICKS_PER_BEAT / 4)) + 1;
-  // Only PATTERN runs inside a pattern; SETUP, SONG and the guitar screen run along the song.
+  // Only PATTERN runs inside a pattern; SETUP, SONG and the rec page run along the song.
   const map = s.screen !== "pattern" ? tempoMap(model.tempo, model.tempoPoints) : null;
   const secs = map && !map.isConstant ? map.secondsAt(tick) : (ticksToBeats(tick) * 60) / model.tempo;
   const liveBpm = map && !map.isConstant ? map.bpmAt(tick) : null;
@@ -43,13 +47,14 @@ export function Transport() {
   const ss = secs - mm * 60;
 
   // Key: locked value, or a suggestion from the notes of every melodic pattern (each pattern
-  // belongs to one track, so drum patterns are left out by their track; muted notes too).
+  // belongs to one track, so drum patterns are left out by their track; muted notes too) plus
+  // the chroma DI detection heard in strummed takes, which wrote no notes of its own.
   const drumIds = new Set(model.tracks.filter((t) => t.isDrum).map((t) => t.id));
   const pcs = model.patterns.filter((p) => !drumIds.has(p.trackId)).flatMap((p) => p.notes.filter((n) => !n.muted).map((n) => n.pitch));
   // Record target: the selected pattern, on its track.
   const recPattern = selectedPattern(s);
   const recInto = recPattern ? `${model.tracks.find((t) => t.id === recPattern.trackId)?.name ?? "?"} › ${recPattern.name}` : null;
-  const detected = detectKey(pcs);
+  const detected = detectKey(pcs, detectedChroma(model));
   const suggestion = !model.key.isLocked && detected.isConfident ? detected.candidates[0] : null;
 
   const commitBpm = () => {
@@ -63,8 +68,8 @@ export function Transport() {
   // Latched by the engine the moment the mix went over the ceiling, so a single over during a
   // take is still there when the take ends. Only the click below lowers it.
   const clipped = s.audio?.masterOver ?? false;
-  // On the guitar screen the record button captures audio instead of arming MIDI.
-  const audioRecord = s.screen === "guitar" && s.armedAudioTrackId !== null;
+  // On the rec page the record button captures audio instead of arming MIDI.
+  const audioRecord = s.screen === "rec" && s.armedAudioTrackId !== null;
   // Which grid the chip shows; a value off the list (an older session's) reads as "free".
   const foundGrid = RECORD_GRIDS.findIndex((g) => g.ticks === s.recordQuantize);
   const recGrid = foundGrid < 0 ? RECORD_GRIDS.length - 1 : foundGrid;
@@ -77,7 +82,7 @@ export function Transport() {
           <div className={s.screen === "setup" ? "on" : ""} onClick={() => s.setScreen("setup")} title="setup: chords, sections, tempo, song length">setup</div>
           <div className={s.screen === "pattern" ? "on" : ""} onClick={() => s.setScreen("pattern")} title="pattern: the piano roll (Tab cycles)">pat</div>
           <div className={s.screen === "song" ? "on" : ""} onClick={() => s.setScreen("song")} title="song: the arrangement (Tab cycles)">song</div>
-          <div className={s.screen === "guitar" ? "on" : ""} onClick={() => s.setScreen("guitar")} title="guitar: the rig, takes and tab">gtr</div>
+          <div className={s.screen === "rec" ? "on" : ""} onClick={() => s.setScreen("rec")} title="rec: input, tuner, takes and the rig">rec</div>
           <div className={s.screen === "sound" ? "on" : ""} onClick={() => s.setScreen("sound")} title="sound: design synth and drum sounds, saved for every project">sound</div>
         </div>
       </div>
@@ -140,12 +145,19 @@ export function Transport() {
         )}
         <button
           className="tbtn"
-          style={s.looping ? { background: "var(--accent-bg)", borderColor: "var(--accent-border)" } : undefined}
+          // An armed punch blocks looping outright, so the switch says so instead of pretending
+          // to work: the engine would ignore it anyway.
+          disabled={punchArmed}
+          style={s.looping && !punchArmed ? { background: "var(--accent-bg)", borderColor: "var(--accent-border)" } : undefined}
           onClick={() => s.toggleLooping()}
-          title="loop (L) · drag the ruler's top strip to set a region · right-click it to clear"
+          title={
+            punchArmed
+              ? "loop is blocked while punch is armed — clear the punch range in SONG"
+              : "loop (L) · drag the ruler's top strip to set a region · right-click it to clear"
+          }
         >
           <svg width="16" height="12" viewBox="0 0 16 12">
-            <path d="M3 4 H12 L10 2 M13 8 H4 L6 10" stroke={s.looping ? "#b48cff" : "#9a9aa4"} strokeWidth="1.6" fill="none" />
+            <path d="M3 4 H12 L10 2 M13 8 H4 L6 10" stroke={s.looping && !punchArmed ? "#b48cff" : "#9a9aa4"} strokeWidth="1.6" fill="none" />
           </svg>
         </button>
         <button

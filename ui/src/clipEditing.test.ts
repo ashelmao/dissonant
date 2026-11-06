@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { clipsInBox, deletePieces, deletePoint, dropAt, duplicateClips, groupMoveDelta, insertPieces, insertPoint, moveClips, pasteClips, snapGrid, snapTo, toggleId, toggleMuted, trimClip, windowPiece } from "./clipEditing";
-import type { Clip } from "./types";
-import { TICKS_PER_BEAT as B } from "./types";
+import { clampFade, clipsInBox, deletePieces, deletePoint, dropAt, duplicateClips, equalPowerGain, groupMoveDelta, insertPieces, insertPoint, moveClips, pasteClips, punchSplit, snapGrid, snapTo, tickAtSeconds, toggleId, toggleMuted, trimClip, windowPiece } from "./clipEditing";
+import type { AudioClip, Clip } from "./types";
+import { DEFAULT_PUNCH_CROSSFADE_SECONDS as XF, TICKS_PER_BEAT as B } from "./types";
 
 // Positions read as beats here; the model counts ticks, so everything is scaled by B.
 const c = (id: string, startBeats: number, lenBeats: number, patternId = "p"): Clip => ({
@@ -179,5 +179,112 @@ describe("ripple", () => {
     expect(windowPiece(0, 16 * B, 4 * B, 8 * B, 32 * B)).toEqual(piece(32, 4, 4));
     expect(windowPiece(4 * B, 4 * B, 4 * B, 8 * B, 32 * B)).toEqual(piece(32, 0, 4));
     expect(windowPiece(0, 4 * B, 4 * B, 8 * B, 32 * B)).toBeNull();
+  });
+});
+
+// ─── audio: fades and punch ────────────────────────────────────────────────────────────────
+// 120 bpm throughout: a beat is half a second, so a tick is 1/1920 s.
+const secondsAt = (tick: number) => tick / (2 * B);
+const audio = (id: string, startBeats: number, lengthSeconds: number, over: Partial<AudioClip> = {}): AudioClip => ({
+  id,
+  trackId: "gtr",
+  sourceId: "src",
+  startTick: startBeats * B,
+  lengthSeconds,
+  offsetSeconds: 0,
+  gain: 1,
+  fadeInSeconds: 0,
+  fadeOutSeconds: 0,
+  muted: false,
+  ...over,
+});
+
+describe("clip fades", () => {
+  it("caps a fade at five seconds and at half the clip", () => {
+    expect(clampFade(0.4, 2)).toBe(0.4);
+    expect(clampFade(3, 2)).toBe(1);
+    expect(clampFade(30, 40)).toBe(5);
+    expect(clampFade(-1, 2)).toBe(0);
+    expect(clampFade(Number.NaN, 2)).toBe(0);
+  });
+
+  it("draws the curve the engine plays: equal power, not a straight line", () => {
+    expect(equalPowerGain(0)).toBe(0);
+    expect(equalPowerGain(1)).toBeCloseTo(1, 12);
+    expect(equalPowerGain(0.5)).toBeCloseTo(Math.SQRT1_2, 12);
+    // The point of it: the two halves of a seam sum to one in power.
+    for (const t of [0.1, 0.25, 0.5, 0.75, 0.9]) {
+      expect(equalPowerGain(t) ** 2 + equalPowerGain(1 - t) ** 2).toBeCloseTo(1, 12);
+    }
+    expect(equalPowerGain(-3)).toBe(0);
+    expect(equalPowerGain(9)).toBeCloseTo(1, 12);
+  });
+});
+
+describe("punch split", () => {
+  let n = 0;
+  const newId = () => `new-${++n}`;
+
+  it("cuts the clip underneath into a head and a tail that crossfade with the take", () => {
+    // A two-second take from beat 0, punched from 1 s (beat 2) to 1.5 s.
+    const original = audio("a", 0, 2);
+    const take = audio("take", 2, 0.5, { id: "take", sourceId: "punched" });
+    const out = punchSplit([original], take, XF, secondsAt, newId);
+    expect(out).toHaveLength(2);
+    const [head, tail] = out;
+
+    expect(head.id).toBe("a");
+    expect(head.startTick).toBe(0);
+    expect(head.lengthSeconds).toBeCloseTo(1 + XF, 9);
+    expect(head.fadeOutSeconds).toBeCloseTo(XF, 9);
+    expect(head.fadeInSeconds).toBe(0);
+
+    // The tail lands on the nearest whole tick to 1.485 s and plays the material that lives
+    // there, so nothing slides against the file.
+    expect(tail.id).not.toBe("a");
+    expect(secondsAt(tail.startTick)).toBeCloseTo(1.5 - XF, 3);
+    expect(tail.offsetSeconds).toBeCloseTo(secondsAt(tail.startTick), 9);
+    expect(tail.offsetSeconds + tail.lengthSeconds).toBeCloseTo(2, 9);
+    expect(tail.fadeInSeconds).toBeCloseTo(XF, 9);
+    expect(tail.fadeOutSeconds).toBe(0);
+  });
+
+  it("leaves clips the punch misses, and clips on other tracks, alone", () => {
+    const before = audio("before", 0, 0.5);
+    const after = audio("after", 8, 1);
+    const elsewhere = audio("vox", 2, 2, { trackId: "vox" });
+    const take = audio("take", 2, 0.5);
+    expect(punchSplit([before, after, elsewhere], take, XF, secondsAt, newId)).toEqual([
+      before,
+      after,
+      elsewhere,
+    ]);
+  });
+
+  it("drops a clip buried under the take and keeps only the tail of one it starts on", () => {
+    const buried = audio("buried", 2, 0.2);
+    const overlapping = audio("late", 2, 2);
+    const take = audio("take", 2, 0.5);
+    const out = punchSplit([buried, overlapping], take, XF, secondsAt, newId);
+    expect(out).toHaveLength(1);
+    // Nothing in front of it to fade out, so it keeps its identity rather than forking.
+    expect(out[0].id).toBe("late");
+    expect(secondsAt(out[0].startTick)).toBeCloseTo(1.5 - XF, 3);
+    expect(out[0].fadeInSeconds).toBeCloseTo(XF, 9);
+  });
+
+  it("never lets the seam overlap itself on a very short take", () => {
+    const original = audio("a", 0, 4);
+    const take = audio("take", 2, 0.01);
+    const [head, tail] = punchSplit([original], take, XF, secondsAt, newId);
+    expect(head.fadeOutSeconds).toBeCloseTo(0.005, 9);
+    expect(tail.fadeInSeconds).toBeCloseTo(0.005, 9);
+  });
+
+  it("finds the tick nearest a time on a map that only increases", () => {
+    expect(tickAtSeconds(secondsAt, 0)).toBe(0);
+    expect(tickAtSeconds(secondsAt, -5)).toBe(0);
+    expect(tickAtSeconds(secondsAt, 0.5)).toBe(B);
+    expect(tickAtSeconds(secondsAt, 1.485)).toBe(2851);
   });
 });

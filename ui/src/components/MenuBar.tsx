@@ -112,7 +112,7 @@ export function MenuBar() {
       { label: `${s.screen === "setup" ? "✓ " : ""}Setup (chords, sections, tempo)`, action: () => s.setScreen("setup") },
       { label: `${s.screen === "pattern" ? "✓ " : ""}Pattern (piano roll)`, sc: "Tab", action: () => s.setScreen("pattern") },
       { label: `${s.screen === "song" ? "✓ " : ""}Song (arrangement)`, sc: "Tab", action: () => s.setScreen("song") },
-      { label: `${s.screen === "guitar" ? "✓ " : ""}Guitar`, sc: "Tab", action: () => s.setScreen("guitar") },
+      { label: `${s.screen === "rec" ? "✓ " : ""}Rec (input, tuner, takes)`, sc: "Tab", action: () => s.setScreen("rec") },
       { label: `${s.screen === "sound" ? "✓ " : ""}Sound (design sounds)`, action: () => s.setScreen("sound") },
       { sep: true },
       { label: `${s.highlightRows ? "✓ " : ""}Highlight rows by tier`, action: () => s.toggleHighlight() },

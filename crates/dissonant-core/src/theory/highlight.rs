@@ -8,9 +8,9 @@
 //!  - **Neutral** — no chord and no key: `None` everywhere.
 
 use super::normalize;
-use super::tier::{Tier, TierClassifier};
+use super::tier::{moves, NoteTier, Tier, TierClassifier};
 use crate::chord_track::ChordTrack;
-use crate::model::KeyState;
+use crate::model::{KeyState, NoteEvent};
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct HighlightEngine {
@@ -54,6 +54,21 @@ impl HighlightEngine {
         key: &KeyState,
     ) -> Option<Tier> {
         self.tier_map(tick, chord_track, key)[normalize(pitch) as usize]
+    }
+
+    /// One note's tier and moving mark, judged at its start tick and start pitch. The pitch
+    /// envelope never enters the tier — see [`NoteTier`] for why — so bending a note can add
+    /// the mark but can never recolour it.
+    pub fn note_tier(
+        &self,
+        note: &NoteEvent,
+        chord_track: &ChordTrack,
+        key: &KeyState,
+    ) -> NoteTier {
+        NoteTier {
+            tier: self.tier(note.pitch, note.start_tick, chord_track, key),
+            moving: moves(&note.pitch_envelope),
+        }
     }
 }
 

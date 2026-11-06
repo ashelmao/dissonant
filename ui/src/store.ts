@@ -1,6 +1,7 @@
 import { useMemo } from "react";
 import { create } from "zustand";
 import { getBridge } from "./bridge";
+import { detectionSummary } from "./detection";
 import type {
   AmpRig,
   AudioImportProgress,
@@ -76,10 +77,10 @@ export interface DialogSpec {
 export type BottomPanel = "devices" | "mixer";
 /**
  * Which top-level screen is showing. It is not what the engine sequences: `PlayMode` is a
- * Rust enum with two variants, and SETUP, SONG, SOUND and the guitar screen all play the song,
+ * Rust enum with two variants, and SETUP, SONG, SOUND and the rec page all play the song,
  * so `playModeOf` folds this down for the bridge.
  */
-export type Screen = ViewMode | "guitar";
+export type Screen = ViewMode | "rec";
 export type LiveKeyboard = "off" | "tier" | "chromatic";
 
 /** A pattern being dragged out of the tree, in client coordinates. */
@@ -188,6 +189,14 @@ interface State {
   selectedAudioClipId: string | null;
   /** Non-null while a file decodes. */
   importing: AudioImportProgress | null;
+  /** The audio clip whose DI is being transcribed, while that runs. One at a time. */
+  detectingClipId: string | null;
+  /** The tuner strip is open. The engine is silent while it is. */
+  tunerOpen: boolean;
+  /** What the tuner last heard, in Hz; null when it hears nothing with a pitch. */
+  tunerHz: number | null;
+  /** How periodic that reading was, 0…1. */
+  tunerClarity: number;
 
   init(): Promise<void>;
   /** `label` names the edit in the Edit menu ("move notes"); defaults to the command's name. */
@@ -207,8 +216,8 @@ interface State {
   deleteLibrarySound(id: string): Promise<void>;
   undo(): Promise<void>;
   redo(): Promise<void>;
-  /** Switch screens. PATTERN loops the selected pattern; SETUP, SONG, SOUND and the guitar
-   *  screen all play the song. The only writer of `screen`. */
+  /** Switch screens. PATTERN loops the selected pattern; SETUP, SONG, SOUND and the rec
+   *  page all play the song. The only writer of `screen`. */
   setScreen(screen: Screen): void;
   /** Also selects that track's first pattern (or keeps the selected one if it's on that track), or none. */
   selectTrack(id: string): void;
@@ -241,6 +250,9 @@ interface State {
   setLoopRegion(region: [number, number] | null): void;
   /** The song's loop brace, in song ticks: an undoable edit, saved with the project. */
   setSongLoop(region: [number, number] | null): Promise<void>;
+  /** The song's punch range, in song ticks: an undoable edit, saved with the project. Arming
+   *  one blocks looping, so this says so rather than letting the two fight. */
+  setPunch(region: [number, number] | null): Promise<void>;
   toggleLooping(): void;
   toggleRecord(): void;
   /** The grid a take snaps to; `null` records it as played. */
@@ -391,6 +403,9 @@ interface State {
   importAudioFile(trackId?: string | null): Promise<void>;
   /** Import a known path (dropped file). */
   importAudioPath(path: string, trackId?: string | null): Promise<void>;
+  /** Transcribe one audio clip's raw DI: notes onto a new synth track and chord candidates
+   *  into the detected lane, one undo step. Says what it wrote and what it refused. */
+  detectNotes(clipId: string): Promise<void>;
   selectAudioClip(id: string | null): void;
   /** Merge a patch into the selected audio track's rig. `transient` while a knob is dragged. */
   setAmp(
@@ -399,6 +414,14 @@ interface State {
     transient?: boolean,
   ): Promise<void>;
   refreshInputDevices(): Promise<void>;
+  /** Open or close the tuner. Opening silences the engine; closing lets it speak again. */
+  toggleTuner(): Promise<void>;
+  /** Poll one reading from the engine. The strip drives this while it is open. */
+  pollTuner(): Promise<void>;
+  /** Acknowledge the input meter's peak hold and clip latch. */
+  clearInputPeak(): Promise<void>;
+  /** Set the manual latency trim, in ms, for one input device. */
+  setInputTrim(device: string, ms: number): Promise<void>;
 }
 
 /** Push the appearance section into CSS variables, the live tier palette and the webview zoom. */
@@ -523,6 +546,18 @@ export const useStore = create<State>((set, get) => {
     else await b.clearLoop();
   };
 
+  /**
+   * Tell the engine where the punch range is. It lives on the model like the song's brace, so
+   * opening a project, undoing and dragging it all arrive through here. One time base only:
+   * the punch is a place in the *song*, and PATTERN has nothing to punch into.
+   */
+  const syncPunch = async () => {
+    const region = get().snapshot?.model.punchRegion ?? null;
+    const b = await getBridge();
+    if (region) await b.setPunch(region[0], region[1]);
+    else await b.clearPunch();
+  };
+
   const syncPlayback = async () => {
     const b = await getBridge();
     const { screen, selectedPatternId, chordOffsetTicks, ghostPatternId, hearGhost, ghostLevel } = get();
@@ -564,6 +599,9 @@ export const useStore = create<State>((set, get) => {
     const loopWas = get().snapshot?.model.loopRegion ?? null;
     const loopNow = m.loopRegion ?? null;
     const loopChanged = loopWas?.[0] !== loopNow?.[0] || loopWas?.[1] !== loopNow?.[1];
+    const punchWas = get().snapshot?.model.punchRegion ?? null;
+    const punchNow = m.punchRegion ?? null;
+    const punchChanged = punchWas?.[0] !== punchNow?.[0] || punchWas?.[1] !== punchNow?.[1];
     const next = reconcileSelection(m, selectedTrackId, selectedPatternId);
     const patternLost = next.selectedPatternId !== selectedPatternId;
     const clipIds = new Set(m.clips.map((c) => c.id));
@@ -577,6 +615,7 @@ export const useStore = create<State>((set, get) => {
     moveSelection(next);
     if (patternLost || ghostLost) void syncPlayback();
     if (loopChanged) void syncLoop();
+    if (punchChanged) void syncPunch();
     // OS window title: "song.dissonant • — dissonant"
     const title = `${fileNameOf(snapshot.path)}${snapshot.dirty ? " •" : ""} — dissonant`;
     if (title !== lastTitle) {
@@ -701,6 +740,10 @@ export const useStore = create<State>((set, get) => {
     monitor: false,
     selectedAudioClipId: null,
     importing: null,
+    detectingClipId: null,
+    tunerOpen: false,
+    tunerHz: null,
+    tunerClarity: 0,
 
     async init() {
       const b = await getBridge();
@@ -843,9 +886,12 @@ export const useStore = create<State>((set, get) => {
     },
 
     setScreen(screen) {
-      // SETUP, SONG, SOUND and the guitar screen all play the song timeline; only PATTERN loops
+      // SETUP, SONG, SOUND and the REC screen all play the song timeline; only PATTERN loops
       // a pattern, so the engine's mode only has to follow that one step.
       const before = playModeOf(get().screen);
+      // The tuner lives on REC and mutes the engine while it is open; leaving the page has to
+      // give the sound back, or the app is silent for reasons the user can no longer see.
+      if (get().tunerOpen && screen !== "rec") void get().toggleTuner();
       set({ screen });
       if (playModeOf(screen) !== before) void syncPlayback();
     },
@@ -913,6 +959,9 @@ export const useStore = create<State>((set, get) => {
     play() {
       const { armed, settings, playhead, snapshot } = get();
       const m = settings.metronome;
+      // An open tuner silences the engine, so pressing play with it open would look like a
+      // dead transport. Tuning is a stopped activity; starting one ends the other.
+      if (get().tunerOpen) void get().toggleTuner();
       void getBridge().then(async (b) => {
         if (armed && m.preRollBars > 0) {
           const bar = barTicksOf(snapshot?.model.timeSignature);
@@ -972,10 +1021,25 @@ export const useStore = create<State>((set, get) => {
     async setSongLoop(region) {
       const was = get().snapshot?.model.loopRegion ?? null;
       if (region?.[0] === was?.[0] && region?.[1] === was?.[1]) return;
+      if (region && get().snapshot?.model.punchRegion) {
+        get().showToast("loop is blocked while punch is armed — clear the punch first", true);
+        return;
+      }
       await get().dispatch({ type: "setLoopRegion", region });
+    },
+    async setPunch(region) {
+      const was = get().snapshot?.model.punchRegion ?? null;
+      if (region?.[0] === was?.[0] && region?.[1] === was?.[1]) return;
+      await get().dispatch({ type: "setPunchRegion", region });
+      // Say it once, where the user is looking, rather than quietly ignoring the loop.
+      if (region && get().looping) get().showToast("punch armed — looping is off until you clear it");
     },
     toggleLooping() {
       const on = !get().looping;
+      if (on && get().snapshot?.model.punchRegion) {
+        get().showToast("loop is blocked while punch is armed — clear the punch first", true);
+        return;
+      }
       set({ looping: on });
       void getBridge().then((b) => b.setLooping(on));
     },
@@ -1634,8 +1698,21 @@ export const useStore = create<State>((set, get) => {
         get().showToast(String(e), true);
         return;
       }
-      // Arming first and playing second is what keeps the count-in out of the take.
-      get().play();
+      const punch = get().snapshot?.model.punchRegion ?? null;
+      if (!punch) {
+        // Arming first and playing second is what keeps the count-in out of the take.
+        get().play();
+        return;
+      }
+      // A punch drops in at its own point, so the run-up is measured back from there rather
+      // than from wherever the playhead was parked — otherwise the take starts after the
+      // drop-in and never happens. Pre-roll and count-in are the metronome's own settings;
+      // punch does not get a second pair.
+      if (get().tunerOpen) void get().toggleTuner();
+      const m = get().settings.metronome;
+      const bar = barTicksOf(get().snapshot?.model.timeSignature);
+      await b.seek(Math.max(0, punch[0] - m.preRollBars * bar));
+      await b.play(m.countInBars);
     },
 
     async stopRecording() {
@@ -1671,12 +1748,31 @@ export const useStore = create<State>((set, get) => {
       const target = trackId ?? (selected?.isAudio ? selected.id : null);
       try {
         applySnapshot(await b.importAudio(path, target, 0));
-        set({ screen: "guitar", importing: null });
+        set({ screen: "rec", importing: null });
         await syncPlayback();
         get().showToast(`imported ${fileNameOf(path)}`);
       } catch (e) {
         set({ importing: null });
         get().showToast(String(e), true);
+      }
+    },
+
+    async detectNotes(clipId) {
+      if (get().detectingClipId !== null) return;
+      const b = await getBridge();
+      set({ detectingClipId: clipId });
+      try {
+        const report = await b.detectAudioClip(clipId);
+        applySnapshot(report.snapshot);
+        await syncPlayback();
+        const track = report.trackId
+          ? report.snapshot.model.tracks.find((t) => t.id === report.trackId)
+          : undefined;
+        get().showToast(detectionSummary(report, track?.name ?? null));
+      } catch (e) {
+        get().showToast(String(e), true);
+      } finally {
+        set({ detectingClipId: null });
       }
     },
 
@@ -1701,6 +1797,50 @@ export const useStore = create<State>((set, get) => {
       } catch {
         set({ inputDevices: [] });
       }
+    },
+
+    async toggleTuner() {
+      const open = !get().tunerOpen;
+      // Clear the reading on both edges: a stale needle under a new string is worse than no
+      // needle, and closing should leave nothing behind for the next open to inherit.
+      set({ tunerOpen: open, tunerHz: null, tunerClarity: 0 });
+      const b = await getBridge();
+      try {
+        await b.setTuner(open);
+      } catch (e) {
+        set({ tunerOpen: false });
+        get().showToast(String(e), true);
+      }
+    },
+
+    async pollTuner() {
+      if (!get().tunerOpen) return;
+      const b = await getBridge();
+      try {
+        const r = await b.tunerReading();
+        set({ tunerHz: r?.hz ?? null, tunerClarity: r?.clarity ?? 0 });
+      } catch {
+        set({ tunerHz: null, tunerClarity: 0 });
+      }
+    },
+
+    async clearInputPeak() {
+      // Drop the local copy first so the strip answers the click; the status poll would
+      // otherwise leave it lit for a second, and the engine re-latches on the next over.
+      const audio = get().audio;
+      if (audio) set({ audio: { ...audio, inputPeakHold: 0, inputOver: false } });
+      const b = await getBridge();
+      try {
+        set({ audio: await b.clearInputPeak() });
+      } catch {
+        /* no backend */
+      }
+    },
+
+    async setInputTrim(device, ms) {
+      if (!device) return;
+      const trims = { ...get().settings.audio.inputTrims, [device]: ms };
+      await get().updateSettings("audio", { inputTrims: trims });
     },
   };
 });
@@ -1743,12 +1883,22 @@ export function selectedTrack(s: State): Track | null {
 }
 
 /**
- * The audio track the guitar screen is showing: the selected one when it is an audio track,
- * else the first. One rule so the screen and the status bar never disagree about it.
+ * The audio track the REC page is showing: the armed one, else the selected one when it is an
+ * audio track, else the first.
+ *
+ * The arm comes first because REC is about what you are about to play into, and the arm is the
+ * only thing that decides where a take lands — a page that showed the selected track while
+ * recording into another one would be actively misleading. One rule, so the page and the
+ * status bar never disagree about it.
  */
-export function selectedAudioTrack(s: State): Track | null {
+export function recTrack(s: State): Track | null {
   const tracks = s.snapshot?.model.tracks.filter((t) => t.isAudio) ?? [];
-  return tracks.find((t) => t.id === s.selectedTrackId) ?? tracks[0] ?? null;
+  return (
+    tracks.find((t) => t.id === s.armedAudioTrackId) ??
+    tracks.find((t) => t.id === s.selectedTrackId) ??
+    tracks[0] ??
+    null
+  );
 }
 
 export function selectedTrackIndex(s: State): number {

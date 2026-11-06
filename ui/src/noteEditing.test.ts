@@ -1,23 +1,31 @@
 import { describe, expect, it } from "vitest";
 import {
+  addPitchPoint,
   adjustVelocity,
   duplicateNotes,
   hitsInSteps,
   moveHitsByRow,
+  movePitchPoint,
   moveNotes,
   noteAt,
   notesInRect,
   pasteNotes,
+  pitchCentsAt,
+  pitchPointAt,
+  pitchPolyline,
   placeNote,
   quantizeNotes,
   noteValueLabel,
   resizeEdge,
+  removePitchPoint,
   resizeNotes,
   snapFloor,
   snapRound,
+  tidyPitchEnvelope,
   tileGhost,
+  togglePitchCurve,
 } from "./noteEditing";
-import { TICKS_PER_BEAT, type NoteEvent } from "./types";
+import { TICKS_PER_BEAT, type NoteEvent, type PitchPoint } from "./types";
 
 const n = (id: string, start: number, len: number, pitch: number, velocity = 100): NoteEvent => ({
   id,
@@ -261,5 +269,98 @@ describe("step selection", () => {
     const up = moveHitsByRow(hits, new Set(["h1", "s1"]), pads, -1);
     expect(up.find((x) => x.id === "h1")!.pitch).toBe(38);
     expect(up.find((x) => x.id === "s1")!.pitch).toBe(36);
+  });
+});
+
+describe("pitch envelope", () => {
+  const bent = (points: PitchPoint[]): NoteEvent[] => [{ ...n("a", 0, 960, 60), pitchEnvelope: points }, n("b", 960, 480, 62)];
+  const ramp = (tick: number, cents: number): PitchPoint => ({ tick, cents, curve: "ramp" });
+
+  it("reads as zero before the first point and holds after the last", () => {
+    // An envelope offsets a note; a note that has not bent yet is in tune, which is where
+    // this parts company with an automation lane holding its first value backwards.
+    const points = [ramp(240, 200), { tick: 480, cents: 0, curve: "step" as const }];
+    expect(pitchCentsAt(points, 0)).toBe(0);
+    expect(pitchCentsAt(points, 120)).toBe(100);
+    expect(pitchCentsAt(points, 240)).toBe(200);
+    // A step holds the previous value right up to its own tick, then jumps.
+    expect(pitchCentsAt(points, 479)).toBe(200);
+    expect(pitchCentsAt(points, 480)).toBe(0);
+    expect(pitchCentsAt(points, 5_000)).toBe(0);
+    expect(pitchCentsAt([], 100)).toBe(0);
+  });
+
+  it("tidies into one clamped, sorted point per tick, keeping the later one", () => {
+    expect(
+      tidyPitchEnvelope([ramp(480, 9_000), ramp(-5, 50), ramp(240, 10), ramp(240, 20), ramp(120, Number.NaN)]),
+    ).toEqual([ramp(240, 20), ramp(480, 1_200)]);
+  });
+
+  it("adds points, refuses the seventeenth and replaces one that lands on an occupied tick", () => {
+    let notes = bent([]);
+    for (let i = 0; i < 16; i++) notes = addPitchPoint(notes, "a", i * 50, i * 10);
+    expect(notes[0].pitchEnvelope).toHaveLength(16);
+    // Full: a new tick is refused outright rather than evicting somebody's earlier point.
+    expect(addPitchPoint(notes, "a", 900, 100)).toBe(notes);
+    // But an occupied tick is a replacement, which does not grow the envelope.
+    const replaced = addPitchPoint(notes, "a", 100, -75);
+    expect(replaced[0].pitchEnvelope).toHaveLength(16);
+    expect(replaced[0].pitchEnvelope!.find((p) => p.tick === 100)!.cents).toBe(-75);
+    // A point is held inside the note it belongs to, both ends.
+    expect(addPitchPoint(bent([]), "a", -400, 50)[0].pitchEnvelope![0].tick).toBe(0);
+    expect(addPitchPoint(bent([]), "a", 5_000, 50)[0].pitchEnvelope![0].tick).toBe(960);
+  });
+
+  it("leaves other notes and the note's own fine alone", () => {
+    const before = [{ ...n("a", 0, 960, 60), fine: -40 }, n("b", 960, 480, 62)];
+    const notes = addPitchPoint(before, "a", 120, 150);
+    expect(notes[0].fine).toBe(-40);
+    expect(notes[0].pitchEnvelope).toEqual([ramp(120, 150)]);
+    // The untouched note comes back as the same object, so React skips redrawing it.
+    expect(notes[1]).toBe(before[1]);
+    expect(addPitchPoint(notes, "nope", 0, 0)).toBe(notes);
+  });
+
+  it("moves a point, reordering when a drag carries it past its neighbour", () => {
+    const notes = bent([ramp(100, 0), ramp(200, 100), ramp(300, 50)]);
+    const dragged = movePitchPoint(notes, "a", 1, 400, 25);
+    expect(dragged[0].pitchEnvelope).toEqual([ramp(100, 0), ramp(300, 50), ramp(400, 25)]);
+    // The same drag run again from the same base lands in the same place: a drag previews
+    // from its own starting array, so reordering mid-gesture cannot lose the point.
+    expect(movePitchPoint(notes, "a", 1, 400, 25)).toEqual(dragged);
+    expect(movePitchPoint(notes, "a", 9, 0, 0)).toBe(notes);
+  });
+
+  it("removes a point and flips its curve", () => {
+    const notes = bent([ramp(100, 0), ramp(200, 100)]);
+    expect(removePitchPoint(notes, "a", 0)[0].pitchEnvelope).toEqual([ramp(200, 100)]);
+    expect(togglePitchCurve(notes, "a", 1)[0].pitchEnvelope![1].curve).toBe("step");
+    expect(togglePitchCurve(togglePitchCurve(notes, "a", 1), "a", 1)).toEqual(notes);
+    expect(removePitchPoint(notes, "a", 7)).toBe(notes);
+  });
+
+  it("finds the handle under the pointer, nearest first, and nothing outside the radius", () => {
+    // One pixel per tick horizontally, one pixel per cent vertically: distances are ticks.
+    const scale = { pxPerTick: 1, pxPerCent: 1 };
+    const note = bent([ramp(100, 0), ramp(104, 20)])[0];
+    expect(pitchPointAt(note, 101, 1, scale, 7)).toBe(0);
+    expect(pitchPointAt(note, 103, 18, scale, 7)).toBe(1);
+    expect(pitchPointAt(note, 200, 0, scale, 7)).toBeNull();
+    expect(pitchPointAt(n("b", 0, 960, 62), 0, 0, scale, 7)).toBeNull();
+  });
+
+  it("draws a polyline that opens in tune and carries a step's corner", () => {
+    expect(pitchPolyline([], 960)).toEqual([]);
+    expect(pitchPolyline([ramp(240, 200)], 960)).toEqual([
+      { tick: 0, cents: 0 },
+      { tick: 240, cents: 200 },
+      { tick: 960, cents: 200 },
+    ]);
+    // A step is two vertices at one tick, so the drawn line matches what is heard.
+    expect(pitchPolyline([ramp(0, 50), { tick: 480, cents: -50, curve: "step" }], 480)).toEqual([
+      { tick: 0, cents: 50 },
+      { tick: 480, cents: 50 },
+      { tick: 480, cents: -50 },
+    ]);
   });
 });

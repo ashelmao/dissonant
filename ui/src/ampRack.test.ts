@@ -6,13 +6,21 @@
  */
 
 import { describe, expect, it } from "vitest";
-import { AMP_PRESETS, matchingPreset, pedalKnobs, PEDAL_LABELS } from "./components/AmpRack";
+import {
+  AMP_PRESETS,
+  AMP_SWITCHES,
+  ampSwitches,
+  matchingPreset,
+  pedalKnobs,
+  PEDAL_LABELS,
+  presetHead,
+} from "./components/AmpRack";
 import type { AmpPreset } from "./components/AmpRack";
-import type { Pedal } from "./types";
-import { defaultAmpRig, newPedal, PEDAL_KINDS } from "./types";
+import type { AmpModel, Pedal } from "./types";
+import { AMP_MODELS, AMP_SWITCH_MODELS, defaultAmpRig, newPedal, PEDAL_KINDS } from "./types";
 
 /** The rig a model menu entry builds, which is all `matchingPreset` is asked about. */
-const rigOf = (p: AmpPreset) => ({ ...defaultAmpRig(), amp: p.amp, eq: p.eq, cab: p.cab });
+const rigOf = (p: AmpPreset) => ({ ...defaultAmpRig(), amp: presetHead(p), eq: p.eq, cab: p.cab });
 
 describe("pedalKnobs", () => {
   it("gives every pedal kind a label and at least two knobs", () => {
@@ -96,11 +104,65 @@ describe("matchingPreset", () => {
 
   it("ignores the knobs, and lets go once a component is changed by hand", () => {
     const p = AMP_PRESETS[0];
-    const dialled = { ...rigOf(p), amp: { ...p.amp, gain: 10, master: 1 } };
+    const dialled = { ...rigOf(p), amp: { ...presetHead(p), gain: 10, master: 1 } };
     // Turning up the gain does not make it another amp — the model menu holds.
     expect(matchingPreset(dialled)?.name).toBe(p.name);
 
+    // Neither does throwing a switch: the menu reads the components, not the front panel.
+    const switched = { ...rigOf(p), amp: { ...presetHead(p), brightCap: true } };
+    expect(matchingPreset(switched)?.name).toBe(p.name);
+
     const rewired = { ...rigOf(p), eq: "boutique" as const };
     expect(matchingPreset(rewired)).toBeNull();
+  });
+});
+
+describe("ampSwitches", () => {
+  it("gives every switch a label, a hint and at least one amp that has it", () => {
+    for (const s of AMP_SWITCHES) {
+      expect(s.label.length).toBeGreaterThan(0);
+      expect(s.hint.length).toBeGreaterThan(0);
+      expect(AMP_SWITCH_MODELS[s.key].length).toBeGreaterThan(0);
+    }
+  });
+
+  it("offers a tweed its bright cap and half power, and a modern stack neither", () => {
+    // The point of the feature: switches are per model. A three-toggle row on every amp would
+    // be four knobs pretending to be a circuit.
+    expect(ampSwitches("clean").map((s) => s.key)).toEqual(["brightCap", "halfPower"]);
+    expect(ampSwitches("lead").map((s) => s.key)).toEqual(["cathodeFollower"]);
+    expect(ampSwitches("fuzz")).toEqual([]);
+  });
+
+  it("never offers a switch the core would turn off again", () => {
+    for (const model of AMP_MODELS) {
+      for (const s of ampSwitches(model)) {
+        expect(AMP_SWITCH_MODELS[s.key]).toContain(model);
+      }
+    }
+  });
+
+  it("keeps the panel order of the switch list whichever amp is showing", () => {
+    const order = AMP_SWITCHES.map((s) => s.key);
+    for (const model of AMP_MODELS) {
+      const shown = ampSwitches(model).map((s) => s.key);
+      expect(shown).toEqual(order.filter((k) => shown.includes(k)));
+    }
+  });
+});
+
+describe("presetHead", () => {
+  it("starts every preset with its switches off", () => {
+    // Wheeling in another amp gives you the amp as it shipped. Throwing a switch is a decision,
+    // and an undo step of its own.
+    for (const p of AMP_PRESETS) {
+      const head = presetHead(p);
+      expect([head.brightCap, head.halfPower, head.cathodeFollower]).toEqual([false, false, false]);
+    }
+  });
+
+  it("only ever builds heads whose model exists", () => {
+    const models: AmpModel[] = AMP_PRESETS.map((p) => presetHead(p).model);
+    for (const m of models) expect(AMP_MODELS).toContain(m);
   });
 });

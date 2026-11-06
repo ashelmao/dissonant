@@ -45,6 +45,30 @@ fn fixture() -> ProjectModel {
     let source = take_source();
     m.audio_clips = vec![AudioClip::new(gid, source.id, 0, 2.0)];
     m.audio_sources = vec![source];
+    // Two chords waiting in the detected lane, so accepting and dismissing have something to
+    // bite on.
+    m.detections = vec![ClipDetection {
+        clip_id: m.audio_clips[0].id,
+        chords: vec![
+            DetectedChord {
+                id: Uuid::new_v4(),
+                start_tick: 2 * BEAT,
+                length_ticks: 4 * BEAT,
+                pitch_classes: vec![9, 0, 4],
+                name: Some("Am".into()),
+                confidence: 0.9,
+            },
+            DetectedChord {
+                id: Uuid::new_v4(),
+                start_tick: 6 * BEAT,
+                length_ticks: 2 * BEAT,
+                pitch_classes: vec![5, 9, 0],
+                name: Some("F".into()),
+                confidence: 0.8,
+            },
+        ],
+        chroma: [0.0; 12],
+    }];
     // Effect chains on a track and on the master, so the insert commands have something to
     // bite on. Two on the track: one insert cannot be reordered. The master's second slot is
     // a native effect, which is the only kind `SetInsertParam` applies to.
@@ -165,6 +189,7 @@ fn every_variant_is_accounted_for(c: Command) -> &'static str {
         Command::MakeClipUnique { .. } => "MakeClipUnique",
         Command::SetSongLength { .. } => "SetSongLength",
         Command::SetLoopRegion { .. } => "SetLoopRegion",
+        Command::SetPunchRegion { .. } => "SetPunchRegion",
         Command::AddSection { .. } => "AddSection",
         Command::UpdateSection { .. } => "UpdateSection",
         Command::RemoveSection { .. } => "RemoveSection",
@@ -182,6 +207,7 @@ fn every_variant_is_accounted_for(c: Command) -> &'static str {
         Command::AddAudioTrack { .. } => "AddAudioTrack",
         Command::SetTrackAmp { .. } => "SetTrackAmp",
         Command::AddAudioTake { .. } => "AddAudioTake",
+        Command::PunchAudioTake { .. } => "PunchAudioTake",
         Command::UpdateAudioClip { .. } => "UpdateAudioClip",
         Command::RemoveAudioClip { .. } => "RemoveAudioClip",
         Command::AddInsert { .. } => "AddInsert",
@@ -193,6 +219,9 @@ fn every_variant_is_accounted_for(c: Command) -> &'static str {
         Command::InsertTime { .. } => "InsertTime",
         Command::DeleteTime { .. } => "DeleteTime",
         Command::DuplicateRange { .. } => "DuplicateRange",
+        Command::AddTranscription { .. } => "AddTranscription",
+        Command::AcceptDetectedChord { .. } => "AcceptDetectedChord",
+        Command::DismissDetectedChord { .. } => "DismissDetectedChord",
     }
 }
 
@@ -201,6 +230,7 @@ fn one_of_every_variant(m: &ProjectModel) -> Vec<Command> {
     let (t0, t1, p0, p1) = ids(m);
     let gid = audio_track(m);
     let take = take_source();
+    let punch_take = take_source();
     let existing = m.audio_clips[0].clone();
     let (chain, master) = (InsertTarget::Track(t0), InsertTarget::Master);
     let (first, second) = (m.tracks[0].inserts[0].id, m.tracks[0].inserts[1].id);
@@ -347,6 +377,9 @@ fn one_of_every_variant(m: &ProjectModel) -> Vec<Command> {
         Command::SetLoopRegion {
             region: Some((4 * BEAT, 12 * BEAT)),
         },
+        Command::SetPunchRegion {
+            region: Some((16 * BEAT, 20 * BEAT)),
+        },
         Command::ImportTracks {
             tracks: vec![ImportedTrack {
                 name: "piano".into(),
@@ -402,6 +435,12 @@ fn one_of_every_variant(m: &ProjectModel) -> Vec<Command> {
             track_id: gid,
             clip: AudioClip::new(gid, take.id, 8 * BEAT, 1.0),
             source: take,
+        },
+        Command::PunchAudioTake {
+            track_id: gid,
+            clip: AudioClip::new(gid, punch_take.id, BEAT, 0.5),
+            source: punch_take,
+            crossfade_seconds: DEFAULT_PUNCH_CROSSFADE_SECONDS,
         },
         Command::UpdateAudioClip {
             clip: AudioClip {
@@ -459,6 +498,23 @@ fn one_of_every_variant(m: &ProjectModel) -> Vec<Command> {
             from: 0,
             to: 16 * BEAT,
             at: 16 * BEAT,
+        },
+        Command::AddTranscription {
+            name: "take 1 notes".into(),
+            start_tick: 0,
+            length_ticks: 8 * BEAT,
+            notes: vec![NoteEvent::new(0, BEAT, 52), NoteEvent::new(BEAT, BEAT, 55)],
+            detection: ClipDetection {
+                clip_id: existing.id,
+                chords: vec![],
+                chroma: [0.0; 12],
+            },
+        },
+        Command::AcceptDetectedChord {
+            id: m.detections[0].chords[0].id,
+        },
+        Command::DismissDetectedChord {
+            id: m.detections[0].chords[1].id,
         },
     ]
 }
@@ -4200,4 +4256,94 @@ fn a_ripple_refuses_nonsense_and_leaves_the_song_alone() {
         assert_eq!(d.model(), &before);
         assert!(!d.can_undo());
     }
+}
+
+#[test]
+fn punching_the_middle_of_a_take_splits_it_and_undoes_in_one_step() {
+    // At 120 bpm a beat is half a second, so the fixture's two-second take at tick 0 runs to
+    // beat 4. The punch covers one second to one and a half: the middle of what was played.
+    let mut d = doc();
+    let gid = audio_track(d.model());
+    let before = d.model().clone();
+    let fix = take_source();
+    let xf = DEFAULT_PUNCH_CROSSFADE_SECONDS;
+    let punch_in = 2 * BEAT;
+    d.apply(
+        Command::PunchAudioTake {
+            track_id: gid,
+            clip: AudioClip::new(gid, fix.id, punch_in, 0.5),
+            source: fix.clone(),
+            crossfade_seconds: xf,
+        },
+        false,
+    )
+    .unwrap();
+
+    let clips = d.model().audio_clips.clone();
+    assert_eq!(clips.len(), 3, "head, take, tail");
+    let (head, take, tail) = (&clips[0], &clips[1], &clips[2]);
+    assert_eq!(take.source_id, fix.id, "the new take is the middle clip");
+    assert!(
+        head.source_id == tail.source_id && head.source_id != fix.id,
+        "the head and tail are both the original take"
+    );
+
+    // The head keeps playing across the crossfade and fades out over it; the tail starts one
+    // crossfade early and fades in over it. The seams are the overlaps.
+    let map = d.model().tempo_map();
+    let secs = |tick: i64| map.seconds_at_tick(tick as f64);
+    let close = |a: f64, b: f64| (a - b).abs() < 1e-6;
+    assert_eq!(head.id, before.audio_clips[0].id, "the head keeps the clip's identity");
+    assert_eq!(head.start_tick, 0);
+    assert!(close(head.length_seconds, 1.0 + xf), "{}", head.length_seconds);
+    assert!(close(head.fade_out_seconds, xf) && close(head.fade_in_seconds, 0.0));
+
+    assert_eq!(take.start_tick, punch_in);
+    assert!(close(take.fade_in_seconds, xf) && close(take.fade_out_seconds, xf));
+
+    // The tail is placed on the nearest whole tick, so its edge can sit up to half a tick off
+    // the exact crossfade start; what it may never do is slide against the file under it.
+    let tail_at = secs(tail.start_tick);
+    assert!((tail_at - (1.5 - xf)).abs() <= secs(1) * 0.5, "{tail_at}");
+    assert!(close(tail.offset_seconds, tail_at), "the tail plays the material that lives there");
+    assert!(close(tail.offset_seconds + tail.length_seconds, 2.0), "and runs to the take's end");
+    assert!(close(tail.fade_in_seconds, xf));
+
+    assert_eq!(d.undo_label(), Some("punch in"));
+    d.undo();
+    assert_eq!(d.model().audio_clips, before.audio_clips, "one ⌘Z puts the take back whole");
+}
+
+#[test]
+fn a_punch_over_a_whole_clip_replaces_it_and_one_beside_it_is_untouched() {
+    let mut d = doc();
+    let gid = audio_track(d.model());
+    // A second take further along, well clear of the punch.
+    let other = take_source();
+    d.apply(
+        Command::AddAudioTake {
+            track_id: gid,
+            clip: AudioClip::new(gid, other.id, 16 * BEAT, 1.0),
+            source: other.clone(),
+        },
+        false,
+    )
+    .unwrap();
+    let fix = take_source();
+    d.apply(
+        Command::PunchAudioTake {
+            track_id: gid,
+            // The fixture's take runs 0…2 s; this covers all of it and then some.
+            clip: AudioClip::new(gid, fix.id, 0, 3.0),
+            source: fix.clone(),
+            crossfade_seconds: DEFAULT_PUNCH_CROSSFADE_SECONDS,
+        },
+        false,
+    )
+    .unwrap();
+    let clips = &d.model().audio_clips;
+    assert_eq!(clips.len(), 2, "nothing is left of the buried take");
+    assert_eq!(clips[0].source_id, fix.id);
+    assert_eq!(clips[1].source_id, other.id, "the take beside the punch is untouched");
+    assert_eq!(clips[1].start_tick, 16 * BEAT);
 }

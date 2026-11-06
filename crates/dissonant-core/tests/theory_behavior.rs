@@ -486,6 +486,57 @@ fn where_chords_overlap_the_later_starting_one_wins() {
     );
 }
 
+#[test]
+fn a_bent_note_keeps_the_tier_of_its_start_pitch_and_gains_the_moving_mark() {
+    use dissonant_core::model::{NoteEvent, PitchPoint};
+    use dissonant_core::{Curve, NoteTier};
+    let e = HighlightEngine::default();
+    let track = two_bar_track();
+    let key = KeyState::locked(0, ScaleType::Major);
+    // F over C is the avoid note. Bend it a whole step up into G — a chord tone — and it is
+    // still an avoid note where it starts: the colour reports the start, the mark the move.
+    let plain = NoteEvent::new(0, 2 * BEAT, 65);
+    let mut bent = plain.clone();
+    bent.pitch_envelope = vec![PitchPoint::new(BEAT, 200.0, Curve::Ramp)];
+    assert_eq!(
+        e.note_tier(&plain, &track, &key),
+        NoteTier {
+            tier: Some(Tier::Dissonance),
+            moving: false
+        }
+    );
+    assert_eq!(
+        e.note_tier(&bent, &track, &key),
+        NoteTier {
+            tier: Some(Tier::Dissonance),
+            moving: true
+        }
+    );
+    // Every pitch, every context: bending never changes the tier, only the mark.
+    for pitch in 48..72 {
+        for (track, key) in [
+            (two_bar_track(), key),
+            (ChordTrack::default(), key),
+            (ChordTrack::default(), KeyState::NONE),
+        ] {
+            for start in [0, 3 * BEAT, 5 * BEAT] {
+                let plain = NoteEvent::new(start, BEAT, pitch);
+                let mut bent = plain.clone();
+                bent.pitch_envelope = vec![
+                    PitchPoint::new(0, -100.0, Curve::Step),
+                    PitchPoint::new(BEAT / 2, 300.0, Curve::Ramp),
+                ];
+                let (a, b) = (
+                    e.note_tier(&plain, &track, &key),
+                    e.note_tier(&bent, &track, &key),
+                );
+                assert_eq!(a.tier, b.tier, "pitch {pitch} at {start}");
+                assert!(!a.moving && b.moving);
+            }
+        }
+    }
+}
+
 // ─── Rust ↔ TypeScript parity ──────────────────────────────────────────────────────────────
 
 /// The UI reimplements this theory in `ui/src/theory.ts` so the roll can repaint at 60 fps
@@ -835,5 +886,39 @@ mod parity {
                 "11520:3840:[2, 6, 9]:D"
             ]
         );
+    }
+
+    type MovingCase = (&'static str, &'static [(i64, f32)], bool);
+
+    /// Which pitch envelopes count as moving. `ui/src/theory.test.ts` mirrors this table as
+    /// `MOVING_CASES`; the roll draws the mark from the TS side, the engine reads this one.
+    const MOVING_CASES: &[MovingCase] = &[
+        ("empty", &[], false),
+        ("held detune at the start", &[(0, 30.0)], false),
+        ("held detune, two points", &[(0, 30.0), (240, 30.0)], false),
+        ("all zero", &[(120, 0.0), (240, 0.0)], false),
+        ("lone late point bends up to it", &[(120, 150.0)], true),
+        ("start detune then fall", &[(0, 30.0), (240, -20.0)], true),
+        (
+            "returns to zero",
+            &[(0, 0.0), (120, 50.0), (240, 0.0)],
+            true,
+        ),
+    ];
+
+    #[test]
+    fn moving_cases_hold_on_the_rust_side() {
+        use dissonant_core::model::{NoteEvent, PitchPoint};
+        use dissonant_core::Curve;
+        let e = HighlightEngine::default();
+        for &(label, points, expected) in MOVING_CASES {
+            let mut note = NoteEvent::new(0, 4 * BEAT, 60);
+            note.pitch_envelope = points
+                .iter()
+                .map(|&(t, c)| PitchPoint::new(t, c, Curve::Ramp))
+                .collect();
+            let got = e.note_tier(&note, &ChordTrack::default(), &KeyState::NONE);
+            assert_eq!(got.moving, expected, "{label}");
+        }
     }
 }

@@ -8,7 +8,7 @@
 import { useSyncExternalStore } from "react";
 import { onZoomChange, pageZoom } from "./uiScale";
 
-export type PanelId = "tree" | "inspector" | "bottom" | "songHead" | "guitar" | "soundBrowser";
+export type PanelId = "tree" | "inspector" | "bottom" | "songHead" | "rec" | "soundBrowser";
 
 interface Spec {
   /** The size in CSS px before anyone drags it: it scales with the UI, like the text in it. */
@@ -32,7 +32,7 @@ const SPECS: Record<PanelId, Spec> = {
   inspector: { size: 264, min: 180, max: 600, axis: "x", keep: 360 },
   bottom: { size: 300, min: 120, max: 760, axis: "y", keep: 220 },
   songHead: { size: 220, min: 120, max: 460, axis: "x", keep: 320 },
-  guitar: { size: 300, min: 200, max: 620, axis: "x", keep: 320 },
+  rec: { size: 300, min: 200, max: 620, axis: "x", keep: 320 },
   soundBrowser: { size: 228, min: 160, max: 520, axis: "x", keep: 420 },
 };
 

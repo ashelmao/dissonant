@@ -19,15 +19,17 @@
 
 use std::ffi::CString;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use clack_extensions::audio_ports::{AudioPortInfoBuffer, PluginAudioPorts};
 use clack_extensions::params::{ParamInfoBuffer, ParamInfoFlags, PluginParams};
 use clack_extensions::state::{PluginState, StateError};
 use clack_host::entry::PluginEntryError;
-use clack_host::events::event_types::{NoteOffEvent, NoteOnEvent, ParamValueEvent};
+use clack_host::events::event_types::{
+    NoteExpressionEvent, NoteExpressionType, NoteOffEvent, NoteOnEvent, ParamValueEvent,
+};
 use clack_host::events::io::EventBuffer;
-use clack_host::events::{Match, Pckn, UnknownEvent};
+use clack_host::events::{Match, Pckn};
 use clack_host::prelude::*;
 use clack_host::process::audio_buffers::{
     AudioPortBuffer, AudioPortBufferType, AudioPorts, InputAudioBuffers, InputChannel,
@@ -41,9 +43,33 @@ use crate::{PluginDescriptor, PluginKind};
 /// produce.
 const DEFAULT_OUTPUT_CHANNELS: usize = 2;
 
-/// Headroom for note and parameter events queued between two render calls. Sized so a dense bar of
-/// chords plus automation never reaches `EventBuffer`'s growth path, which would allocate.
-const EVENT_CAPACITY: usize = 256;
+/// Headroom for the events queued between two render calls, and the hard ceiling on tuning
+/// expressions within one.
+///
+/// Notes and parameters were the whole budget once, and 256 covered a dense bar of chords plus
+/// automation. Per-note tuning is what sized it up: the engine follows at most 16 bent notes
+/// per plugin and sends each one a value at most every 64 samples while it moves, plus one at
+/// each envelope point it lands on, so a 2048-frame block of sixteen notes all bending peaks at
+/// roughly 800. 1024 holds that with the old 256 still spare for notes and parameters. Beyond
+/// it, [`PluginAudioUnit::note_tuning`] refuses rather than letting the queue reach its growth
+/// path, which would allocate on the audio thread; a refused value is simply sent a little later.
+const EVENT_CAPACITY: usize = 1024;
+
+/// CLAP's tuning expression spans ±120 semitones; anything wider is not a value a plugin has
+/// agreed to accept.
+const MAX_TUNING_SEMITONES: f64 = 120.0;
+
+/// Where every note id comes from, shared by every unit in the process.
+///
+/// Per-unit counters would hand the same id to two different notes the moment a track swaps one
+/// plugin for another, and an expression still addressed to the old note would land on the new
+/// one. A process-wide counter makes ids unique for as long as anyone could be holding one; the
+/// top bit is masked off because CLAP reserves negative ids for "unspecified".
+static NEXT_NOTE_ID: AtomicU32 = AtomicU32::new(0);
+
+fn next_note_id() -> u32 {
+    NEXT_NOTE_ID.fetch_add(1, Ordering::Relaxed) & i32::MAX as u32
+}
 
 // ─── parameters ──────────────────────────────────────────────────────────────────────────────
 
@@ -246,6 +272,7 @@ impl HostedPlugin {
         let unit = PluginAudioUnit {
             processor: processor.into(),
             kind: desc.kind,
+            queue: EventQueue::new(),
             input_events: EventBuffer::with_capacity(EVENT_CAPACITY),
             output_events: EventBuffer::with_capacity(EVENT_CAPACITY),
             in_ports: AudioPorts::with_capacity(in_channels.max(1), 1),
@@ -255,8 +282,6 @@ impl HostedPlugin {
             in_channels,
             out_channels,
             max_frames,
-            held: 0,
-            pending_events: false,
             status: ProcessStatus::Sleep,
         };
 
@@ -456,7 +481,10 @@ pub struct PluginAudioUnit {
     processor: PluginAudioProcessor<DissonantHost>,
     /// What the plugin is for, which decides how it is fed and when it may be skipped.
     kind: PluginKind,
-    /// Notes and parameter changes queued since the last render, in insertion order.
+    /// Notes, parameter changes and expressions queued since the last render, with the held
+    /// keys and the note id each one is sounding under.
+    queue: EventQueue,
+    /// The slice of `queue` one `process` call sees, re-stamped relative to its own first frame.
     input_events: EventBuffer,
     /// Where the plugin writes events back. Nothing upstream consumes them, so it is emptied every
     /// `process` call to keep it from growing.
@@ -473,11 +501,6 @@ pub struct PluginAudioUnit {
     in_channels: usize,
     out_channels: usize,
     max_frames: usize,
-    /// One bit per MIDI pitch currently held down.
-    held: u128,
-    /// Set by every queued event: a parameter change can make a silent plugin sound, so it must
-    /// not be skipped before the plugin has seen it.
-    pending_events: bool,
     status: ProcessStatus,
 }
 
@@ -491,29 +514,25 @@ enum PortInput {
 }
 
 impl PluginAudioUnit {
-    /// Queues a note-on at the start of the next rendered block.
-    pub fn note_on(&mut self, pitch: u8, velocity: u8) {
-        let event = NoteOnEvent::new(0, pckn(pitch), f64::from(velocity) / 127.0);
-        self.push(&event);
-        if pitch < 128 {
-            self.held |= 1u128 << pitch;
-        }
+    /// Queues a note-on at the start of the next rendered block and returns the note id it
+    /// sounds under.
+    ///
+    /// Every note gets a real id rather than CLAP's "unspecified" -1: per-note expressions are
+    /// addressed by it, and a plugin that tracks voices by id needs the note-off to name the
+    /// same one.
+    pub fn note_on(&mut self, pitch: u8, velocity: u8) -> u32 {
+        self.queue.note_on(pitch, f64::from(velocity) / 127.0)
     }
 
-    /// Queues a note-off at the start of the next rendered block.
+    /// Queues a note-off at the start of the next rendered block, addressed to the id the key
+    /// was struck under.
     pub fn note_off(&mut self, pitch: u8) {
-        let event = NoteOffEvent::new(0, pckn(pitch), 0.0);
-        self.push(&event);
-        if pitch < 128 {
-            self.held &= !(1u128 << pitch);
-        }
+        self.queue.note_off(pitch);
     }
 
     /// Releases every held note with a single wildcard note-off, as CLAP defines it.
     pub fn all_notes_off(&mut self) {
-        let event = NoteOffEvent::new(0, Pckn::match_all(), 0.0);
-        self.push(&event);
-        self.held = 0;
+        self.queue.all_notes_off();
     }
 
     /// Queues a parameter change. Ignores `id`s CLAP cannot represent.
@@ -521,8 +540,25 @@ impl PluginAudioUnit {
         let Some(id) = ClapId::from_raw(id) else {
             return;
         };
-        let event = ParamValueEvent::new(0, id, Pckn::match_all(), value);
-        self.push(&event);
+        self.queue.push(0, Queued::Param { id, value });
+    }
+
+    /// Whether `pitch` is still held under `note_id`: struck by [`note_on`](Self::note_on) and
+    /// neither released nor struck again since.
+    pub fn holds(&self, note_id: u32, pitch: u8) -> bool {
+        self.queue.holds(note_id, pitch)
+    }
+
+    /// Queues a `CLAP_NOTE_EXPRESSION_TUNING` for one held note, `at` samples into the next
+    /// render call, retuning it by `semitones` from its key — an absolute statement, not a step
+    /// on top of the last one, and clamped to CLAP's ±120.
+    ///
+    /// Returns false, queueing nothing, when the note is no longer held under that id or the
+    /// queue is at [`EVENT_CAPACITY`]; the caller keeps the value and offers it again later.
+    /// A plugin without note-expression support ignores the event, which leaves it exactly
+    /// where it was before expressions were sent at all.
+    pub fn note_tuning(&mut self, at: u32, note_id: u32, pitch: u8, semitones: f64) -> bool {
+        self.queue.tuning(at, note_id, pitch, semitones)
     }
 
     /// Whether the mixer can skip this unit entirely.
@@ -539,7 +575,9 @@ impl PluginAudioUnit {
     pub fn is_silent(&self) -> bool {
         match self.kind {
             PluginKind::Instrument => {
-                !self.pending_events && self.held == 0 && self.status == ProcessStatus::Sleep
+                self.queue.is_empty()
+                    && !self.queue.any_held()
+                    && self.status == ProcessStatus::Sleep
             }
             PluginKind::Effect => self.status == ProcessStatus::Sleep,
         }
@@ -550,15 +588,20 @@ impl PluginAudioUnit {
     /// This is the instrument path: the plugin is fed silence on any input port it declares.
     ///
     /// Requests longer than the `max_frames` this unit was opened with are split into several
-    /// `process` calls, so nothing here allocates or resizes. A plugin whose main output is mono
-    /// is added to both sides; extra channels beyond the first two are ignored, which is what the
-    /// stereo mixer can carry.
+    /// `process` calls, so nothing here allocates or resizes; each call is handed the queued
+    /// events that fall inside it, re-stamped against its own first frame. A plugin whose main
+    /// output is mono is added to both sides; extra channels beyond the first two are ignored,
+    /// which is what the stereo mixer can carry.
     pub fn render_add(&mut self, l: &mut [f32], r: &mut [f32]) {
         let frames = l.len().min(r.len());
         let mut done = 0;
+        let mut next_event = 0;
+        self.queue.sort();
 
         while done < frames {
             let chunk = (frames - done).min(self.max_frames);
+            self.queue
+                .deliver(&mut next_event, done, chunk, done + chunk == frames, &mut self.input_events);
             self.process_chunk(chunk, PortInput::Silence);
 
             let left = &self.scratch[..chunk];
@@ -572,14 +615,12 @@ impl PluginAudioUnit {
                 r[done + i] += right[i];
             }
 
-            // Every queued event is stamped at frame 0, so it belongs to the first chunk only.
-            // Clearing here also satisfies the contract that a render drains the event queue.
-            self.input_events.clear();
             done += chunk;
         }
 
+        // A render drains the queue whether or not every event found a frame to land on.
+        self.queue.clear();
         self.input_events.clear();
-        self.pending_events = false;
     }
 
     /// Runs the plugin over `l` and `r` and writes its output back over them.
@@ -599,10 +640,14 @@ impl PluginAudioUnit {
     pub fn process_replace(&mut self, l: &mut [f32], r: &mut [f32]) {
         let frames = l.len().min(r.len());
         let mut done = 0;
+        let mut next_event = 0;
+        self.queue.sort();
 
         while done < frames {
             let chunk = (frames - done).min(self.max_frames);
             self.fill_input(&l[done..done + chunk], &r[done..done + chunk]);
+            self.queue
+                .deliver(&mut next_event, done, chunk, done + chunk == frames, &mut self.input_events);
             self.process_chunk(chunk, PortInput::Audio);
 
             let left = &self.scratch[..chunk];
@@ -614,13 +659,11 @@ impl PluginAudioUnit {
             l[done..done + chunk].copy_from_slice(left);
             r[done..done + chunk].copy_from_slice(right);
 
-            // As in `render_add`: frame-zero events belong to the first chunk only.
-            self.input_events.clear();
             done += chunk;
         }
 
+        self.queue.clear();
         self.input_events.clear();
-        self.pending_events = false;
     }
 
     /// Copies one chunk of the caller's stereo pair into the plugin's input buffer.
@@ -710,20 +753,311 @@ impl PluginAudioUnit {
             }
         };
     }
+}
 
-    fn push<E: AsRef<UnknownEvent> + ?Sized>(&mut self, event: &E) {
-        self.input_events.push(event);
-        self.pending_events = true;
+// ─── event queue ─────────────────────────────────────────────────────────────────────────────
+
+/// One event waiting for the next render, in this host's own terms. Kept as plain data rather
+/// than as CLAP events so a render split into several `process` calls can re-stamp each one
+/// against the call it lands in; clack's buffer stores events opaquely and cannot be edited.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Queued {
+    NoteOn {
+        key: u8,
+        id: u32,
+        velocity: f64,
+    },
+    /// `id` is `None` when the key was struck again while still held: two notes then share
+    /// it, and only a wildcard id releases both, which is what the note-off has always done.
+    NoteOff {
+        key: u8,
+        id: Option<u32>,
+    },
+    AllNotesOff,
+    Param {
+        id: ClapId,
+        value: f64,
+    },
+    Tuning {
+        key: u8,
+        id: u32,
+        semitones: f64,
+    },
+}
+
+/// A queued event and where it lands: `time` in samples from the start of the next render call,
+/// `seq` its insertion order, so events sharing a sample stay in the order they were queued — a
+/// note's first tuning has to reach the plugin after the note-on it addresses.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Timed {
+    time: u32,
+    seq: u32,
+    event: Queued,
+}
+
+/// Everything a [`PluginAudioUnit`] owes its plugin before the next render, and which note id
+/// each held key is sounding under.
+struct EventQueue {
+    /// Pre-sized to [`EVENT_CAPACITY`] and drained by every render.
+    events: Vec<Timed>,
+    /// One bit per MIDI key currently held down.
+    held: u128,
+    /// Keys struck again while already held; see [`Queued::NoteOff`].
+    restruck: u128,
+    /// The id of the most recent note on each key. Meaningful only while the key's `held` bit
+    /// is set.
+    ids: [u32; 128],
+}
+
+impl EventQueue {
+    fn new() -> Self {
+        EventQueue {
+            events: Vec::with_capacity(EVENT_CAPACITY),
+            held: 0,
+            restruck: 0,
+            ids: [0; 128],
+        }
+    }
+
+    fn note_on(&mut self, key: u8, velocity: f64) -> u32 {
+        let id = next_note_id();
+        if key < 128 {
+            let bit = 1u128 << key;
+            if self.held & bit != 0 {
+                self.restruck |= bit;
+            }
+            self.held |= bit;
+            self.ids[key as usize] = id;
+        }
+        self.push(0, Queued::NoteOn { key, id, velocity });
+        id
+    }
+
+    fn note_off(&mut self, key: u8) {
+        let mut id = None;
+        if key < 128 {
+            let bit = 1u128 << key;
+            if self.held & bit != 0 && self.restruck & bit == 0 {
+                id = Some(self.ids[key as usize]);
+            }
+            self.held &= !bit;
+            self.restruck &= !bit;
+        }
+        self.push(0, Queued::NoteOff { key, id });
+    }
+
+    fn all_notes_off(&mut self) {
+        self.push(0, Queued::AllNotesOff);
+        self.held = 0;
+        self.restruck = 0;
+    }
+
+    fn holds(&self, id: u32, key: u8) -> bool {
+        key < 128 && self.held & (1u128 << key) != 0 && self.ids[key as usize] == id
+    }
+
+    fn any_held(&self) -> bool {
+        self.held != 0
+    }
+
+    fn tuning(&mut self, at: u32, id: u32, key: u8, semitones: f64) -> bool {
+        if !self.holds(id, key) || self.events.len() >= EVENT_CAPACITY {
+            return false;
+        }
+        let semitones = semitones.clamp(-MAX_TUNING_SEMITONES, MAX_TUNING_SEMITONES);
+        self.push(at, Queued::Tuning { key, id, semitones });
+        true
+    }
+
+    fn push(&mut self, time: u32, event: Queued) {
+        let seq = self.events.len() as u32;
+        self.events.push(Timed { time, seq, event });
+    }
+
+    fn is_empty(&self) -> bool {
+        self.events.is_empty()
+    }
+
+    fn clear(&mut self) {
+        self.events.clear();
+    }
+
+    /// CLAP requires a `process` call's events in time order. Unstable on purpose — the std
+    /// stable sort may allocate — with `seq` breaking ties so it behaves as a stable one.
+    fn sort(&mut self) {
+        self.events.sort_unstable_by_key(|e| (e.time, e.seq));
+    }
+
+    /// Writes into `out` the sorted events landing in the `len` frames that start `from` frames
+    /// into the render, stamped relative to `from`, and advances `next` past them. The `last`
+    /// call of a render also takes anything stamped past its end, on its final frame, rather
+    /// than dropping a note-off on the floor.
+    fn deliver(&self, next: &mut usize, from: usize, len: usize, last: bool, out: &mut EventBuffer) {
+        out.clear();
+        while let Some(e) = self.events.get(*next) {
+            let t = e.time as usize;
+            if !last && t >= from + len {
+                break;
+            }
+            let time = (t.saturating_sub(from)).min(len.saturating_sub(1)) as u32;
+            match e.event {
+                Queued::NoteOn { key, id, velocity } => {
+                    out.push(&NoteOnEvent::new(time, pckn(key, Some(id)), velocity))
+                }
+                Queued::NoteOff { key, id } => out.push(&NoteOffEvent::new(time, pckn(key, id), 0.0)),
+                Queued::AllNotesOff => out.push(&NoteOffEvent::new(time, Pckn::match_all(), 0.0)),
+                Queued::Param { id, value } => {
+                    out.push(&ParamValueEvent::new(time, id, Pckn::match_all(), value))
+                }
+                Queued::Tuning { key, id, semitones } => out.push(&NoteExpressionEvent::new(
+                    time,
+                    pckn(key, Some(id)),
+                    NoteExpressionType::Tuning,
+                    semitones,
+                )),
+            }
+            *next += 1;
+        }
     }
 }
 
-/// Targets one key on the first note port and first channel, with no note id: the engine plays
-/// plain MIDI-shaped notes and does not track per-note expression.
-fn pckn(pitch: u8) -> Pckn {
+/// Targets one key on the first note port and first channel, and one note on it when `note_id`
+/// is known. The engine speaks a single MIDI-shaped port; the id is what lets a per-note
+/// expression reach the voice it belongs to rather than every voice on the key.
+fn pckn(key: u8, note_id: Option<u32>) -> Pckn {
     Pckn {
         port_index: Match::Specific(0),
         channel: Match::Specific(0),
-        key: Match::Specific(u16::from(pitch)),
-        note_id: Match::All,
+        key: Match::Specific(u16::from(key)),
+        note_id: note_id.map_or(Match::All, Match::Specific),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn delivered(queue: &mut EventQueue, frames: usize, max_frames: usize) -> Vec<Vec<(u32, String)>> {
+        queue.sort();
+        let mut out = EventBuffer::with_capacity(EVENT_CAPACITY);
+        let (mut next, mut done, mut calls) = (0, 0, Vec::new());
+        while done < frames {
+            let chunk = (frames - done).min(max_frames);
+            queue.deliver(&mut next, done, chunk, done + chunk == frames, &mut out);
+            calls.push(
+                out.iter()
+                    .map(|e| {
+                        let what = if let Some(on) = e.as_event::<NoteOnEvent>() {
+                            format!("on {:?} {:?}", on.key(), on.note_id())
+                        } else if let Some(off) = e.as_event::<NoteOffEvent>() {
+                            format!("off {:?} {:?}", off.key(), off.note_id())
+                        } else if let Some(x) = e.as_event::<NoteExpressionEvent>() {
+                            format!("tune {:?} {:?} {}", x.key(), x.note_id(), x.value())
+                        } else {
+                            "other".to_string()
+                        };
+                        (e.header().time(), what)
+                    })
+                    .collect(),
+            );
+            done += chunk;
+        }
+        calls
+    }
+
+    #[test]
+    fn a_note_sounds_and_releases_under_one_real_id() {
+        let mut q = EventQueue::new();
+        let id = q.note_on(60, 1.0);
+        assert!(id <= i32::MAX as u32);
+        assert!(q.holds(id, 60));
+        q.note_off(60);
+        assert!(!q.holds(id, 60));
+        let calls = delivered(&mut q, 64, 64);
+        assert_eq!(
+            calls[0],
+            vec![
+                (0, format!("on Specific(60) Specific({id})")),
+                (0, format!("off Specific(60) Specific({id})")),
+            ]
+        );
+    }
+
+    #[test]
+    fn ids_are_never_reused_between_notes() {
+        let mut q = EventQueue::new();
+        let a = q.note_on(60, 1.0);
+        q.note_off(60);
+        let b = q.note_on(60, 1.0);
+        assert_ne!(a, b);
+        assert!(!q.holds(a, 60), "a released note's id must not match its successor");
+        assert!(q.holds(b, 60));
+    }
+
+    #[test]
+    fn a_restruck_key_releases_with_a_wildcard_id() {
+        let mut q = EventQueue::new();
+        let first = q.note_on(64, 1.0);
+        let second = q.note_on(64, 1.0);
+        assert!(!q.holds(first, 64), "the key now sounds under the newer id");
+        assert!(q.holds(second, 64));
+        q.note_off(64);
+        let calls = delivered(&mut q, 16, 16);
+        assert_eq!(calls[0][2], (0, "off Specific(64) All".to_string()));
+    }
+
+    #[test]
+    fn tuning_is_refused_for_a_note_that_is_not_held() {
+        let mut q = EventQueue::new();
+        let id = q.note_on(60, 1.0);
+        assert!(!q.tuning(0, id, 61, 0.5), "wrong key");
+        assert!(!q.tuning(0, id.wrapping_add(1), 60, 0.5), "wrong id");
+        q.all_notes_off();
+        assert!(!q.tuning(0, id, 60, 0.5), "released");
+    }
+
+    #[test]
+    fn tuning_stops_at_capacity_instead_of_growing_the_queue() {
+        let mut q = EventQueue::new();
+        let id = q.note_on(60, 1.0);
+        let accepted = (0..2 * EVENT_CAPACITY as u32)
+            .filter(|&i| q.tuning(i, id, 60, 0.01 * f64::from(i)))
+            .count();
+        assert_eq!(accepted, EVENT_CAPACITY - 1, "the note-on already holds one slot");
+        assert_eq!(q.events.capacity(), EVENT_CAPACITY);
+    }
+
+    #[test]
+    fn timed_events_land_in_the_process_call_that_contains_them() {
+        let mut q = EventQueue::new();
+        let id = q.note_on(60, 1.0);
+        // Queued out of order, as several notes' expressions are: delivery must sort them.
+        q.tuning(100, id, 60, 1.0);
+        q.tuning(0, id, 60, 0.25);
+        q.tuning(64, id, 60, 0.5);
+        q.tuning(63, id, 60, 0.75);
+        let calls = delivered(&mut q, 160, 64);
+        assert_eq!(calls.len(), 3);
+        let tune = |t: u32, v: f64| (t, format!("tune Specific(60) Specific({id}) {v}"));
+        assert_eq!(
+            calls[0],
+            vec![(0, format!("on Specific(60) Specific({id})")), tune(0, 0.25), tune(63, 0.75)],
+            "the note-on comes first even though a tuning shares its sample"
+        );
+        assert_eq!(
+            calls[1],
+            vec![tune(0, 0.5), tune(36, 1.0)],
+            "re-stamped against the second call"
+        );
+        assert!(calls[2].is_empty());
+    }
+
+    #[test]
+    fn tuning_is_clamped_to_the_clap_range() {
+        let mut q = EventQueue::new();
+        let id = q.note_on(60, 1.0);
+        q.tuning(0, id, 60, 500.0);
+        let calls = delivered(&mut q, 8, 8);
+        assert_eq!(calls[0][1].1, format!("tune Specific(60) Specific({id}) 120"));
     }
 }

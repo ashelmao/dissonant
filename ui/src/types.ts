@@ -75,6 +75,24 @@ export interface NoteEvent {
   slideFrom?: string;
   /** The rope's slide time in seconds, 0–2; absent uses the patch's glide. */
   slideSecs?: number;
+  /**
+   * The note's pitch contour, as an offset *on top of* `fine`: ticks are measured from the
+   * note's start, at most {@link MAX_PITCH_POINTS} of them. Absent on the overwhelming
+   * majority of notes, which sound at `pitch + fine` throughout.
+   */
+  pitchEnvelope?: PitchPoint[];
+}
+
+/** Most points one note's pitch envelope may carry. Mirrors `model::MAX_PITCH_POINTS`. */
+export const MAX_PITCH_POINTS = 16;
+
+/** One point on a note's pitch envelope. Mirrors `dissonant_core::model::PitchPoint`. */
+export interface PitchPoint {
+  /** Ticks after the note's start. */
+  tick: number;
+  /** Offset from the note's pitch and its `fine`, in cents. */
+  cents: number;
+  curve: Curve;
 }
 
 /** The per-note properties the roll's lane and the drum graph editor can draw. */
@@ -206,6 +224,11 @@ export interface AudioClip {
 
 export const MAX_CLIP_GAIN = 4;
 export const MAX_FADE_SECONDS = 5;
+/**
+ * The crossfade a punch lays over each of its two seams, in seconds. Mirrors
+ * `dissonant_core::DEFAULT_PUNCH_CROSSFADE_SECONDS`.
+ */
+export const DEFAULT_PUNCH_CROSSFADE_SECONDS = 0.015;
 /** Most pedals a rig will hold. Mirrors `dissonant_core::MAX_PEDALS`. */
 export const MAX_PEDALS = 4;
 
@@ -271,7 +294,8 @@ export type Pedal =
 export type AmpModel = "clean" | "crunch" | "lead" | "fuzz";
 export const AMP_MODELS: AmpModel[] = ["clean", "crunch", "lead", "fuzz"];
 
-/** The amp head: which voicing, and the knob row across its face. All 0…10. */
+/** The amp head: which voicing, the knob row across its face (all 0…10), and the circuit
+ *  switches on the models that have them. */
 export interface AmpHead {
   model: AmpModel;
   gain: number;
@@ -280,7 +304,27 @@ export interface AmpHead {
   treble: number;
   presence: number;
   master: number;
+  /** Treble bypass across the gain pot. Only real on the models that offer it; the core turns
+   *  it off again on the ones that do not. */
+  brightCap: boolean;
+  /** Half the output tubes: less headroom, and a supply that gives up sooner. */
+  halfPower: boolean;
+  /** Drive the tone stack from a cathode follower rather than straight off a plate. */
+  cathodeFollower: boolean;
 }
+
+/** The circuit switches an amp head can carry. */
+export type AmpSwitchKey = "brightCap" | "halfPower" | "cathodeFollower";
+
+/** Which models' circuits actually have each switch. Mirrors `AmpModel::has_bright_cap` and its
+ *  neighbours in `model.rs`: "more models" means switches rather than more entries in the list,
+ *  but a switch bolted onto every amp is only a knob with two positions. The core turns off the
+ *  ones a model never had, so this table and that one have to agree. */
+export const AMP_SWITCH_MODELS: Record<AmpSwitchKey, AmpModel[]> = {
+  brightCap: ["clean", "crunch"],
+  halfPower: ["clean"],
+  cathodeFollower: ["crunch", "lead"],
+};
 
 /** The tone-stack topology, which is what actually separates one classic amp from another once
  *  the gain stage is equal. Named for where the circuit comes from, not for a brand. */
@@ -381,6 +425,9 @@ export function defaultAmpRig(): AmpRig {
       treble: 6,
       presence: 5,
       master: 5,
+      brightCap: false,
+      halfPower: false,
+      cathodeFollower: false,
     },
     eq: "usClassic",
     cab: { model: "fourByTwelve", micModel: "dynamic", posX: 5, posZ: 2 },
@@ -508,9 +555,43 @@ export interface ProjectModel {
   songLengthTicks: number;
   /** The song's loop brace in song ticks, `[start, end]`; absent / null = loop the whole song. */
   loopRegion?: [number, number] | null;
+  /** The armed punch range in song ticks, `[in, out]`; absent / null = nothing armed. Looping
+   *  is blocked while it is set. */
+  punchRegion?: [number, number] | null;
   /** Copies of the non-factory sounds the tracks use. Absent when empty. */
   sounds?: Sound[];
+  /** What DI analysis heard besides notes, one entry per analysed audio clip. Absent when
+   *  empty. */
+  detections?: ClipDetection[];
 }
+
+/**
+ * A chord heard in a recorded DI, waiting in the detected lane. It joins the progression only
+ * when accepted (`acceptDetectedChord`), one at a time.
+ */
+export interface DetectedChord {
+  id: string;
+  startTick: number;
+  lengthTicks: number;
+  /** Root first. */
+  pitchClasses: number[];
+  name: string | null;
+  /** 0…1: how closely the heard chroma matched this chord. */
+  confidence: number;
+}
+
+/** What one analysis of one audio clip found besides notes. */
+export interface ClipDetection {
+  clipId: string;
+  chords: DetectedChord[];
+  /** Per pitch class (0 = C), in note equivalents: sums with a histogram of placed notes for
+   *  key detection. */
+  chroma: number[];
+}
+
+/** Most chord candidates one analysis may leave in the detected lane. Mirrors
+ *  `dissonant_core::MAX_DETECTED_CHORDS`. */
+export const MAX_DETECTED_CHORDS = 512;
 
 export interface TempoPoint {
   id: string;
@@ -998,6 +1079,8 @@ export type Command =
   | { type: "makeClipUnique"; id: string }
   | { type: "setSongLength"; ticks: number }
   | { type: "setLoopRegion"; region: [number, number] | null }
+  /** Arm the punch range, or `null` to disarm it. Looping is blocked while it is set. */
+  | { type: "setPunchRegion"; region: [number, number] | null }
   | { type: "addSection"; name: string; startTick: number }
   | { type: "updateSection"; section: Section }
   | { type: "removeSection"; id: string }
@@ -1022,6 +1105,18 @@ export type Command =
       source: AudioSource;
       clip: AudioClip;
     }
+  /**
+   * A take that lands inside what was already there: the clips under it are split and
+   * crossfaded against it — head fading out across `crossfadeSeconds` from the take's start,
+   * tail fading in across the same at its end — all in one undo step.
+   */
+  | {
+      type: "punchAudioTake";
+      trackId: string;
+      source: AudioSource;
+      clip: AudioClip;
+      crossfadeSeconds: number;
+    }
   | { type: "updateAudioClip"; clip: AudioClip }
   | { type: "removeAudioClip"; id: string }
   /**
@@ -1033,7 +1128,35 @@ export type Command =
   /** Cut `[at, at + ticks)` out of the song and close the gap, in one undo step. */
   | { type: "deleteTime"; at: number; ticks: number }
   /** Copy everything in `[from, to)` to `at`, pushing what was there along. */
-  | { type: "duplicateRange"; from: number; to: number; at: number };
+  | { type: "duplicateRange"; from: number; to: number; at: number }
+  /**
+   * What DI analysis heard in one audio clip, as one undo step: a new synth track `name` with
+   * one `lengthTicks` pattern of `notes` placed at `startTick` (no track when `notes` is empty),
+   * and `detection` replacing whatever an earlier analysis of the same clip left.
+   */
+  | {
+      type: "addTranscription";
+      name: string;
+      startTick: number;
+      lengthTicks: number;
+      notes: NoteEvent[];
+      detection: ClipDetection;
+    }
+  /** Lay one detected chord onto the progression over its own span; it leaves the lane. */
+  | { type: "acceptDetectedChord"; id: string }
+  /** Drop one detected chord without touching the progression. */
+  | { type: "dismissDetectedChord"; id: string };
+
+/** `detect_audio_clip`'s answer: the new state and what the analysis did. */
+export interface DetectionReport {
+  snapshot: Snapshot;
+  /** The new note track, when any notes were written. */
+  trackId: string | null;
+  notes: number;
+  chords: number;
+  /** Regions refused as polyphonic, `[start, end]` in song ticks: no notes were written there. */
+  refused: [number, number][];
+}
 
 export interface PlayheadEvent {
   tick: number;
@@ -1068,6 +1191,29 @@ export interface AudioStatus {
   inputUnderruns?: number;
   /** Latched until cleared: the mix asked the master for more than its ceiling. */
   masterOver?: boolean;
+  /** The input meter's peak hold and clip latch, both since the last `clearInputPeak`.
+   *  Pre-rig: this is what the interface is sending, whatever the rig does with it. */
+  inputPeakHold?: number;
+  inputOver?: boolean;
+  /** The manual latency trim in force for the open input device, in ms. */
+  inputTrimMs?: number;
+  /** What the next take will be pulled back by: block + backlog + trim. */
+  alignmentMs?: number;
+  /** What the last take of this session was actually corrected by. */
+  lastTakeAlign?: TakeAlign | null;
+}
+
+/** `dissonant_app::TakeAlign`: how far the last take moved, and how much of its head was cut. */
+export interface TakeAlign {
+  shiftedMs: number;
+  trimmedMs: number;
+}
+
+/** `dissonant_app::TunerReading`: what the tuner hears, straight off the input. */
+export interface TunerReading {
+  hz: number;
+  /** 0…1. A chord or a muted string reads low. */
+  clarity: number;
 }
 
 /** What the export dialog sends; `null` fields fall back to the export settings. */
@@ -1123,7 +1269,7 @@ export interface InputDevice {
   defaultSampleRate: number;
 }
 
-/** What the guitar screen's progress strip reads while a file imports. */
+/** What the rec page's progress strip reads while a file imports. */
 export interface AudioImportProgress {
   name: string;
   fraction: number;
@@ -1150,6 +1296,9 @@ export interface Settings {
     inputDevice: string | null;
     /** Which of the input device's channels the guitar is plugged into. */
     inputChannel: number;
+    /** Manual latency trim per input device, in ms, keyed by device name. A device nobody
+     *  has trimmed is simply absent. */
+    inputTrims: Record<string, number>;
   };
   midi: {
     defaultInput: string | null;
@@ -1196,6 +1345,12 @@ export interface Settings {
     preRollBars: number;
     duringPlayback: boolean;
   };
+  tuner: {
+    /** What A4 is worth, in Hz. */
+    a4Hz: number;
+    /** Which named tuning the readout names its strings from; see `tuner.ts`. */
+    tuning: string;
+  };
 }
 
 export const DEFAULT_TIER_COLORS: TierColors = {
@@ -1224,6 +1379,7 @@ export const DEFAULT_SETTINGS: Settings = {
     bufferSize: null,
     inputDevice: null,
     inputChannel: 0,
+    inputTrims: {},
   },
   midi: {
     defaultInput: null,
@@ -1269,6 +1425,10 @@ export const DEFAULT_SETTINGS: Settings = {
     preRollBars: 0,
     duringPlayback: true,
   },
+  tuner: {
+    a4Hz: 440,
+    tuning: "standard",
+  },
 };
 
 /** Deep-merge a (possibly partial / older) settings object over the defaults. */
@@ -1277,7 +1437,11 @@ export function withDefaults(
 ): Settings {
   const d = DEFAULT_SETTINGS;
   return {
-    audio: { ...d.audio, ...(s?.audio ?? {}) },
+    audio: {
+      ...d.audio,
+      ...(s?.audio ?? {}),
+      inputTrims: { ...(s?.audio?.inputTrims ?? {}) },
+    },
     midi: { ...d.midi, ...(s?.midi ?? {}) },
     editing: {
       ...d.editing,
@@ -1297,6 +1461,7 @@ export function withDefaults(
       },
     },
     metronome: { ...d.metronome, ...(s?.metronome ?? {}) },
+    tuner: { ...d.tuner, ...(s?.tuner ?? {}) },
   };
 }
 

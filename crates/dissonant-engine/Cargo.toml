@@ -16,11 +16,12 @@ thiserror = { workspace = true }
 log = "0.4"
 
 [dev-dependencies]
-# The insert tests run real CLAP effects, built from this crate's own fixture. Both sides of the
-# audio-ports extension are needed: the host half comes in through `dissonant-plugins`, the
-# plugin half is compiled into the `cdylib` examples below.
+# The insert and expression tests run real CLAP plugins, built from this crate's own fixtures.
+# Both sides of each extension are needed: the host half comes in through `dissonant-plugins`,
+# the plugin half is compiled into the `cdylib` examples below. `state` is how the note recorder
+# hands its log back.
 clack-plugin = "0.2"
-clack-extensions = { version = "0.2", features = ["audio-ports", "clack-plugin"] }
+clack-extensions = { version = "0.2", features = ["audio-ports", "state", "clack-plugin"] }
 
 # One source, two builds: the same saturator at two drives, so an insert chain's order is
 # something a test can hear. `cargo test` builds examples, so both are on disk by the time the
@@ -33,4 +34,11 @@ crate-type = ["cdylib"]
 [[example]]
 name = "dissonant_saturator_trim_fixture"
 path = "tests/fixture/trim_entry.rs"
+crate-type = ["cdylib"]
+
+# An instrument that records the note events and expressions it receives, so per-note tuning
+# can be checked at the sample it lands on rather than inferred from audio.
+[[example]]
+name = "dissonant_note_recorder_fixture"
+path = "tests/fixture/note_recorder_entry.rs"
 crate-type = ["cdylib"]
