@@ -177,10 +177,12 @@ fn every_variant_is_accounted_for(c: Command) -> &'static str {
         Command::RenamePattern { .. } => "RenamePattern",
         Command::SetPatternLength { .. } => "SetPatternLength",
         Command::SetNotes { .. } => "SetNotes",
+        Command::PatchNotes { .. } => "PatchNotes",
         Command::SetRope { .. } => "SetRope",
         Command::ClearRope { .. } => "ClearRope",
         Command::SetSlideTime { .. } => "SetSlideTime",
         Command::SetChords { .. } => "SetChords",
+        Command::PatchChords { .. } => "PatchChords",
         Command::AddClip { .. } => "AddClip",
         Command::UpdateClip { .. } => "UpdateClip",
         Command::UpdateClips { .. } => "UpdateClips",
@@ -242,6 +244,15 @@ fn one_of_every_variant(m: &ProjectModel) -> Vec<Command> {
         },
         Command::AddTrack { is_drum: false },
         Command::AddTrack { is_drum: true },
+        Command::PatchNotes {
+            pattern_id: p0,
+            upsert: vec![NoteEvent::new(0, 240, 61)],
+            remove: vec![],
+        },
+        Command::PatchChords {
+            upsert: vec![ChordEvent::new(0, 960, vec![0, 4, 7], Some("C".into()))],
+            remove: vec![],
+        },
         Command::DeleteTrack { id: t0 },
         Command::RenameTrack {
             id: t0,

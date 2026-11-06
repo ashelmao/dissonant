@@ -66,7 +66,7 @@ pub struct TempoPoint {
 impl TempoPoint {
     pub fn new(tick: i64, bpm: f64, ramp: bool) -> Self {
         TempoPoint {
-            id: Uuid::new_v4(),
+            id: crate::ids::mint(),
             tick,
             bpm,
             ramp,

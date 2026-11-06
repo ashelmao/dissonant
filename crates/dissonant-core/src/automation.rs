@@ -110,7 +110,7 @@ pub struct Breakpoint {
 impl Breakpoint {
     pub fn new(tick: i64, value: f64, curve: Curve) -> Self {
         Breakpoint {
-            id: Uuid::new_v4(),
+            id: crate::ids::mint(),
             tick,
             value,
             curve,
@@ -132,7 +132,7 @@ pub struct AutomationLane {
 impl AutomationLane {
     pub fn new(target: AutoTarget) -> Self {
         AutomationLane {
-            id: Uuid::new_v4(),
+            id: crate::ids::mint(),
             target,
             points: Vec::new(),
         }

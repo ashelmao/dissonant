@@ -96,7 +96,7 @@ impl ChordEvent {
         name: Option<String>,
     ) -> Self {
         ChordEvent {
-            id: Uuid::new_v4(),
+            id: crate::ids::mint(),
             start_tick,
             length_ticks,
             pitch_classes,
@@ -496,7 +496,7 @@ pub struct NoteEvent {
 impl NoteEvent {
     pub fn new(start_tick: i64, length_ticks: i64, pitch: i32) -> Self {
         NoteEvent {
-            id: Uuid::new_v4(),
+            id: crate::ids::mint(),
             start_tick,
             length_ticks,
             pitch,
@@ -724,7 +724,7 @@ impl Insert {
     /// A freshly chosen effect: enabled, with no state of its own yet.
     pub fn new(uid: impl Into<String>, name: impl Into<String>) -> Self {
         Insert {
-            id: Uuid::new_v4(),
+            id: crate::ids::mint(),
             uid: uid.into(),
             name: name.into(),
             enabled: true,
@@ -825,7 +825,7 @@ pub enum TrackKind {
 impl Track {
     pub fn new(name: impl Into<String>) -> Self {
         Track {
-            id: Uuid::new_v4(),
+            id: crate::ids::mint(),
             name: name.into(),
             voice: default_voice(),
             muted: false,
@@ -937,7 +937,7 @@ pub struct AudioClip {
 impl AudioClip {
     pub fn new(track_id: Uuid, source_id: Uuid, start_tick: i64, length_seconds: f64) -> Self {
         AudioClip {
-            id: Uuid::new_v4(),
+            id: crate::ids::mint(),
             track_id,
             source_id,
             start_tick,
@@ -1626,7 +1626,7 @@ fn de_legacy_chords<'de, D: Deserializer<'de>>(d: D) -> Result<crate::chord_trac
 impl SongPattern {
     pub fn new(track_id: Uuid, name: impl Into<String>) -> Self {
         SongPattern {
-            id: Uuid::new_v4(),
+            id: crate::ids::mint(),
             track_id,
             name: name.into(),
             length_ticks: default_pattern_length(),
@@ -1644,11 +1644,11 @@ impl SongPattern {
     /// A deep copy on the same track with fresh pattern and note ids, named "<name> copy".
     pub fn duplicated(&self) -> Self {
         let mut copy = self.clone();
-        copy.id = Uuid::new_v4();
+        copy.id = crate::ids::mint();
         copy.name = format!("{} copy", self.name);
         let mut copy_of = HashMap::new();
         for n in &mut copy.notes {
-            let fresh = Uuid::new_v4();
+            let fresh = crate::ids::mint();
             copy_of.insert(n.id, fresh);
             n.id = fresh;
         }
@@ -1852,7 +1852,7 @@ pub struct Clip {
 impl Clip {
     pub fn new(pattern_id: Uuid, start_tick: i64, length_ticks: i64) -> Self {
         Clip {
-            id: Uuid::new_v4(),
+            id: crate::ids::mint(),
             pattern_id,
             start_tick,
             length_ticks,
@@ -1913,7 +1913,7 @@ impl Section {
     /// A marker with the implicit extent: it runs to the next section, then to the song's end.
     pub fn new(name: impl Into<String>, start_tick: i64) -> Self {
         Section {
-            id: Uuid::new_v4(),
+            id: crate::ids::mint(),
             name: name.into(),
             start_tick,
             length_ticks: 0,
@@ -2081,7 +2081,7 @@ impl Default for ProjectModel {
 
 /// A loop brace held inside `[0, song_end]`, or `None` when nothing is left of it. One rule for
 /// both the editing command and the file fixups, so a hand-edited file and a drag agree.
-pub(crate) fn clamp_loop(start: i64, end: i64, song_end: i64) -> Option<(i64, i64)> {
+pub fn clamp_loop(start: i64, end: i64, song_end: i64) -> Option<(i64, i64)> {
     let start = start.clamp(0, song_end);
     let end = end.clamp(0, song_end);
     (end > start).then_some((start, end))
@@ -2381,6 +2381,25 @@ impl ProjectModel {
             .filter(move |c| c.track_id == track_id)
     }
 
+    /// Repair what a partly-applied change can leave behind: things pointing at what is gone,
+    /// lists out of order. A whole command never needs this. An undo cut short by somebody
+    /// else's edit can.
+    pub fn mend(&mut self) {
+        let tracks: HashSet<Uuid> = self.tracks.iter().map(|t| t.id).collect();
+        self.patterns.retain(|p| tracks.contains(&p.track_id));
+        let patterns: HashSet<Uuid> = self.patterns.iter().map(|p| p.id).collect();
+        self.clips.retain(|c| patterns.contains(&c.pattern_id));
+        self.audio_clips.retain(|c| tracks.contains(&c.track_id));
+        self.automation.retain(|l| l.target.track_id().is_none_or(|t| tracks.contains(&t)));
+        for p in &mut self.patterns {
+            p.notes.sort_by(|a, b| a.start_tick.cmp(&b.start_tick).then(a.pitch.cmp(&b.pitch)));
+            tidy_ropes(&mut p.notes);
+        }
+        let chords = self.chords.take();
+        self.chords = crate::chord_track::ChordTrack::new(tidy_chords(chords));
+        crate::ripple::settle(self);
+    }
+
     /// Normalize after decoding a foreign/older file: fold schema ≤ 8 beat fields into ticks,
     /// split schema ≤ 9 patterns into one per track, bump the schema, make sure there is at
     /// least one track, clamp every note, tidy the chords, hold the song length to at least a
@@ -2611,7 +2630,7 @@ impl ProjectModel {
                 split.length_ticks = old.length_ticks;
                 split.notes = notes;
                 clips.extend(mine.iter().map(|c| Clip {
-                    id: Uuid::new_v4(),
+                    id: crate::ids::mint(),
                     pattern_id: split.id,
                     ..(*c).clone()
                 }));

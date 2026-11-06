@@ -1,0 +1,18 @@
+[package]
+name = "dissonant-net"
+description = "Carries a Dissonant session between machines over iroh: encrypted, direct where it can be, relayed where it can't."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+iroh = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+data-encoding = "2"
+log = "0.4"
+
+[dev-dependencies]
+dissonant-core = { path = "../dissonant-core" }
+dissonant-session = { path = "../dissonant-session" }

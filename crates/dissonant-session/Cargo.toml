@@ -1,0 +1,12 @@
+[package]
+name = "dissonant-session"
+description = "Dissonant's shared-session logic: the protocol and the host and guest state machines. No networking and no async, so all of it runs in a test."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+dissonant-core = { path = "../dissonant-core" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }

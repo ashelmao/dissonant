@@ -13,8 +13,10 @@ pub mod automation;
 pub mod chord_track;
 pub mod document;
 pub mod effects;
+pub mod ids;
 pub mod midi_file;
 pub mod model;
+pub mod patch;
 pub mod ripple;
 pub mod sequence;
 pub mod sound;
@@ -28,8 +30,9 @@ pub use automation::{
     track_param_range, AutoTarget, AutomationCurve, AutomationLane, Breakpoint, Curve, MasterParam,
 };
 pub use chord_track::ChordTrack;
-pub use document::{Command, Document, EditError, InsertTarget, TrackParam};
+pub use document::{Command, Document, EditError, InsertTarget, StepOutcome, TimeEdit, TrackParam};
 pub use effects::{NativeKind, NativeParam, ParamMap, NATIVE_PREFIX};
+pub use patch::{Conflict, Patch, PatchError, Personal};
 pub use midi_file::{ImportedMidi, ImportedTrack, MidiError, MidiScope};
 pub use model::{
     decimate_pitch_envelope, remap_ropes, rope_is_live, tidy_chords, tidy_pitch_envelope,

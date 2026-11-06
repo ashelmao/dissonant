@@ -14,7 +14,6 @@
 use crate::automation::Breakpoint;
 use crate::model::{AudioClip, ChordEvent, Clip, DetectedChord, ProjectModel, Section};
 use crate::tempo::{TempoMap, TempoPoint};
-use uuid::Uuid;
 
 /// A surviving piece of a span an edit cut: where it lands, how far into the original span it
 /// begins (what the piece has to skip to keep playing the same material), and how long it is.
@@ -121,7 +120,7 @@ pub fn window_piece(start: i64, len: i64, from: i64, to: i64, at: i64) -> Option
 /// that starts the pattern where the first left off, so a split is inaudible.
 fn split_clip(clip: &Clip, pieces: Vec<Piece>) -> impl Iterator<Item = Clip> + '_ {
     pieces.into_iter().enumerate().map(move |(i, p)| Clip {
-        id: if i == 0 { clip.id } else { Uuid::new_v4() },
+        id: if i == 0 { clip.id } else { crate::ids::mint() },
         start_tick: p.start,
         length_ticks: p.len,
         offset_ticks: clip.offset_ticks + p.skip,
@@ -132,7 +131,7 @@ fn split_clip(clip: &Clip, pieces: Vec<Piece>) -> impl Iterator<Item = Clip> + '
 /// `chord` cut into its pieces, each still spelling the same notes.
 fn split_chord(chord: &ChordEvent, pieces: Vec<Piece>) -> impl Iterator<Item = ChordEvent> + '_ {
     pieces.into_iter().enumerate().map(move |(i, p)| ChordEvent {
-        id: if i == 0 { chord.id } else { Uuid::new_v4() },
+        id: if i == 0 { chord.id } else { crate::ids::mint() },
         start_tick: p.start,
         length_ticks: p.len,
         ..chord.clone()
@@ -148,7 +147,7 @@ fn split_detected(m: &mut ProjectModel, pieces: impl Fn(&DetectedChord) -> Vec<P
         for c in std::mem::take(&mut d.chords) {
             for (i, p) in pieces(&c).into_iter().enumerate() {
                 out.push(DetectedChord {
-                    id: if i == 0 { c.id } else { Uuid::new_v4() },
+                    id: if i == 0 { c.id } else { crate::ids::mint() },
                     start_tick: p.start,
                     length_ticks: p.len,
                     ..c.clone()
@@ -184,7 +183,7 @@ fn split_audio(map: &TempoMap, clip: &AudioClip, pieces: Vec<Piece>, len: i64) -
                 into(clip.start_tick + p.skip + p.len)
             };
             AudioClip {
-                id: if i == 0 { clip.id } else { Uuid::new_v4() },
+                id: if i == 0 { clip.id } else { crate::ids::mint() },
                 start_tick: p.start,
                 length_seconds: until - from,
                 offset_seconds: clip.offset_seconds + from,
@@ -255,16 +254,8 @@ pub fn insert_time(m: &mut ProjectModel, at: i64, ticks: i64) {
     // Time opened inside the brace lengthens it: the loop is a place in the music, and that
     // place just got longer. A brace that ends exactly where the time opens does not grow.
     // The punch range is a place in the music too, so it moves by the same rule.
-    let shift = |r: Option<(i64, i64)>| {
-        r.map(|(s, e)| {
-            (
-                insert_point(s, at, ticks),
-                if e > at { e + ticks } else { e },
-            )
-        })
-    };
-    m.loop_region = shift(m.loop_region);
-    m.punch_region = shift(m.punch_region);
+    m.loop_region = shift_region(m.loop_region, at, ticks);
+    m.punch_region = shift_region(m.punch_region, at, ticks);
     // `at` past the end means "open time there", so the song reaches it either way.
     m.song_length_ticks = m.song_length_ticks.max(at) + ticks;
     settle(m);
@@ -336,11 +327,8 @@ pub fn delete_time(m: &mut ProjectModel, at: i64, ticks: i64) {
     // A lane with every point inside the cut has nothing left to say; the parameter goes back
     // to its static control, as `ClearAutomation` leaves it.
     m.automation.retain(|l| !l.points.is_empty());
-    let pull = |r: Option<(i64, i64)>| {
-        r.map(|(s, e): (i64, i64)| (delete_point(s, at, ticks), delete_point(e, at, ticks)))
-    };
-    m.loop_region = pull(m.loop_region);
-    m.punch_region = pull(m.punch_region);
+    m.loop_region = pull_region(m.loop_region, at, ticks);
+    m.punch_region = pull_region(m.punch_region, at, ticks);
     let gone = (m.song_length_ticks.min(cut_end) - at).max(0);
     m.song_length_ticks = (m.song_length_ticks - gone).max(m.bar_ticks());
     settle(m);
@@ -391,7 +379,7 @@ pub fn duplicate_range(m: &mut ProjectModel, from: i64, to: i64, at: i64) {
     for c in &clips {
         if let Some(p) = window_piece(c.start_tick, c.length_ticks, from, to, at) {
             m.clips.push(Clip {
-                id: Uuid::new_v4(),
+                id: crate::ids::mint(),
                 start_tick: p.start,
                 length_ticks: p.len,
                 offset_ticks: c.offset_ticks + p.skip,
@@ -406,7 +394,7 @@ pub fn duplicate_range(m: &mut ProjectModel, from: i64, to: i64, at: i64) {
             // is a second take of the same source, not the same clip twice.
             m.audio_clips.extend(split_audio(&map, c, vec![p], len).into_iter().map(|copy| {
                 AudioClip {
-                    id: Uuid::new_v4(),
+                    id: crate::ids::mint(),
                     ..copy
                 }
             }));
@@ -414,7 +402,7 @@ pub fn duplicate_range(m: &mut ProjectModel, from: i64, to: i64, at: i64) {
     }
     for (s, (s0, s1)) in sections {
         m.sections.push(Section {
-            id: Uuid::new_v4(),
+            id: crate::ids::mint(),
             start_tick: at + (s0 - from),
             // An explicit extent is cut at the range's end; an implicit one stays implicit, so
             // the copy runs to whatever marker follows it, exactly as the original did.
@@ -451,7 +439,7 @@ pub fn duplicate_range(m: &mut ProjectModel, from: i64, to: i64, at: i64) {
             continue;
         };
         lane.points.extend(points.into_iter().map(|p| Breakpoint {
-            id: Uuid::new_v4(),
+            id: crate::ids::mint(),
             tick: at + (p.tick - from),
             ..p
         }));
@@ -460,9 +448,20 @@ pub fn duplicate_range(m: &mut ProjectModel, from: i64, to: i64, at: i64) {
     settle(m);
 }
 
+/// A loop or punch range after [`insert_time`] opens `ticks` at `at`.
+pub fn shift_region(r: Option<(i64, i64)>, at: i64, ticks: i64) -> Option<(i64, i64)> {
+    r.map(|(s, e)| (insert_point(s, at, ticks), if e > at { e + ticks } else { e }))
+}
+
+/// A loop or punch range after [`delete_time`] cuts `ticks` at `at`. A range cut away entirely is
+/// left empty here; [`crate::model::clamp_loop`] is what drops one.
+pub fn pull_region(r: Option<(i64, i64)>, at: i64, ticks: i64) -> Option<(i64, i64)> {
+    r.map(|(s, e)| (delete_point(s, at, ticks), delete_point(e, at, ticks)))
+}
+
 /// Put the timeline back in order after a ripple: everything sorted by start, nothing reaching
 /// past the song's end.
-fn settle(m: &mut ProjectModel) {
+pub(crate) fn settle(m: &mut ProjectModel) {
     m.clips.sort_by_key(|c| c.start_tick);
     m.audio_clips.sort_by_key(|c| c.start_tick);
     m.sections.sort_by_key(|s| s.start_tick);

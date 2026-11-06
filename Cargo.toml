@@ -4,7 +4,9 @@ members = [
     "crates/dissonant-catalog",
     "crates/dissonant-core",
     "crates/dissonant-engine",
+    "crates/dissonant-net",
     "crates/dissonant-plugins",
+    "crates/dissonant-session",
     "src-tauri",
 ]
 
@@ -17,7 +19,7 @@ repository = "https://github.com/lilylilylily123/dissonant"
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["float_roundtrip"] }
 uuid = { version = "1", features = ["v4", "v5", "serde"] }
 thiserror = "2"
 

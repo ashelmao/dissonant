@@ -1,12 +1,13 @@
 //! The document: a [`ProjectModel`] plus undo/redo, mutated only through [`Command`]s.
 //!
 //! Every command is validated and applied here, so the UI, tests and any future scripting or
-//! collaboration layer all go through one door. Undo is snapshot-based (the model is small);
-//! continuous controls (sliders) send `transient` commands which coalesce into one undo step
-//! per gesture.
+//! collaboration layer all go through one door. An undo step is a [`Patch`], so it can be taken
+//! back without touching anything somebody else did since; continuous controls (sliders) send
+//! `transient` commands which coalesce into one undo step per gesture.
 
 use crate::automation::{AutoTarget, AutomationLane, Breakpoint, Curve};
 use crate::midi_file::ImportedTrack;
+use crate::patch::Patch;
 use crate::model::{
     AmpRig, AudioClip, AudioSource, ChordEvent, Clip, ClipDetection, Insert, KeyState,
     MasterSettings, NoteEvent, ProjectModel, Section, SongPattern, Track, TrackPlugin,
@@ -180,6 +181,15 @@ pub enum Command {
         pattern_id: Uuid,
         notes: Vec<NoteEvent>,
     },
+    /// Change some of a pattern's notes and leave the rest alone. This is what a shared session
+    /// turns [`Command::SetNotes`] into, so two people in one pattern don't erase each other: an
+    /// id in `remove` that is already gone is not an error, and a note in `upsert` replaces the
+    /// note with its id or joins the pattern.
+    PatchNotes {
+        pattern_id: Uuid,
+        upsert: Vec<NoteEvent>,
+        remove: Vec<Uuid>,
+    },
     /// Rope `note_id` to `source_id`, both in `pattern_id`: the source's voice will slide into
     /// this note while the rope is live (see [`crate::model::rope_is_live`]). Replaces any rope
     /// the note had. A note can't slide from itself or from a note downstream of it.
@@ -203,6 +213,11 @@ pub enum Command {
     /// Replace the project's chord progression (song ticks).
     SetChords {
         chords: Vec<ChordEvent>,
+    },
+    /// Change some chords and leave the rest alone: [`Command::PatchNotes`] for the progression.
+    PatchChords {
+        upsert: Vec<ChordEvent>,
+        remove: Vec<Uuid>,
     },
     /// Place a pattern on the song (on its own track). `length_ticks` defaults to the pattern
     /// length. Refused at or past the song end; a clip crossing it is cut there.
@@ -443,8 +458,27 @@ pub enum EditError {
 /// One undo step: the model before the edit, and what the edit was ("move notes").
 #[derive(Debug, Clone)]
 struct HistoryEntry {
-    model: ProjectModel,
+    /// The edit as it was made: applying it reversed undoes it.
+    patch: Patch,
     label: String,
+}
+
+/// A transient gesture in progress: the model when it began, to diff against when it ends.
+#[derive(Debug, Clone)]
+struct Gesture {
+    before: ProjectModel,
+    label: String,
+}
+
+/// What came of an undo or a redo.
+#[derive(Debug, Clone, PartialEq)]
+pub enum StepOutcome {
+    /// There was nothing to undo or redo.
+    Nothing,
+    /// The model changed by this patch.
+    Applied(Patch),
+    /// Somebody else's work got in the way, so nothing changed and the step is gone.
+    Blocked,
 }
 
 #[derive(Debug, Clone)]
@@ -452,8 +486,8 @@ pub struct Document {
     model: ProjectModel,
     undo: Vec<HistoryEntry>,
     redo: Vec<HistoryEntry>,
-    /// Snapshot taken at the start of a transient gesture, pushed to `undo` when it ends.
-    pending: Option<HistoryEntry>,
+    /// The transient gesture in progress, which becomes one undo step when it ends.
+    pending: Option<Gesture>,
     pub path: Option<std::path::PathBuf>,
     /// The model as it was at the last save point; `is_dirty` is a comparison against it rather
     /// than a sticky flag, so undoing back to the saved state really is "no unsaved changes".
@@ -495,7 +529,7 @@ impl Document {
     /// True only when an undo would actually change something: an open gesture that has not
     /// moved off its starting value is not undoable, and promising one lights a dead menu item.
     pub fn can_undo(&self) -> bool {
-        !self.undo.is_empty() || self.pending.as_ref().is_some_and(|p| p.model != self.model)
+        !self.undo.is_empty() || self.pending.as_ref().is_some_and(|p| p.before != self.model)
     }
 
     pub fn can_redo(&self) -> bool {
@@ -539,25 +573,19 @@ impl Document {
         let label = label
             .filter(|l| !l.trim().is_empty())
             .unwrap_or_else(|| command.label());
-        let before = self.model.clone();
         let mut next = self.model.clone();
         apply_to(&mut next, command)?;
-        if next == before {
+        if next == self.model {
             return Ok(());
         }
         if transient {
             if self.pending.is_none() {
-                self.pending = Some(HistoryEntry {
-                    model: before,
-                    label,
-                });
+                self.pending = Some(Gesture { before: self.model.clone(), label });
             }
         } else {
             self.commit_gesture();
-            self.push_undo(HistoryEntry {
-                model: before,
-                label,
-            });
+            let patch = Patch::between(&self.model, &next);
+            self.push_undo(HistoryEntry { patch, label });
         }
         self.redo.clear();
         self.model = next;
@@ -567,42 +595,115 @@ impl Document {
 
     /// End a run of transient edits, making it one undo step.
     pub fn commit_gesture(&mut self) {
-        if let Some(entry) = self.pending.take() {
-            if entry.model != self.model {
-                self.push_undo(entry);
+        if let Some(gesture) = self.pending.take() {
+            if gesture.before != self.model {
+                let patch = Patch::between(&gesture.before, &self.model);
+                self.push_undo(HistoryEntry { patch, label: gesture.label });
             }
         }
     }
 
     pub fn undo(&mut self) -> bool {
-        self.commit_gesture();
-        match self.undo.pop() {
-            Some(entry) => {
-                let current = std::mem::replace(&mut self.model, entry.model);
-                self.redo.push(HistoryEntry {
-                    model: current,
-                    label: entry.label,
-                });
-                self.touch();
-                true
-            }
-            None => false,
-        }
+        matches!(self.undo_step(), StepOutcome::Applied(_))
     }
 
     pub fn redo(&mut self) -> bool {
+        matches!(self.redo_step(), StepOutcome::Applied(_))
+    }
+
+    /// [`Document::undo`], saying what changed. Anything somebody else changed since the edit is
+    /// left as they left it.
+    pub fn undo_step(&mut self) -> StepOutcome {
         self.commit_gesture();
-        match self.redo.pop() {
-            Some(entry) => {
-                let current = std::mem::replace(&mut self.model, entry.model);
-                self.undo.push(HistoryEntry {
-                    model: current,
-                    label: entry.label,
-                });
-                self.touch();
-                true
+        let Some(entry) = self.undo.pop() else { return StepOutcome::Nothing };
+        match self.settle_patch(&entry.patch.reversed()) {
+            Some(change) => {
+                self.redo.push(HistoryEntry { patch: change.reversed(), label: entry.label });
+                StepOutcome::Applied(change)
             }
-            None => false,
+            None => StepOutcome::Blocked,
+        }
+    }
+
+    /// [`Document::redo`], saying what changed.
+    pub fn redo_step(&mut self) -> StepOutcome {
+        self.commit_gesture();
+        let Some(entry) = self.redo.pop() else { return StepOutcome::Nothing };
+        match self.settle_patch(&entry.patch) {
+            Some(change) => {
+                self.undo.push(HistoryEntry { patch: change.clone(), label: entry.label });
+                StepOutcome::Applied(change)
+            }
+            None => StepOutcome::Blocked,
+        }
+    }
+
+    /// Apply as much of `patch` as still holds, returning the change actually made. `None` when
+    /// there was nothing left to do or the patch was refused.
+    fn settle_patch(&mut self, patch: &Patch) -> Option<Patch> {
+        let usable = patch.applicable_to(&self.model).ok()?;
+        let mut next = usable.apply(&self.model).ok()?;
+        // Only a step cut short can leave anything to mend: a whole one puts back a model that
+        // was already consistent.
+        if &usable != patch {
+            next.mend();
+        }
+        let change = Patch::between(&self.model, &next);
+        if change.is_empty() {
+            return None;
+        }
+        self.model = next;
+        self.touch();
+        Some(change)
+    }
+
+    /// Run a command for somebody else: the model changes but this document's history doesn't.
+    /// Returns what changed.
+    pub fn apply_external(&mut self, command: Command) -> Result<Patch, EditError> {
+        let mut next = self.model.clone();
+        apply_to(&mut next, command)?;
+        let change = Patch::between(&self.model, &next);
+        self.adopt(next, &change);
+        Ok(change)
+    }
+
+    /// Apply somebody else's undo or redo: as much of `patch` as still holds, outside this
+    /// document's history. Returns what changed, which may be nothing.
+    pub fn apply_external_patch(&mut self, patch: &Patch) -> Patch {
+        let Ok(usable) = patch.applicable_to(&self.model) else { return Patch::default() };
+        let Ok(mut next) = usable.apply(&self.model) else { return Patch::default() };
+        next.mend();
+        let change = Patch::between(&self.model, &next);
+        self.adopt(next, &change);
+        change
+    }
+
+    /// Take a new model that differs by `change`, which is somebody else's doing.
+    fn adopt(&mut self, next: ProjectModel, change: &Patch) {
+        if change.is_empty() {
+            return;
+        }
+        self.keep_gesture_current(change);
+        self.model = next;
+        self.touch();
+    }
+
+    /// Somebody else's `change` landed in the middle of a gesture. Move the gesture's starting
+    /// point along with it, so ending the gesture records this person's edit and not theirs.
+    pub fn keep_gesture_current(&mut self, change: &Patch) {
+        if let Some(gesture) = &mut self.pending {
+            if let Ok(before) = change.apply(&gesture.before) {
+                gesture.before = before;
+            }
+        }
+    }
+
+    /// Show `model` in place of the current one, keeping history. A guest's view of a session is
+    /// rebuilt this way whenever the host answers.
+    pub fn set_view(&mut self, model: ProjectModel) {
+        if model != self.model {
+            self.model = model;
+            self.touch();
         }
     }
 
@@ -647,7 +748,53 @@ fn embed_sound(m: &mut ProjectModel, sound: Sound) {
     }
 }
 
+/// A change to the song's timeline that moves whatever marks a place in the music. Guests apply
+/// it to their own loop and punch ranges, which never travel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", rename_all_fields = "camelCase")]
+pub enum TimeEdit {
+    Insert { at: i64, ticks: i64 },
+    Delete { at: i64, ticks: i64 },
+}
+
+impl TimeEdit {
+    /// `region` after this edit, by the same rule the document applies to its own.
+    pub fn shift(&self, region: Option<(i64, i64)>) -> Option<(i64, i64)> {
+        match *self {
+            TimeEdit::Insert { at, ticks } => crate::ripple::shift_region(region, at, ticks),
+            TimeEdit::Delete { at, ticks } => crate::ripple::pull_region(region, at, ticks),
+        }
+    }
+}
+
 impl Command {
+    /// Whether this edit belongs to one person in a shared session rather than to the project.
+    /// See [`crate::patch::Personal`].
+    pub fn is_personal(&self) -> bool {
+        matches!(
+            self,
+            Command::SetTrackMuted { .. }
+                | Command::SetTrackSoloed { .. }
+                | Command::SetLoopRegion { .. }
+                | Command::SetPunchRegion { .. }
+        )
+    }
+
+    /// Whether this edit brings in audio that exists only on the machine that made it.
+    pub fn adds_audio(&self) -> bool {
+        matches!(self, Command::AddAudioTake { .. } | Command::PunchAudioTake { .. })
+    }
+
+    /// How this edit moves the timeline, if it does.
+    pub fn time_edit(&self) -> Option<TimeEdit> {
+        match *self {
+            Command::InsertTime { at, ticks } => Some(TimeEdit::Insert { at, ticks }),
+            Command::DeleteTime { at, ticks } => Some(TimeEdit::Delete { at, ticks }),
+            Command::DuplicateRange { from, to, at } => Some(TimeEdit::Insert { at, ticks: to - from }),
+            _ => None,
+        }
+    }
+
     /// A short, lower-case description for the Edit menu ("Undo set tempo").
     pub fn label(&self) -> String {
         use Command::*;
@@ -696,11 +843,11 @@ impl Command {
             DeletePattern { .. } => "delete pattern",
             RenamePattern { .. } => "rename pattern",
             SetPatternLength { .. } => "change pattern length",
-            SetNotes { .. } => "edit notes",
+            SetNotes { .. } | PatchNotes { .. } => "edit notes",
             SetRope { .. } => "add rope",
             ClearRope { .. } => "remove rope",
             SetSlideTime { .. } => "change slide time",
-            SetChords { .. } => "edit chords",
+            SetChords { .. } | PatchChords { .. } => "edit chords",
             AddClip { .. } => "add clip",
             UpdateClip { .. } => "edit clip",
             UpdateClips { .. } => "move clips",
@@ -839,6 +986,12 @@ fn insert_mut(
         .iter_mut()
         .find(|i| i.id == insert_id)
         .ok_or(EditError::NoSuchInsert)
+}
+
+/// Run a command on a bare model, outside any history. A guest replays what the host hasn't
+/// answered yet this way.
+pub fn apply_command(m: &mut ProjectModel, command: Command) -> Result<(), EditError> {
+    apply_to(m, command)
 }
 
 fn apply_to(m: &mut ProjectModel, command: Command) -> Result<(), EditError> {
@@ -1114,6 +1267,16 @@ fn apply_to(m: &mut ProjectModel, command: Command) -> Result<(), EditError> {
             crate::model::tidy_ropes(&mut notes);
             p.notes = notes;
         }
+        PatchNotes { pattern_id, upsert, remove } => {
+            let p = m.pattern_mut(&pattern_id).ok_or(EditError::NoSuchPattern)?;
+            let replaced: Vec<Uuid> = upsert.iter().map(|n| n.id).collect();
+            let mut notes = std::mem::take(&mut p.notes);
+            notes.retain(|n| !remove.contains(&n.id) && !replaced.contains(&n.id));
+            notes.extend(upsert.into_iter().map(NoteEvent::sanitized));
+            notes.sort_by(|a, b| a.start_tick.cmp(&b.start_tick).then(a.pitch.cmp(&b.pitch)));
+            crate::model::tidy_ropes(&mut notes);
+            p.notes = notes;
+        }
         SetRope {
             pattern_id,
             note_id,
@@ -1163,6 +1326,13 @@ fn apply_to(m: &mut ProjectModel, command: Command) -> Result<(), EditError> {
         }
         SetChords { chords } => {
             m.chords = crate::chord_track::ChordTrack::new(crate::model::tidy_chords(chords))
+        }
+        PatchChords { upsert, remove } => {
+            let replaced: Vec<Uuid> = upsert.iter().map(|c| c.id).collect();
+            let mut chords = m.chords.take();
+            chords.retain(|c| !remove.contains(&c.id) && !replaced.contains(&c.id));
+            chords.extend(upsert);
+            m.chords = crate::chord_track::ChordTrack::new(crate::model::tidy_chords(chords));
         }
         AddClip {
             pattern_id,
@@ -1682,7 +1852,7 @@ fn place_chord(chords: Vec<ChordEvent>, chord: ChordEvent) -> Vec<ChordEvent> {
         if c_end > e {
             let mut tail = c.clone();
             if c.start_tick < s {
-                tail.id = Uuid::new_v4();
+                tail.id = crate::ids::mint();
             }
             tail.start_tick = e;
             tail.length_ticks = c_end - e;
@@ -1736,7 +1906,7 @@ fn punch_split(map: &TempoMap, clips: Vec<AudioClip>, take: &AudioClip, xf: f64)
                 // The head keeps the clip's identity when there is one, the way a ripple split
                 // does; with the take butted against the clip's front, the tail is all that is
                 // left of it and keeps the id instead.
-                id: if head.is_some() { Uuid::new_v4() } else { c.id },
+                id: if head.is_some() { crate::ids::mint() } else { c.id },
                 start_tick: tick,
                 length_seconds: end - at,
                 offset_seconds: c.offset_seconds + (at - start),
